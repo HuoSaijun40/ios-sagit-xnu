@@ -1,0 +1,117 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -362,6 +362,9 @@
+ bsd/security/audit/audit_worker.c		optional config_audit
+ 
+ bsd/pthread/pthread_shims.c		standard
++bsd/pthread/sagit_pthread_init.c		standard
++bsd/pthread/sagit_pthread_support.c		standard
++bsd/pthread/sagit_pthread_synch.c		standard
+ bsd/pthread/pthread_priority.c		standard
+ bsd/pthread/pthread_workqueue.c		standard
+ 
+diff --git a/bsd/conf/Makefile.template b/bsd/conf/Makefile.template
+--- a/bsd/conf/Makefile.template
++++ b/bsd/conf/Makefile.template
+@@ -44,6 +44,15 @@
+         -Warray-bounds-pointer-arithmetic
+ SFLAGS+= -include meta_features.h
+ 
++# libpthread is built into SAGIT; other boards load their normal kext.
++ifeq ($(CURRENT_MACHINE_CONFIG),SAGIT)
++SAGIT_PTHREAD_ROOT = $(SRCROOT)/bsd/pthread/sagit_libpthread
++SAGIT_PTHREAD_INC = -I$(SAGIT_PTHREAD_ROOT) -I$(SAGIT_PTHREAD_ROOT)/private -I$(SAGIT_PTHREAD_ROOT)/include
++sagit_pthread_init.o_INCFLAGS = $(SAGIT_PTHREAD_INC)
++sagit_pthread_support.o_INCFLAGS = $(SAGIT_PTHREAD_INC)
++sagit_pthread_synch.o_INCFLAGS = $(SAGIT_PTHREAD_INC)
++endif
++
+ #
+ # Directories for mig generated files
+ #
+diff --git a/bsd/pthread/sweet_pthread_compat.h b/bsd/pthread/sweet_pthread_compat.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/pthread/sweet_pthread_compat.h
+@@ -0,0 +1,25 @@
++/*
++ * Compile the matching libpthread provider with its kext view of BSD headers.
++ * It owns its full ksyn_waitq_element layout; the kernel's opaque counterpart
++ * reserves this layout. All communication with private BSD state uses callbacks.
++ */
++#ifndef SAGIT_PTHREAD_COMPAT_H
++#define SAGIT_PTHREAD_COMPAT_H
++#undef BSD_KERNEL_PRIVATE
++#undef XNU_KERNEL_PRIVATE
++#define __PTHREAD_EXPOSE_INTERNALS__ 1
++#define NEEDS_SCHED_CALL_T 1
++
++/* The seven-argument kext API forwards to the eight-argument kernel vm_fault. */
++#define vm_fault vm_fault_external
++
++/* Avoid collisions with the kernel side of the callback interface. */
++#define pthread_kern sagit_pthread_kern
++#define current_uthread sagit_pthread_current_uthread
++#define pthread_start sagit_pthread_start
++#define pthread_stop sagit_pthread_stop
++
++/* os/log passes &__dso_handle as the containing Mach-O image address. */
++extern void *sagit_pthread_log_image __asm("__mh_execute_header");
++#define __dso_handle sagit_pthread_log_image
++#endif
+\ No newline at end of file
+diff --git a/bsd/pthread/sweet_pthread_init.c b/bsd/pthread/sweet_pthread_init.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/pthread/sweet_pthread_init.c
+@@ -0,0 +1,26 @@
++/* Built-in provider: Apple libpthread-514.100.2, paired with xnu-8796.141.3. */
++#if defined(ARM64_BOARD_CONFIG_SAGIT)
++#include "sagit_pthread_compat.h"
++#include "sagit_libpthread/kern/kern_init.c"
++
++/* Keep the provider's full layout within the kernel's reserved storage. */
++_Static_assert(sizeof(struct ksyn_waitq_element) == 56,
++    "update SAGIT ksyn storage in sys/pthread_internal.h");
++
++/* Restore the startup interface after compiling the provider's kext code. */
++#define XNU_KERNEL_PRIVATE 1
++#include <kern/startup.h>
++#include <pexpert/pexpert.h>
++
++__startup_func
++static void
++sagit_pthread_register(void)
++{
++    kern_return_t kr = sagit_pthread_start(NULL, NULL);
++    if (kr != KERN_SUCCESS || sagit_pthread_kern == NULL) {
++        panic("SAGIT: pthread provider registration failed: %d", kr);
++    }
++    kprintf("SAGIT pthread: libpthread-514.100.2 registered\n");
++}
++STARTUP(EARLY_BOOT, STARTUP_RANK_SECOND, sagit_pthread_register);
++#endif /* ARM64_BOARD_CONFIG_SAGIT */
+\ No newline at end of file
+diff --git a/bsd/pthread/sweet_pthread_support.c b/bsd/pthread/sweet_pthread_support.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/pthread/sweet_pthread_support.c
+@@ -0,0 +1,5 @@
++/* Built-in provider: Apple libpthread-514.100.2, paired with xnu-8796.141.3. */
++#if defined(ARM64_BOARD_CONFIG_SAGIT)
++#include "sagit_pthread_compat.h"
++#include "sagit_libpthread/kern/kern_support.c"
++#endif /* ARM64_BOARD_CONFIG_SAGIT */
+\ No newline at end of file
+diff --git a/bsd/pthread/sweet_pthread_synch.c b/bsd/pthread/sweet_pthread_synch.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/pthread/sweet_pthread_synch.c
+@@ -0,0 +1,5 @@
++/* Built-in provider: Apple libpthread-514.100.2, paired with xnu-8796.141.3. */
++#if defined(ARM64_BOARD_CONFIG_SAGIT)
++#include "sagit_pthread_compat.h"
++#include "sagit_libpthread/kern/kern_synch.c"
++#endif /* ARM64_BOARD_CONFIG_SAGIT */
+\ No newline at end of file
