@@ -81,43 +81,11 @@ jobs:
             esac
             cp "$f" dxb/patches/
           done
-          # No ci/*.sh any more: the vendored sources are unpacked straight into
-          # dxb/xnu by the hook injected below. Clear any stale stage helper so an
+          # No ci/*.sh any more: the vendored sources are unpacked in the next
+          # step, into a pre-cloned dxb/xnu. Clear any stale stage helper so an
           # older copy cannot also run during this build.
           find dxb/patches -maxdepth 1 -name '[0-9][0-9][0-9][0-9]-*-sagit-*.sh' -delete 2>/dev/null || true
           ls -l vendor/*.tar.gz || { echo "::error::vendor/*.tar.gz missing"; exit 1; }
-          # Staging the Apple OSS sources is a plain unpack + copy, so do it inline
-          # instead of relying on build.sh's scripts. Injected right after build.sh
-          # cds into the xnu source root, which is where the copies must land.
-          python3 - <<'PY'
-          import pathlib
-          p = pathlib.Path("dxb/build.sh")
-          s = p.read_text()
-          anchor = '        cd "${WORK_DIR}/xnu"\n'
-          hook = (
-              '        echo "=== SAGIT: staging vendored sources ==="\n'
-              '        V="${SAGIT_VENDOR:-${GITHUB_WORKSPACE:-..}/vendor}"\n'
-              '        if [ ! -d bsd/sagit_hfs ]; then\n'
-              '          T=$(mktemp -d); tar -xzf "$V/hfs.tar.gz" -C "$T" || exit 1\n'
-              '          mkdir -p bsd/sagit_hfs && cp -R "$T/hfs/core" "$T/hfs/hfs_encodings" bsd/sagit_hfs/ || exit 1\n'
-              '          cp "$(xcrun --sdk macosx --show-sdk-path)/usr/include/TargetConditionals.h" bsd/sagit_hfs/ || exit 1\n'
-              '          rm -rf "$T"; echo "staged bsd/sagit_hfs"\n'
-              '        else echo "bsd/sagit_hfs present"; fi\n'
-              '        if [ ! -d bsd/pthread/sagit_libpthread ]; then\n'
-              '          T=$(mktemp -d); tar -xzf "$V/libpthread.tar.gz" -C "$T" || exit 1\n'
-              '          mkdir -p bsd/pthread/sagit_libpthread\n'
-              '          cp -R "$T/libpthread/kern" "$T/libpthread/include" "$T/libpthread/private" bsd/pthread/sagit_libpthread/ || exit 1\n'
-              '          rm -rf "$T"; echo "staged bsd/pthread/sagit_libpthread"\n'
-              '        else echo "bsd/pthread/sagit_libpthread present"; fi\n'
-          )
-          if "SAGIT: staging vendored sources" in s:
-              print("stage hook already present")
-          elif s.count(anchor) == 1:
-              p.write_text(s.replace(anchor, anchor + hook, 1))
-              print("injected stage hook")
-          else:
-              print("ERROR: stage hook anchor not found")
-          PY
           dup=$( (ls dxb/patches/*.patch 2>/dev/null || true) | xargs -n1 basename 2>/dev/null \
                  | grep -E '^[0-9]{4}-' | cut -c1-4 | sort | uniq -d || true)
           if [ -n "$dup" ]; then echo "::error::duplicate numbered patches: $dup"; exit 1; fi
@@ -136,6 +104,40 @@ jobs:
           # OTHER_CFLAGS carry its -std / include setup and must not be replaced.
           sed -i '' 's|-target libfirehose_kernel -sdk macosx ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"|-target libfirehose_kernel -sdk macosx ARCHS="arm64" VALID_ARCHS="arm64" WARNING_CFLAGS="-mcpu=generic+crypto"|' dxb/build.sh
           grep -c 'WARNING_CFLAGS="-mcpu=generic+crypto"' dxb/build.sh
+
+      # build.sh only clones xnu when dxb/xnu is absent, so pre-clone it at the
+      # exact tag build.sh would have used, drop the vendored Apple OSS sources
+      # in, and let build.sh pick it up. Every step is visible in the job log.
+      - name: Pre-clone xnu and stage vendored sources
+        run: |
+          set -euo pipefail
+          RELEASE_URL="https://raw.githubusercontent.com/apple-oss-distributions/distribution-macOS/${MACOS_VERSION}/products/release.json"
+          XNU_TAG=$(curl -s "$RELEASE_URL" | jq -r '.projects[] | select(.project=="xnu") | .tag')
+          [ -n "$XNU_TAG" ] || { echo "::error::could not resolve the xnu tag from $RELEASE_URL"; exit 1; }
+          echo "xnu tag: $XNU_TAG"
+          git clone -q --depth 1 --branch "$XNU_TAG" https://github.com/apple-oss-distributions/xnu.git dxb/xnu
+          echo "cloned $(git -C dxb/xnu rev-parse --short HEAD) into dxb/xnu"
+
+          T=$(mktemp -d)
+          tar -xzf vendor/hfs.tar.gz -C "$T"
+          mkdir -p dxb/xnu/bsd/sagit_hfs
+          cp -R "$T/hfs/core" "$T/hfs/hfs_encodings" dxb/xnu/bsd/sagit_hfs/
+          cp "$(xcrun --sdk macosx --show-sdk-path)/usr/include/TargetConditionals.h" dxb/xnu/bsd/sagit_hfs/
+          echo "staged bsd/sagit_hfs: $(ls dxb/xnu/bsd/sagit_hfs/core | wc -l) core files"
+
+          tar -xzf vendor/libpthread.tar.gz -C "$T"
+          mkdir -p dxb/xnu/bsd/pthread/sagit_libpthread
+          cp -R "$T/libpthread/kern" "$T/libpthread/include" "$T/libpthread/private" \
+                dxb/xnu/bsd/pthread/sagit_libpthread/
+          echo "staged bsd/pthread/sagit_libpthread: $(ls dxb/xnu/bsd/pthread/sagit_libpthread | tr '\n' ' ')"
+          rm -rf "$T"
+
+          # Sanity check: every file 0052 lists must now exist.
+          miss=$(awk '/sagit_hfs\/.*optional sagit_hfs/ {print $1}' xnu/patches/0052-sagit-builtin-hfs.patch \
+                 | grep '^bsd/' | sed 's#^bsd/sagit_hfs#dxb/xnu/bsd/sagit_hfs#' | while read -r f; do
+                   [ -e "$f" ] || echo "$f"; done)
+          if [ -n "$miss" ]; then echo "::error::missing staged files:"; echo "$miss"; exit 1; fi
+          echo "all HFS sources listed by 0052 are present"
           ls dxb/patches
 
       - name: Deps
