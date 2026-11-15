@@ -1,0 +1,31 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -493,6 +493,13 @@
+ #define DEBUG_BSDINIT 0
+ 
+ #if defined(SAGIT)
++/* 0 = boot normally. 1 = panic before sagit_ufs_rootdev, 2 = panic after. */
++#ifndef SAGIT_UFS_PROBE
++#define SAGIT_UFS_PROBE 1
++#endif
++#endif
++
++#if defined(SAGIT)
+ /*
+  * Binary-search the bsd_init() failure: panic after this many init groups.
+  * 0 disables the probe. Change the number and rebuild.
+@@ -955,7 +962,13 @@
+ 		{
+ 			extern int sagit_ufs_rootdev(dev_t * dev);
+ 			dev_t ufs_dev = 0;
++			if (SAGIT_UFS_PROBE == 1) {
++				panic("SAGIT probe 1: about to call sagit_ufs_rootdev");
++			}
+ 			int ufs_err = sagit_ufs_rootdev(&ufs_dev);
++			if (SAGIT_UFS_PROBE == 2) {
++				panic("SAGIT probe 2: sagit_ufs_rootdev returned %d", ufs_err);
++			}
+ 
+ 			if (ufs_err == 0) {
+ 				rootdev = ufs_dev;
