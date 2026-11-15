@@ -1,0 +1,100 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -514,6 +514,10 @@
+ 	bsd_init_kprintf("calling kauth_init\n");
+ 	kauth_init();
+ 
++	#if defined(SAGIT)
++		printf("SAGIT B01 kauth\n");
++	#endif
++
+ 	/* kernel_task->proc = kernproc; */
+ 	set_bsdtask_info(kernel_task, (void *)kernproc);
+ 
+@@ -684,11 +688,19 @@
+ 	bsd_init_kprintf("calling bsd_bufferinit\n");
+ 	bsd_bufferinit();
+ 
++	#if defined(SAGIT)
++		printf("SAGIT B02 bufferinit\n");
++	#endif
++
+ 	/*
+ 	 * Initialize the calendar.
+ 	 */
+ 	bsd_init_kprintf("calling IOKitInitializeTime\n");
+ 	IOKitInitializeTime();
++
++	#if defined(SAGIT)
++		printf("SAGIT B03 iokit_time\n");
++	#endif
+ #if defined(SAGIT)
+ 	printf("SAGIT: iokit_time done\n");
+ #endif
+@@ -696,6 +708,10 @@
+ 	/* Initialize the file systems. */
+ 	bsd_init_kprintf("calling vfsinit\n");
+ 	vfsinit();
++
++	#if defined(SAGIT)
++		printf("SAGIT B04 vfsinit\n");
++	#endif
+ #if defined(SAGIT)
+ 	printf("SAGIT: vfsinit done\n");
+ #endif
+@@ -709,6 +725,10 @@
+ 	/* Initial proc_uuid_policy subsystem */
+ 	bsd_init_kprintf("calling proc_uuid_policy_init()\n");
+ 	proc_uuid_policy_init();
++
++	#if defined(SAGIT)
++		printf("SAGIT B06 uuid_policy\n");
++	#endif
+ #endif
+ 
+ #if SOCKETS
+@@ -718,6 +738,10 @@
+ 	/* Initialize mbuf's. */
+ 	bsd_init_kprintf("calling mbinit\n");
+ 	mbinit();
++
++	#if defined(SAGIT)
++		printf("SAGIT B05 mbinit\n");
++	#endif
+ 	restricted_in_port_init();
+ #endif /* SOCKETS */
+ 
+@@ -734,6 +758,10 @@
+ 	bsd_init_kprintf("calling knote_init\n");
+ 	knote_init();
+ 
++	#if defined(SAGIT)
++		printf("SAGIT B07 knote\n");
++	#endif
++
+ 	/* Initialize event handler */
+ 	bsd_init_kprintf("calling eventhandler_init\n");
+ 	eventhandler_init();
+@@ -764,6 +792,10 @@
+ 	socketinit();
+ 	bsd_init_kprintf("calling domaininit\n");
+ 	domaininit();
++
++	#if defined(SAGIT)
++		printf("SAGIT B08 domaininit\n");
++	#endif
+ 	iptap_init();
+ #if FLOW_DIVERT
+ 	flow_divert_init();
+@@ -869,6 +901,10 @@
+ 
+ 	bsd_init_kprintf("calling inittodr\n");
+ 	inittodr(0);
++
++	#if defined(SAGIT)
++		printf("SAGIT B09 inittodr\n");
++	#endif
+ #if defined(SAGIT)
+ 	printf("SAGIT: inittodr done\n");
+ #endif
