@@ -1,0 +1,99 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -492,6 +492,23 @@
+ 
+ #define DEBUG_BSDINIT 0
+ 
++#if defined(SAGIT)
++/*
++ * Binary-search the bsd_init() failure: panic after this many init groups.
++ * 0 disables the probe. Change the number and rebuild.
++ */
++#ifndef SAGIT_BISECT
++#define SAGIT_BISECT 4
++#endif
++#define SAGIT_BISECT_AT(n, name) do { \
++	if (SAGIT_BISECT != 0 && (n) == SAGIT_BISECT) { \
++		panic("SAGIT B%02d reached: " name, (n)); \
++	} \
++} while (0)
++#else
++#define SAGIT_BISECT_AT(n, name) do { } while (0)
++#endif
++
+ #if DEBUG_BSDINIT
+ #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
+ #else
+@@ -514,6 +531,8 @@
+ 	bsd_init_kprintf("calling kauth_init\n");
+ 	kauth_init();
+ 
++	SAGIT_BISECT_AT(1, "kauth_init");
++
+ 	#if defined(SAGIT)
+ 		printf("SAGIT B01 kauth\n");
+ 	#endif
+@@ -688,6 +707,8 @@
+ 	bsd_init_kprintf("calling bsd_bufferinit\n");
+ 	bsd_bufferinit();
+ 
++	SAGIT_BISECT_AT(2, "bsd_bufferinit");
++
+ 	#if defined(SAGIT)
+ 		printf("SAGIT B02 bufferinit\n");
+ 	#endif
+@@ -698,6 +719,8 @@
+ 	bsd_init_kprintf("calling IOKitInitializeTime\n");
+ 	IOKitInitializeTime();
+ 
++	SAGIT_BISECT_AT(3, "IOKitInitializeTime");
++
+ 	#if defined(SAGIT)
+ 		printf("SAGIT B03 iokit_time\n");
+ 	#endif
+@@ -709,6 +732,8 @@
+ 	bsd_init_kprintf("calling vfsinit\n");
+ 	vfsinit();
+ 
++	SAGIT_BISECT_AT(4, "vfsinit");
++
+ 	#if defined(SAGIT)
+ 		printf("SAGIT B04 vfsinit\n");
+ 	#endif
+@@ -739,6 +764,8 @@
+ 	bsd_init_kprintf("calling mbinit\n");
+ 	mbinit();
+ 
++	SAGIT_BISECT_AT(5, "mbinit");
++
+ 	#if defined(SAGIT)
+ 		printf("SAGIT B05 mbinit\n");
+ 	#endif
+@@ -758,6 +785,8 @@
+ 	bsd_init_kprintf("calling knote_init\n");
+ 	knote_init();
+ 
++	SAGIT_BISECT_AT(6, "knote_init");
++
+ 	#if defined(SAGIT)
+ 		printf("SAGIT B07 knote\n");
+ 	#endif
+@@ -793,6 +822,8 @@
+ 	bsd_init_kprintf("calling domaininit\n");
+ 	domaininit();
+ 
++	SAGIT_BISECT_AT(7, "domaininit");
++
+ 	#if defined(SAGIT)
+ 		printf("SAGIT B08 domaininit\n");
+ 	#endif
+@@ -902,6 +933,8 @@
+ 	bsd_init_kprintf("calling inittodr\n");
+ 	inittodr(0);
+ 
++	SAGIT_BISECT_AT(8, "inittodr");
++
+ 	#if defined(SAGIT)
+ 		printf("SAGIT B09 inittodr\n");
+ 	#endif
