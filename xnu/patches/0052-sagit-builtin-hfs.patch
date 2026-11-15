@@ -1,0 +1,318 @@
+diff --git a/config/MASTER b/config/MASTER
+--- a/config/MASTER
++++ b/config/MASTER
+@@ -113,6 +113,7 @@
+ #	4.4 filesystems
+ #
+ options		MOCKFS		# Boot from an executable	# <mockfs>
++options		SAGIT_HFS	# Built-in Apple OSS HFS (SAGIT)	# <sagit_hfs>
+ options		FIFO		# fifo support			# <fifo>
+ options		FDESC		# fdesc_fs support		# <fdesc>
+ options		DEVFS		# devfs support			# <devfs>
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -381,6 +381,47 @@
+ bsd/kern/kern_core.c			optional config_coredump
+ bsd/kern/kern_credential.c		standard
+ bsd/kern/kern_crossarch.c		standard
++# Apple OSS hfs-627.100.6, staged by xnu/patches/0046-sagit-stage-hfs.sh
++bsd/sagit_hfs/core/BTree.c		optional sagit_hfs
++bsd/sagit_hfs/core/BTreeAllocate.c		optional sagit_hfs
++bsd/sagit_hfs/core/BTreeMiscOps.c		optional sagit_hfs
++bsd/sagit_hfs/core/BTreeNodeOps.c		optional sagit_hfs
++bsd/sagit_hfs/core/BTreeNodeReserve.c		optional sagit_hfs
++bsd/sagit_hfs/core/BTreeScanner.c		optional sagit_hfs
++bsd/sagit_hfs/core/BTreeTreeOps.c		optional sagit_hfs
++bsd/sagit_hfs/core/BTreeWrapper.c		optional sagit_hfs
++bsd/sagit_hfs/core/CatalogUtilities.c		optional sagit_hfs
++bsd/sagit_hfs/core/FileExtentMapping.c		optional sagit_hfs
++bsd/sagit_hfs/core/FileIDsServices.c		optional sagit_hfs
++bsd/sagit_hfs/core/MacOSStubs.c		optional sagit_hfs
++bsd/sagit_hfs/core/UnicodeWrappers.c		optional sagit_hfs
++bsd/sagit_hfs/core/VolumeAllocation.c		optional sagit_hfs
++bsd/sagit_hfs/core/hfs_attrlist.c		optional sagit_hfs
++bsd/sagit_hfs/core/hfs_btreeio.c		optional sagit_hfs
++bsd/sagit_hfs/core/hfs_catalog.c		optional sagit_hfs
++bsd/sagit_hfs/core/hfs_chash.c		optional sagit_hfs
++bsd/sagit_hfs/core/hfs_cnode.c		optional sagit_hfs
++bsd/sagit_hfs/core/hfs_cprotect.c		optional sagit_hfs
++bsd/sagit_hfs/core/hfs_endian.c		optional sagit_hfs
++bsd/sagit_hfs/core/hfs_extents.c		optional sagit_hfs
++bsd/sagit_hfs/core/hfs_fsinfo.c		optional sagit_hfs
++bsd/sagit_hfs/core/hfs_hotfiles.c		optional sagit_hfs
++bsd/sagit_hfs/core/hfs_journal.c		optional sagit_hfs
++bsd/sagit_hfs/core/hfs_link.c		optional sagit_hfs
++bsd/sagit_hfs/core/hfs_lookup.c		optional sagit_hfs
++bsd/sagit_hfs/core/hfs_notification.c		optional sagit_hfs
++bsd/sagit_hfs/core/hfs_quota.c		optional sagit_hfs
++bsd/sagit_hfs/core/hfs_readwrite.c		optional sagit_hfs
++bsd/sagit_hfs/core/hfs_resize.c		optional sagit_hfs
++bsd/sagit_hfs/core/hfs_search.c		optional sagit_hfs
++bsd/sagit_hfs/core/hfs_vfsops.c		optional sagit_hfs
++bsd/sagit_hfs/core/hfs_vfsutils.c		optional sagit_hfs
++bsd/sagit_hfs/core/hfs_vnops.c		optional sagit_hfs
++bsd/sagit_hfs/core/hfs_xattr.c		optional sagit_hfs
++bsd/sagit_hfs/core/rangelist.c		optional sagit_hfs
++bsd/sagit_hfs/hfs_encodings/hfs_encodinghint.c		optional sagit_hfs
++bsd/sagit_hfs/hfs_encodings/hfs_encodings.c		optional sagit_hfs
++bsd/sagit_hfs/sagit_hfs_iokit.c		optional sagit_hfs
+ bsd/kern/kern_cs.c			standard
+ bsd/kern/kern_csr.c			optional config_csr
+ bsd/kern/kern_debug.c			standard
+diff --git a/bsd/conf/Makefile.template b/bsd/conf/Makefile.template
+--- a/bsd/conf/Makefile.template
++++ b/bsd/conf/Makefile.template
+@@ -53,6 +53,13 @@
+ sagit_pthread_synch.o_INCFLAGS = $(SAGIT_PTHREAD_INC)
+ endif
+ 
++# Apple OSS HFS built in (bsd/sagit_hfs): compiled like the kext, see sagit_hfs_compat.h.
++SAGIT_HFS_ROOT = $(SRCROOT)/bsd/sagit_hfs
++SAGIT_HFS_OBJS = BTree.o BTreeAllocate.o BTreeMiscOps.o BTreeNodeOps.o BTreeNodeReserve.o BTreeScanner.o BTreeTreeOps.o BTreeWrapper.o CatalogUtilities.o FileExtentMapping.o FileIDsServices.o MacOSStubs.o UnicodeWrappers.o VolumeAllocation.o hfs_attrlist.o hfs_btreeio.o hfs_catalog.o hfs_chash.o hfs_cnode.o hfs_cprotect.o hfs_endian.o hfs_extents.o hfs_fsinfo.o hfs_hotfiles.o hfs_journal.o hfs_link.o hfs_lookup.o hfs_notification.o hfs_quota.o hfs_readwrite.o hfs_resize.o hfs_search.o hfs_vfsops.o hfs_vfsutils.o hfs_vnops.o hfs_xattr.o rangelist.o hfs_encodinghint.o hfs_encodings.o sagit_hfs_iokit.o
++$(foreach o,$(SAGIT_HFS_OBJS),$(eval $(o)_CFLAGS_ADD += -include $(SAGIT_HFS_ROOT)/sagit_hfs_compat.h -I$(SAGIT_HFS_ROOT) -I$(SAGIT_HFS_ROOT)/core))
++hfs_encodings.o_CFLAGS_ADD += -Dhfs_allocated=hfs_encodings_allocated
++hfs_encodinghint.o_CFLAGS_ADD += -Dhfs_allocated=hfs_encodings_allocated
++
+ #
+ # Directories for mig generated files
+ #
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -699,6 +699,11 @@
+ #if defined(SAGIT)
+ 	printf("SAGIT: vfsinit done\n");
+ #endif
++#if SAGIT_HFS
++	/* HFS is built in: register it like its kext would, before mounting root. */
++	extern void sagit_hfs_register(void);
++	sagit_hfs_register();
++#endif
+ 
+ #if CONFIG_PROC_UUID_POLICY
+ 	/* Initial proc_uuid_policy subsystem */
+diff --git a/bsd/miscfs/mockfs/mockfs_vfsops.c b/bsd/miscfs/mockfs/mockfs_vfsops.c
+--- a/bsd/miscfs/mockfs/mockfs_vfsops.c
++++ b/bsd/miscfs/mockfs/mockfs_vfsops.c
+@@ -51,6 +51,36 @@
+ int mockfs_sync(__unused struct mount *mp, __unused int waitfor, __unused vfs_context_t ctx);
+ int mockfs_init(__unused struct vfsconf * vfsc);
+ 
++static int
++mockfs_check_macho(vnode_t rvp)
++{
++	buf_t bp = NULL;
++	uint32_t magic = 0;
++	int error;
++
++	error = (int)buf_meta_bread(rvp, 0, DEV_BSIZE, NOCRED, &bp);
++	if (!error) {
++		memcpy(&magic, (const void *)buf_dataptr(bp), sizeof(magic));
++		switch (magic) {
++		case MH_MAGIC:
++		case MH_CIGAM:
++		case MH_MAGIC_64:
++		case MH_CIGAM_64:
++		case FAT_MAGIC:
++		case FAT_CIGAM:
++			break;
++		default:
++			error = EINVAL;
++			break;
++		}
++	}
++	if (bp) {
++		/* Do not leave a DEV_BSIZE block cached for the next filesystem's reads. */
++		buf_markinvalid(bp);
++		buf_brelse(bp);
++	}
++	return error;
++}
+ /*
+  * mockfs_mountroot:
+  *   Given a mount (mp) and a vnode for the root device (rvp), builds a fake filesystem for rvp.  This consists
+@@ -72,9 +102,11 @@
+ 	dk_memdev_info_t memdev_info;
+ 
+ 	/*
+-	 * TODO: Validate that the device at least LOOKS like a mach-o (has a sane header); this would prevent us
+-	 *   from causing EBADMACHO panics further along the boot path.
++	 * Validate that the device at least LOOKS like a mach-o ...
+ 	 */
++	if ((rvalue = mockfs_check_macho(rvp))) {
++		return rvalue;
++	}
+ 
+ 	/*
+ 	 * There are no M_MOCKFS* definitions at the moment, just use M_TEMP.
+diff --git a/bsd/sagit_hfs/sagit_hfs_compat.h b/bsd/sagit_hfs/sagit_hfs_compat.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/sagit_hfs/sagit_hfs_compat.h
+@@ -0,0 +1,26 @@
++/*
++ * Compile Apple's HFS kext sources inside SAGIT the way the kext is built:
++ * with the kext (KPI) view of the kernel headers, and with only HFS's own
++ * kext-config.h deciding features. The kernel's -DCONFIG_* options are not
++ * visible to a kext build, so the ones HFS tests are cleared first. SAGIT
++ * has no AppleKeyStore, so content protection stays off.
++ */
++#ifndef SAGIT_HFS_COMPAT_H
++#define SAGIT_HFS_COMPAT_H
++#undef BSD_KERNEL_PRIVATE
++#undef XNU_KERNEL_PRIVATE
++#undef CONFIG_PROTECT
++#undef CONFIG_SEARCHFS
++#undef CONFIG_HFS_DIRLINK
++#undef CONFIG_SECLUDED_RENAME
++#undef CONFIG_MACF
++#undef CONFIG_HFS_RBTREE
++#undef QUOTA
++#undef NAMEDSTREAMS
++#undef FIFO
++#undef HFS_COMPRESSION
++#include "core/kext-config.h"
++
++/* Built in, not a loadable kext (see sagit_hfs_iokit.c). */
++#define OSKextGetCurrentLoadTag sagit_hfs_current_load_tag
++#endif
+\ No newline at end of file
+diff --git a/bsd/sagit_hfs/sagit_hfs_iokit.c b/bsd/sagit_hfs/sagit_hfs_iokit.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/sagit_hfs/sagit_hfs_iokit.c
+@@ -0,0 +1,132 @@
++/*
++ * Built-in replacement for HFS's IOKit glue (core/hfs_iokit.cpp and
++ * hfs_encodings/hfs_encodings_kext.cpp) on SAGIT.
++ *
++ * On Apple platforms HFS is a kext: IOKit matches its IOService on
++ * IOResources and start() registers the filesystem. SAGIT links HFS into
++ * the kernel instead, so bsd_init calls sagit_hfs_register() right after
++ * vfsinit(), before the root filesystem is mounted. The registration is the
++ * kext's start() sequence.
++ *
++ * The helpers that query IOKit storage keep their answers for SAGIT, which
++ * has no IOStorageFamily and therefore no IOMedia objects: nothing is
++ * ejectable and no media carries an external journal. The platform expert
++ * publishes no serial number. Content protection (AppleKeyStore) is not
++ * built (sagit_hfs_compat.h).
++ */
++#include <libkern/OSKextLib.h>
++#include <pexpert/pexpert.h>
++#include <sys/sysctl.h>
++
++#include "hfs.h"
++#include "hfs_cnode.h"
++#include "hfs_dbg.h"
++#include "hfs_iokit.h"
++#include "hfs_encodings/hfs_encodings_internal.h"
++
++#ifndef panic_on_assert
++bool panic_on_assert;
++#endif
++
++#if DEBUG
++bool hfs_corruption_panics = true;
++#endif
++
++extern struct vnodeopv_desc hfs_vnodeop_opv_desc;
++extern struct vnodeopv_desc hfs_specop_opv_desc;
++extern struct vnodeopv_desc hfs_fifoop_opv_desc;
++extern struct vfsops hfs_vfsops;
++
++void sagit_hfs_register(void);
++
++static vfstable_t sagit_hfs_vfs_handle;
++
++void
++sagit_hfs_register(void)
++{
++#ifndef panic_on_assert
++	panic_on_assert = PE_i_can_has_kernel_configuration() & kPEICanHasAssertions;
++#endif
++
++#if DEBUG
++	PE_parse_boot_argn("hfs_corruption_panics", &hfs_corruption_panics, sizeof(hfs_corruption_panics));
++#endif
++
++	/* The HFSEncodings kext's start(): its converters must exist before any mount. */
++	hfs_converterinit();
++
++	struct vnodeopv_desc *op_descs[] = {
++		&hfs_vnodeop_opv_desc,
++		&hfs_specop_opv_desc,
++#if FIFO
++		&hfs_fifoop_opv_desc,
++#endif
++	};
++
++#ifndef VFS_TBLVNOP_SECLUDE_RENAME
++#define VFS_TBLVNOP_SECLUDE_RENAME 0
++#endif
++
++	struct vfs_fsentry vfe = {
++		.vfe_vfsops = &hfs_vfsops,
++		.vfe_vopcnt = sizeof(op_descs) / sizeof(op_descs[0]),
++		.vfe_opvdescs = op_descs,
++		.vfe_fsname = "hfs",
++		.vfe_flags = (VFS_TBLNOTYPENUM | VFS_TBLLOCALVOL | VFS_TBLREADDIR_EXTENDED
++		    | VFS_TBL64BITREADY | VFS_TBLVNOP_PAGEOUTV2 | VFS_TBLVNOP_PAGEINV2
++		    | VFS_TBLTHREADSAFE | VFS_TBLCANMOUNTROOT | VFS_TBLVNOP_SECLUDE_RENAME
++		    | VFS_TBLNATIVEXATTR)
++	};
++
++	int ret = vfs_fsadd(&vfe, &sagit_hfs_vfs_handle);
++	if (ret) {
++		panic("SAGIT HFS: vfs_fsadd failed: %d", ret);
++	}
++
++	hfs_init_zones();
++	hfs_sysctl_register();
++
++	uint32_t num_cpus;
++	size_t sz = sizeof(num_cpus);
++
++	if (sysctlbyname("hw.physicalcpu", &num_cpus, &sz, NULL, 0) == 0) {
++		if ((2 * num_cpus) > MAX_CACHED_ORIGINS_DEFAULT) {
++			_hfs_max_origins = 2 * num_cpus;
++			_hfs_max_file_origins = 2 * num_cpus;
++		} else if ((2 * num_cpus) > MAX_CACHED_FILE_ORIGINS_DEFAULT) {
++			_hfs_max_file_origins = 2 * num_cpus;
++		}
++	}
++
++	printf("SAGIT HFS: hfs-627.100.6 registered\n");
++}
++
++/* Built in, not a loadable kext: there is no kext to retain per mount. */
++OSKextLoadTag
++sagit_hfs_current_load_tag(void)
++{
++	return kOSKextInvalidLoadTag;
++}
++
++int
++hfs_is_ejectable(__unused const char *cdev_name)
++{
++	return 0;
++}
++
++void
++hfs_iterate_media_with_content(__unused const char *content_uuid_cstring,
++    __unused int (*func)(const char *bsd_name, const char *uuid_str, void *arg),
++    __unused void *arg)
++{
++}
++
++kern_return_t
++hfs_get_platform_serial_number(char *serial_number_str, uint32_t len)
++{
++	if (len < 1) {
++		return 0;
++	}
++	serial_number_str[0] = '\0';
++	return KERN_NOT_SUPPORTED;
++}
+\ No newline at end of file

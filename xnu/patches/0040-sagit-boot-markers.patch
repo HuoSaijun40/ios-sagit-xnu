@@ -1,0 +1,36 @@
+diff --git a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -183,6 +183,9 @@
+ 	SOCD_TRACE_XNU(START_IOKIT);
+ 	assert(gRootNub != NULL);
+ 	bool ok = gRootNub->startIOServiceMatching();
++#if defined(SAGIT)
++	IOLog("SAGIT: IOService matching returned %d\n", ok);
++#endif
+ 	if (__improbable(!ok)) {
+ 		panic("Failed to start IOService matching");
+ 	}
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -500,6 +500,9 @@
+ 
+ 	throttle_init();
+ 
++#if defined(SAGIT)
++	printf("SAGIT: bsd_init enter\n");
++#endif
+ 	printf(copyright);
+ 
+ #if CONFIG_DEV_KMEM
+@@ -866,6 +869,9 @@
+ 		netboot = (mountroot == netboot_mountroot);
+ #endif
+ 
++#if defined(SAGIT)
++		printf("SAGIT: vfs_mountroot (%s)\n", rootdevice[0] ? rootdevice : "no rootdev");
++#endif
+ 		bsd_init_kprintf("vfs_mountroot\n");
+ 		if (0 == (err = vfs_mountroot())) {
+ 			break;
