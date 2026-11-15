@@ -86,11 +86,15 @@ jobs:
           # into the tree (0045/0046). Copy our stage helpers, after clearing any
           # stale one so a renamed helper cannot run twice.
           find dxb/patches -maxdepth 1 -name '[0-9][0-9][0-9][0-9]-*-sagit-*.sh' -delete 2>/dev/null || true
+          n=0
           for f in ci/*.sh; do
             [ -e "$f" ] || continue
             cp "$f" dxb/patches/
+            n=$((n + 1))
           done
-          ls dxb/patches/*.sh 2>/dev/null || true
+          echo "stage scripts copied: $n"
+          [ "$n" -ge 2 ] || { echo "::error::ci/*.sh not found (expected 2 stage scripts at the repo root)"; exit 1; }
+          ls -l dxb/patches/*.sh 2>/dev/null || true
           dup=$( (ls dxb/patches/*.patch 2>/dev/null || true) | xargs -n1 basename 2>/dev/null \
                  | grep -E '^[0-9]{4}-' | cut -c1-4 | sort | uniq -d || true)
           if [ -n "$dup" ]; then echo "::error::duplicate numbered patches: $dup"; exit 1; fi
