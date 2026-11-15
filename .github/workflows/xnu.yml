@@ -137,11 +137,14 @@ jobs:
           echo "staged bsd/pthread/sagit_libpthread: $(ls dxb/xnu/bsd/pthread/sagit_libpthread | tr '\n' ' ')"
           rm -rf "$T"
 
-          # Sanity check: every file 0052 lists must now exist.
-          miss=$(awk '/sagit_hfs\/.*optional sagit_hfs/ {print $1}' xnu/patches/0052-sagit-builtin-hfs.patch \
-                 | grep '^bsd/' | sed 's#^bsd/sagit_hfs#dxb/xnu/bsd/sagit_hfs#' | while read -r f; do
-                   [ -e "$f" ] || echo "$f"; done)
-          if [ -n "$miss" ]; then echo "::error::missing staged files:"; echo "$miss"; exit 1; fi
+          # Sanity check: every source 0052 pulls from the tarball must exist.
+          # sagit_hfs_iokit.c is created by the patch itself, not staged here.
+          miss=""
+          for f in $(awk '/^\+bsd\/sagit_hfs\/(core|hfs_encodings)\// {print $1}' xnu/patches/0052-sagit-builtin-hfs.patch); do
+            rel=${f#+bsd/sagit_hfs/}
+            [ -e "dxb/xnu/bsd/sagit_hfs/$rel" ] || miss="$miss $f"
+          done
+          if [ -n "$miss" ]; then echo "::error::missing staged files:$miss"; exit 1; fi
           echo "all HFS sources listed by 0052 are present"
           ls dxb/patches
 
