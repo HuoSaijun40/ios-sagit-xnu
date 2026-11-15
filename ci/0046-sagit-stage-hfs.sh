@@ -29,7 +29,7 @@ import sys
 source = Path(sys.argv[1])
 target = Path('bsd/sagit_hfs')
 if target.exists():
-    raise SystemExit(f'refusing to overwrite existing HFS sources: {target}')
+    print(f'already staged: {target}'); raise SystemExit(0)
 # Preserve upstream copyright/license headers; no downloaded sources in git.
 for directory in ('core', 'hfs_encodings'):
     shutil.copytree(source / directory, target / directory)

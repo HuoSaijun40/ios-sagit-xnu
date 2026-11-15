@@ -28,7 +28,7 @@ import sys
 source = Path(sys.argv[1])
 target = Path('bsd/pthread/sagit_libpthread')
 if target.exists():
-    raise SystemExit(f'refusing to overwrite existing provider: {target}')
+    print(f'already staged: {target}'); raise SystemExit(0)
 # Preserve upstream copyright/license headers; no downloaded sources in git.
 for directory in ('kern', 'private', 'include'):
     shutil.copytree(source / directory, target / directory)
