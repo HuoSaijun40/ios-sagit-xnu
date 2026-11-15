@@ -1,0 +1,12 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -495,7 +495,7 @@
+ #if defined(SAGIT)
+ /* 0 = boot normally. 1 = panic before sagit_ufs_rootdev, 2 = panic after. */
+ #ifndef SAGIT_UFS_PROBE
+-#define SAGIT_UFS_PROBE 1
++#define SAGIT_UFS_PROBE 2
+ #endif
+ #endif
+ 
