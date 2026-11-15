@@ -1,0 +1,12 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -498,7 +498,7 @@
+  * 0 disables the probe. Change the number and rebuild.
+  */
+ #ifndef SAGIT_BISECT
+-#define SAGIT_BISECT 7
++#define SAGIT_BISECT 0
+ #endif
+ #define SAGIT_BISECT_AT(n, name) do { \
+ 	if (SAGIT_BISECT != 0 && (n) == SAGIT_BISECT) { \

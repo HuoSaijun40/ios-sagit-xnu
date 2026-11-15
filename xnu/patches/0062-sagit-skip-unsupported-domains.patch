@@ -1,0 +1,32 @@
+diff --git a/bsd/kern/uipc_domain.c b/bsd/kern/uipc_domain.c
+--- a/bsd/kern/uipc_domain.c
++++ b/bsd/kern/uipc_domain.c
+@@ -726,16 +726,28 @@
+ 	 */
+ 	attach_domain(&inetdomain_s);
+ 	attach_domain(&inet6domain_s);
++#if defined(SAGIT)
++	printf("SAGIT: not attaching mpdomain_s (unsupported)\n");
++#else
+ #if MULTIPATH
+ 	attach_domain(&mpdomain_s);
+ #endif /* MULTIPATH */
++#endif /* SAGIT */
+ 	attach_domain(&systemdomain_s);
+ 	attach_domain(&localdomain_s);
++#if defined(SAGIT)
++	printf("SAGIT: not attaching keydomain_s (unsupported)\n");
++#else
+ #if IPSEC
+ 	attach_domain(&keydomain_s);
+ #endif /* IPSEC */
++#endif /* SAGIT */
+ 	attach_domain(&ndrvdomain_s);
++#if !defined(SAGIT)
+ 	attach_domain(&vsockdomain_s);
++#else
++	printf("SAGIT: not attaching vsockdomain_s (unsupported)\n");
++#endif /* SAGIT */
+ 	attach_domain(&routedomain_s);  /* must be last domain */
+ 
+ 	/*
