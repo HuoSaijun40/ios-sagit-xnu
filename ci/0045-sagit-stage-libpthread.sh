@@ -17,7 +17,7 @@ pthread_sha=a6c70ca0e544347a0377babf748f831577ec24f9
 # Sources are committed as vendor/libpthread.tar.gz (no network needed).
 if [ ! -f "$VENDOR/libpthread.tar.gz" ]; then echo "missing vendor/libpthread.tar.gz" >&2; exit 1; fi
 pthread_tmp=$(mktemp -d)
-tar -xzf "$VENDOR/libpthread.tar.gz" -C "pthread_tmp"
+tar -xzf "$VENDOR/libpthread.tar.gz" -C "$pthread_tmp"
 trap 'rm -rf "$pthread_tmp"' EXIT
 echo "using vendored libpthread-514.100.2"
 
