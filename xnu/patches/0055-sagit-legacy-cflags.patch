@@ -1,0 +1,23 @@
+diff --git a/bsd/conf/Makefile.template b/bsd/conf/Makefile.template
+--- a/bsd/conf/Makefile.template
++++ b/bsd/conf/Makefile.template
+@@ -54,12 +54,19 @@
+ sagit_pthread_init.o_INCFLAGS = $(SAGIT_PTHREAD_INC)
+ sagit_pthread_support.o_INCFLAGS = $(SAGIT_PTHREAD_INC)
+ sagit_pthread_synch.o_INCFLAGS = $(SAGIT_PTHREAD_INC)
++# libpthread-514 predates clang turning pointer<->integer conversions through
++# void* into errors; the port hands handles around that way, so downgrade it here.
++SAGIT_LEGACY_CFLAGS = -Wno-int-conversion -Wno-incompatible-pointer-types -Wno-implicit-function-declaration
++sagit_pthread_init.o_CFLAGS_ADD += $(SAGIT_LEGACY_CFLAGS)
++sagit_pthread_support.o_CFLAGS_ADD += $(SAGIT_LEGACY_CFLAGS)
++sagit_pthread_synch.o_CFLAGS_ADD += $(SAGIT_LEGACY_CFLAGS)
+ endif
+ 
+ # Apple OSS HFS built in (bsd/sagit_hfs): compiled like the kext, see sagit_hfs_compat.h.
+ SAGIT_HFS_ROOT = $(SRCROOT)/bsd/sagit_hfs
+ SAGIT_HFS_OBJS = BTree.o BTreeAllocate.o BTreeMiscOps.o BTreeNodeOps.o BTreeNodeReserve.o BTreeScanner.o BTreeTreeOps.o BTreeWrapper.o CatalogUtilities.o FileExtentMapping.o FileIDsServices.o MacOSStubs.o UnicodeWrappers.o VolumeAllocation.o hfs_attrlist.o hfs_btreeio.o hfs_catalog.o hfs_chash.o hfs_cnode.o hfs_cprotect.o hfs_endian.o hfs_extents.o hfs_fsinfo.o hfs_hotfiles.o hfs_journal.o hfs_link.o hfs_lookup.o hfs_notification.o hfs_quota.o hfs_readwrite.o hfs_resize.o hfs_search.o hfs_vfsops.o hfs_vfsutils.o hfs_vnops.o hfs_xattr.o rangelist.o hfs_encodinghint.o hfs_encodings.o sagit_hfs_iokit.o
+ $(foreach o,$(SAGIT_HFS_OBJS),$(eval $(o)_CFLAGS_ADD += -include $(SAGIT_HFS_ROOT)/sagit_hfs_compat.h -I$(SAGIT_HFS_ROOT) -I$(SAGIT_HFS_ROOT)/core))
++$(foreach o,$(SAGIT_HFS_OBJS),$(eval $(o)_CFLAGS_ADD += -Wno-int-conversion -Wno-incompatible-pointer-types -Wno-implicit-function-declaration))
+ hfs_encodings.o_CFLAGS_ADD += -Dhfs_allocated=hfs_encodings_allocated
+ hfs_encodinghint.o_CFLAGS_ADD += -Dhfs_allocated=hfs_encodings_allocated
+ 
