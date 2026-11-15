@@ -205,6 +205,16 @@ jobs:
             tail -40000 "$LOG" | sed -e 's/\x1b\[[0-9;]*m//g' \
               | grep -v -E 'warning:|^[[:space:]]+[0-9]+ \||^[[:space:]]+\|.*\^|^[[:space:]]*$' \
               | tail -400 | tee -a "$LOG" || true
+            # Parallel -j output interleaves clang diagnostics, which is why the
+            # failing bsd file never showed up as a readable "error:" line.
+            # Rebuild the bsd component alone, serially, and keep its own log.
+            echo "=== serial bsd rebuild (de-interleaved) ===" | tee -a "$LOG"
+            BSDLOG="${RUNNER_TEMP}/bsd-serial.log"
+            rc_bsd=0
+            ( cd xnu/bsd && make -j1 do_all MAKEFLAGS= >"$BSDLOG" 2>&1 ) || rc_bsd=$?
+            echo "serial bsd make exit: $rc_bsd (log $(wc -l < "$BSDLOG" 2>/dev/null || echo 0) lines)"
+            sed -e 's/\x1b\[[0-9;]*m//g' "$BSDLOG" 2>/dev/null \
+              | grep -n -B3 -A12 -m5 -E 'error:|Error [0-9]+' | head -160 | tee -a "$LOG" || true
           fi
 
           # Only diagnostics go into the job log and into the small artifact;
