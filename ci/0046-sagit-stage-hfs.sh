@@ -24,7 +24,7 @@ echo "using vendored hfs-627.100.6"
 
 
 
-python3 - "$hfs_tmp" <<'PY'
+python3 - "$hfs_tmp/hfs" <<'PY'
 from pathlib import Path
 import shutil
 import sys

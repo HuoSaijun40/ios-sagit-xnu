@@ -23,7 +23,7 @@ echo "using vendored libpthread-514.100.2"
 
 
 
-python3 - "$pthread_tmp" <<'PY'
+python3 - "$pthread_tmp/libpthread" <<'PY'
 from pathlib import Path
 import shutil
 import sys
