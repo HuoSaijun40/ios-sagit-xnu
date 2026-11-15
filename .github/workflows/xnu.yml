@@ -81,9 +81,8 @@ jobs:
             esac
             cp "$f" dxb/patches/
           done
-          # No ci/*.sh any more: the vendored sources are unpacked in the next
-          # step, into a pre-cloned dxb/xnu. Clear any stale stage helper so an
-          # older copy cannot also run during this build.
+          # The vendored OSS sources are unpacked into a pre-cloned dxb/xnu by the
+          # next step; clear any stale stage helper so an old copy cannot run.
           find dxb/patches -maxdepth 1 -name '[0-9][0-9][0-9][0-9]-*-sagit-*.sh' -delete 2>/dev/null || true
           ls -l vendor/*.tar.gz || { echo "::error::vendor/*.tar.gz missing"; exit 1; }
           dup=$( (ls dxb/patches/*.patch 2>/dev/null || true) | xargs -n1 basename 2>/dev/null \
@@ -195,6 +194,18 @@ jobs:
           bash build.sh >"$LOG" 2>&1 || rc=$?
           echo "build.sh exit code: $rc"
           echo "full compiler log: $(wc -l < "$LOG") lines, $(du -h "$LOG" | cut -f1) (not shown)"
+
+          # LDFILELIST (makedefs' file-list generation) can fail without printing
+          # a reason. If the build died right after it, re-run just that step with
+          # make's own tracing so the next diagnostics says what it choked on.
+          if [ "$rc" -ne 0 ] && grep -q 'LDFILELIST' "$LOG"; then
+            echo "=== LDFILELIST failed: retrying the osfmk file list with tracing ===" | tee -a "$LOG"
+            if ! make -C xnu/osfmk LDFILELIST MAKEFLAGS= V=1 2>&1 | tail -60 | tee -a "$LOG"; then
+              echo "(traced retry failed as well)"
+            fi
+            echo "=== make -n on the bootstrap target ===" | tee -a "$LOG"
+            make -C xnu -n build_all_bootstrap_DEVELOPMENT^ARM64^SAGIT MAKEFLAGS= 2>&1 | tail -40 | tee -a "$LOG" || true
+          fi
 
           # Only diagnostics go into the job log and into the small artifact;
           # the raw log stays on the runner. Grep -A gives the source context
