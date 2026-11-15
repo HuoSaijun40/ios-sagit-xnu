@@ -1,0 +1,45 @@
+diff --git a/bsd/dev/sagit_ufs.c b/bsd/dev/sagit_ufs.c
+--- a/bsd/dev/sagit_ufs.c
++++ b/bsd/dev/sagit_ufs.c
+@@ -34,6 +34,20 @@
+ #include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>
+ 
++#if defined(SAGIT)
++/* Stage probe: panic at step N so the stall point is visible. 0 = off. */
++#ifndef SAGIT_UFS_STAGE
++#define SAGIT_UFS_STAGE 1
++#endif
++#define SAGIT_UFS_STEP(n, what) do { \
++	if (SAGIT_UFS_STAGE != 0 && (n) == SAGIT_UFS_STAGE) { \
++		panic("SAGIT UFS step %d: %s", (n), what); \
++	} \
++} while (0)
++#else
++#define SAGIT_UFS_STEP(n, what) do { } while (0)
++#endif
++
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+ #if defined(SAGIT)
+@@ -551,20 +565,6 @@
+ /* Root device for rd=ufsroot0 (IOFindBSDRoot). */
+ int sagit_ufs_rootdev(dev_t *dev);
+ 
+-#if defined(SAGIT)
+-/* Stage probe: panic at step N so the stall point is visible. 0 = off. */
+-#ifndef SAGIT_UFS_STAGE
+-#define SAGIT_UFS_STAGE 1
+-#endif
+-#define SAGIT_UFS_STEP(n, what) do { \
+-	if (SAGIT_UFS_STAGE != 0 && (n) == SAGIT_UFS_STAGE) { \
+-		panic("SAGIT UFS step %d: %s", (n), what); \
+-	} \
+-} while (0)
+-#else
+-#define SAGIT_UFS_STEP(n, what) do { } while (0)
+-#endif
+-
+ int
+ sagit_ufs_rootdev(dev_t *dev)
+ {
