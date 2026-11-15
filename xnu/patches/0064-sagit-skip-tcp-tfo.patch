@@ -1,0 +1,28 @@
+diff --git a/bsd/netinet/tcp_subr.c b/bsd/netinet/tcp_subr.c
+--- a/bsd/netinet/tcp_subr.c
++++ b/bsd/netinet/tcp_subr.c
+@@ -533,7 +533,12 @@
+ 	SYSCTL_SKMEM_UPDATE_FIELD(tcp.microuptime_init, tcp_microuptime_init);
+ 	SYSCTL_SKMEM_UPDATE_FIELD(tcp.now_init, tcp_now_init);
+ 
++#if defined(SAGIT)
++	/* No corecrypto: the TFO cookie installs AES and would fault. */
++	printf("SAGIT: skipping tcp_tfo_init (no corecrypto)\n");
++#else
+ 	tcp_tfo_init();
++#endif /* SAGIT */
+ 
+ 	LIST_INIT(&tcb);
+ 	tcbinfo.ipi_listhead = &tcb;
+@@ -605,7 +610,11 @@
+ 	}
+ 
+ 	/* Initialize TCP Cache */
++#if defined(SAGIT)
++	/* TFO cache lives under the same crypto dependency. */
++#else
+ 	tcp_cache_init();
++#endif /* SAGIT */
+ 
+ 	tcp_mpkl_log_object = MPKL_CREATE_LOGOBJECT("com.apple.xnu.tcp");
+ 	if (tcp_mpkl_log_object == NULL) {
