@@ -1,0 +1,34 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -946,8 +946,30 @@
+ 	while (TRUE) {
+ 		int err;
+ 
++#if defined(SAGIT)
++		/*
++		 * Do not ask IOKit to discover the root device: IOFindBSDRoot() never
++		 * returns on this port (no IOMedia/IOStorageFamily), which stalls the
++		 * boot right here. Resolve ufsroot0 directly instead.
++		 */
++		{
++			extern int sagit_ufs_rootdev(dev_t * dev);
++			dev_t ufs_dev = 0;
++			int ufs_err = sagit_ufs_rootdev(&ufs_dev);
++
++			if (ufs_err == 0) {
++				rootdev = ufs_dev;
++				strlcpy(rootdevice, "ufsroot0", sizeof(rootdevice));
++				printf("SAGIT: root device resolved (ufsroot0, maj %d min %d)\n",
++				    major(ufs_dev), minor(ufs_dev));
++			} else {
++				panic("SAGIT: ufsroot0 unavailable: %d", ufs_err);
++			}
++		}
++#else
+ 		bsd_init_kprintf("calling setconf\n");
+ 		setconf();
++#endif
+ #if CONFIG_NETBOOT
+ 		netboot = (mountroot == netboot_mountroot);
+ #endif
