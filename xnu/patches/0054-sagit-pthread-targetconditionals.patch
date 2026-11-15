@@ -1,0 +1,17 @@
+diff --git a/bsd/conf/Makefile.template b/bsd/conf/Makefile.template
+--- a/bsd/conf/Makefile.template
++++ b/bsd/conf/Makefile.template
+@@ -45,9 +45,12 @@
+ SFLAGS+= -include meta_features.h
+ 
+ # libpthread is built into SAGIT; other boards load their normal kext.
++# sagit_pthread_compat.h drops BSD_KERNEL_PRIVATE, so osfmk/kern/debug.h pulls in
++# <TargetConditionals.h> the kext way; the kernel build is -nostdinc, so the SDK
++# copy is staged next to these sources and searched first.
+ ifeq ($(CURRENT_MACHINE_CONFIG),SAGIT)
+ SAGIT_PTHREAD_ROOT = $(SRCROOT)/bsd/pthread/sagit_libpthread
+-SAGIT_PTHREAD_INC = -I$(SAGIT_PTHREAD_ROOT) -I$(SAGIT_PTHREAD_ROOT)/private -I$(SAGIT_PTHREAD_ROOT)/include
++SAGIT_PTHREAD_INC = -I$(SAGIT_PTHREAD_ROOT) -I$(SAGIT_PTHREAD_ROOT)/private -I$(SAGIT_PTHREAD_ROOT)/include -I$(SRCROOT)/bsd/pthread
+ sagit_pthread_init.o_INCFLAGS = $(SAGIT_PTHREAD_INC)
+ sagit_pthread_support.o_INCFLAGS = $(SAGIT_PTHREAD_INC)
+ sagit_pthread_synch.o_INCFLAGS = $(SAGIT_PTHREAD_INC)
