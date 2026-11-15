@@ -95,6 +95,25 @@ jobs:
           echo "stage scripts copied: $n"
           [ "$n" -ge 2 ] || { echo "::error::ci/*.sh not found (expected 2 stage scripts at the repo root)"; exit 1; }
           ls -l dxb/patches/*.sh 2>/dev/null || true
+          # The pinned build.sh gates its patches/*.sh loop on a `compgen -G`
+          # test that does not fire in this job, so stage the OSS sources here.
+          # Our scripts are idempotent: if build.sh's own loop also runs them,
+          # the second run just prints "already staged".
+          python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path("dxb/build.sh")
+          s = p.read_text()
+          anchor = '        cd "${WORK_DIR}/xnu"\n'
+          run = ('        for S in "${PATCH_DIR}"/*.sh; do [ -e "$S" ] || continue; '
+                 'echo "SAGIT stage: $S"; bash "$S" || exit 1; done\n')
+          if "SAGIT stage:" in s:
+              print("stage runner already present")
+          elif s.count(anchor) == 1:
+              p.write_text(s.replace(anchor, anchor + run, 1))
+              print("injected stage runner")
+          else:
+              print("ERROR: stage runner anchor not found")
+          PY
           dup=$( (ls dxb/patches/*.patch 2>/dev/null || true) | xargs -n1 basename 2>/dev/null \
                  | grep -E '^[0-9]{4}-' | cut -c1-4 | sort | uniq -d || true)
           if [ -n "$dup" ]; then echo "::error::duplicate numbered patches: $dup"; exit 1; fi
