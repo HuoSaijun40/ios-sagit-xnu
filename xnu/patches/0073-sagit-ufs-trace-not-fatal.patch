@@ -1,0 +1,106 @@
+diff --git a/bsd/dev/sagit_ufs.c b/bsd/dev/sagit_ufs.c
+--- a/bsd/dev/sagit_ufs.c
++++ b/bsd/dev/sagit_ufs.c
+@@ -35,17 +35,22 @@
+ #include <libkern/libkern.h>
+ 
+ #if defined(SAGIT)
+-/* Stage probe: panic at step N so the stall point is visible. 0 = off. */
+-#ifndef SAGIT_UFS_STAGE
+-#define SAGIT_UFS_STAGE 1
+-#endif
++/*
++ * Stage trace. Earlier rounds panicked at step N so the stall point was
++ * visible, but that stopped the driver before it did anything and kept the
++ * 0069 spin budget from ever running. Now every step sets a sticky bit and
++ * execution continues; the bits ride along in the panic string when the SCSI
++ * poll gives up, so one boot reports the whole path.
++ */
++static uint32_t sagit_ufs_trace;
+ #define SAGIT_UFS_STEP(n, what) do { \
+-	if (SAGIT_UFS_STAGE != 0 && (n) == SAGIT_UFS_STAGE) { \
+-		panic("SAGIT UFS step %d: %s", (n), what); \
+-	} \
++	(void)(what); \
++	sagit_ufs_trace |= (1u << (n)); \
+ } while (0)
++#define SAGIT_UFS_TRACE()       (sagit_ufs_trace)
+ #else
+ #define SAGIT_UFS_STEP(n, what) do { } while (0)
++#define SAGIT_UFS_TRACE()       0
+ #endif
+ 
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+@@ -199,9 +204,30 @@
+ 	 */
+ 	for (uint32_t spin = 0; ufs_rd(REG_UTRLDBR) & 1; spin++) {
+ 		if (spin >= CMD_SPIN_BUDGET) {
++			/*
++			 * Report everything a single boot can tell us: which steps
++			 * were reached, and what the host controller looks like
++			 * right now. printf() is dead this late, so panic().
++			 */
++#if defined(SAGIT)
++			uint32_t hcs = ufs_rd(REG_HCS);
++			uint32_t hce = ufs_rd(REG_HCE);
++			uint32_t dbr = ufs_rd(REG_UTRLDBR);
++			uint32_t rsr = ufs_rd(REG_UTRLRSR);
++			uint32_t lba = ufs_rd(REG_UTRLBA);
++			ufs_wr(REG_UTRLCLR, ~1u);
++			panic("SAGIT UFS: cmd 0x%02x never completed (%u spins)"
++			    " steps=0x%x hcs=0x%x hce=0x%x dbr=0x%x rsr=0x%x"
++			    " utrlba=0x%x dma=0x%llx dmapa=0x%llx regs=0x%llx",
++			    cdb[0], spin, SAGIT_UFS_TRACE(), hcs, hce, dbr, rsr,
++			    lba, (unsigned long long)su.dma,
++			    (unsigned long long)su.dma_pa,
++			    (unsigned long long)su.regs);
++#else
+ 			ufs_wr(REG_UTRLCLR, ~1u);
+ 			panic("SAGIT UFS: command 0x%02x timed out after %u spins",
+ 			    cdb[0], spin);
++#endif
+ 		}
+ 		sagit_ufs_hard_delay();
+ 	}
+@@ -507,10 +533,10 @@
+ 		return ENXIO;
+ 	}
+ 	PE_parse_boot_argn("ufsroot", want, sizeof(want));
+-	SAGIT_UFS_STEP(2, "DT node found, about to ml_io_map");
++	SAGIT_UFS_STEP(1, "DT node found, about to ml_io_map");
+ 
+ 	su.regs = ml_io_map(reg[0], reg[1]);
+-	SAGIT_UFS_STEP(3, "ml_io_map done, about to kmem_alloc_contig");
++	SAGIT_UFS_STEP(2, "ml_io_map done, about to kmem_alloc_contig");
+ 	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		panic("SAGIT UFS: kmem_alloc_contig(%u bytes) failed", (unsigned)DMA_SIZE);
+@@ -520,7 +546,7 @@
+ 		return ENOMEM;
+ 	}
+ 	su.dma_pa = ptoa_64(pn);
+-	SAGIT_UFS_STEP(4, "dma mapped, about to take over host");
++	SAGIT_UFS_STEP(3, "dma mapped, about to take over host");
+ 	su.lun = 0;
+ 	su.secsize = DEV_BSIZE;
+ 
+@@ -528,8 +554,9 @@
+ 	lck_mtx_lock(&sagit_ufs_lock);
+ #endif
+ 	error = ufs_take_over_host();
+-	SAGIT_UFS_STEP(5, "ufs_take_over_host returned");
++	SAGIT_UFS_STEP(4, "ufs_take_over_host returned");
+ 	if (!error) {
++		SAGIT_UFS_STEP(5, "about to send TEST UNIT READY");
+ 		static const uint8_t tur[6] = { 0x00 };
+ 		/* The first command after the bootloader may report a unit attention. */
+ 		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0)); i++) {
+@@ -568,7 +595,7 @@
+ int
+ sagit_ufs_rootdev(dev_t *dev)
+ {
+-	SAGIT_UFS_STEP(1, "enter sagit_ufs_rootdev");
++	SAGIT_UFS_STEP(0, "enter sagit_ufs_rootdev");
+ 	if (!su.ready) {
+ 		int error = sagit_ufs_init();
+ 		if (error) {
