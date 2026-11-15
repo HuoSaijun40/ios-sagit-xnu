@@ -1,6 +1,8 @@
 #!/bin/bash
 # dxb runs patches/*.sh from the XNU source root before applying *.patch.
 set -euo pipefail
+# Vendored sources live next to xnu/ in the repo (no network needed).
+VENDOR="${VENDOR:-${GITHUB_WORKSPACE}/vendor}"
 
 [[ "${MACHINE_CONFIG:-}" == SAGIT ]] || exit 0
 [[ "${MACOS_VERSION:-}" == 13.5 ]] || {
@@ -12,13 +14,14 @@ set -euo pipefail
 # libpthread-514.100.2 is paired with xnu-8796.141.3 in Apple's macos-135
 # release.json. Fetch the immutable commit, never a moving branch/tag.
 pthread_sha=a6c70ca0e544347a0377babf748f831577ec24f9
+# Sources are committed as vendor/libpthread.tar.gz (no network needed).
+if [ ! -f "$VENDOR/libpthread.tar.gz" ]; then echo "missing vendor/libpthread.tar.gz" >&2; exit 1; fi
 pthread_tmp=$(mktemp -d)
+tar -xzf "$VENDOR/libpthread.tar.gz" -C "pthread_tmp"
 trap 'rm -rf "$pthread_tmp"' EXIT
-git init -q "$pthread_tmp"
-git -C "$pthread_tmp" fetch -q --depth 1 \
-    https://github.com/apple-oss-distributions/libpthread "$pthread_sha"
-git -C "$pthread_tmp" checkout -q FETCH_HEAD
-[[ "$(git -C "$pthread_tmp" rev-parse HEAD)" == "$pthread_sha" ]]
+echo "using vendored libpthread-514.100.2"
+
+
 
 python3 - "$pthread_tmp" <<'PY'
 from pathlib import Path

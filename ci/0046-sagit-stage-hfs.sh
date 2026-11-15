@@ -2,6 +2,8 @@
 # Stage Apple's open source HFS for the SAGIT built-in filesystem (bsd/sagit_hfs).
 # dxb runs patches/*.sh from the XNU source root before applying *.patch.
 set -euo pipefail
+# Vendored sources live next to xnu/ in the repo (no network needed).
+VENDOR="${VENDOR:-${GITHUB_WORKSPACE}/vendor}"
 
 [[ "${MACHINE_CONFIG:-}" == SAGIT ]] || exit 0
 [[ "${MACOS_VERSION:-}" == 13.5 ]] || {
@@ -13,13 +15,14 @@ set -euo pipefail
 # hfs-627.100.6 is paired with xnu-8796.141.3 in Apple's macos-135
 # release.json. Fetch the immutable commit, never a moving branch/tag.
 hfs_sha=31d5ec238dfab485e78a9a30b8b92d13e8914f03
+# Sources are committed as vendor/hfs.tar.gz (no network needed).
+if [ ! -f "$VENDOR/hfs.tar.gz" ]; then echo "missing vendor/hfs.tar.gz" >&2; exit 1; fi
 hfs_tmp=$(mktemp -d)
+tar -xzf "$VENDOR/hfs.tar.gz" -C "$hfs_tmp"
 trap 'rm -rf "$hfs_tmp"' EXIT
-git init -q "$hfs_tmp"
-git -C "$hfs_tmp" fetch -q --depth 1 \
-    https://github.com/apple-oss-distributions/hfs "$hfs_sha"
-git -C "$hfs_tmp" checkout -q FETCH_HEAD
-[[ "$(git -C "$hfs_tmp" rev-parse HEAD)" == "$hfs_sha" ]]
+echo "using vendored hfs-627.100.6"
+
+
 
 python3 - "$hfs_tmp" <<'PY'
 from pathlib import Path
