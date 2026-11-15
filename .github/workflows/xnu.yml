@@ -126,6 +126,25 @@ jobs:
           tar -xzf vendor/hfs.tar.gz -C "$T"
           mkdir -p dxb/xnu/bsd/sagit_hfs
           cp -R "$T/hfs/core" "$T/hfs/hfs_encodings" dxb/xnu/bsd/sagit_hfs/
+          # No AppleKeyStore on this port (content protection is off, see
+          # sagit_hfs_compat.h), so guard the header and the key-wrapping API it
+          # belongs to. Without this the compile dies with
+          #   hfs.h: fatal error: 'AppleKeyStore/AppleKeyStoreFSServices.h' file not found
+          python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path("dxb/xnu/bsd/sagit_hfs/core/hfs_iokit.h")
+          t = p.read_text()
+          inc = "#include <AppleKeyStore/AppleKeyStoreFSServices.h>\n"
+          first, end = "int hfs_unwrap_key(", "__END_DECLS"
+          if t.count(inc) == 1 and t.count(first) == 1 and t.count(end) == 1 and "#if CONFIG_PROTECT" not in t:
+              t = t.replace(inc, "#if CONFIG_PROTECT\n" + inc + "#endif\n")
+              i, j = t.index(first), t.index(end)
+              t = t[:i] + "#if CONFIG_PROTECT\n" + t[i:j].rstrip("\n") + "\n#endif\n\n" + t[j:]
+              p.write_text(t)
+              print("guarded AppleKeyStore in hfs_iokit.h")
+          else:
+              print("hfs_iokit.h: nothing to guard (already patched?)")
+          PY
           cp "$(xcrun --sdk macosx --show-sdk-path)/usr/include/TargetConditionals.h" dxb/xnu/bsd/sagit_hfs/
           echo "staged bsd/sagit_hfs: $(ls dxb/xnu/bsd/sagit_hfs/core | wc -l) core files"
 
