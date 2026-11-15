@@ -206,15 +206,19 @@ jobs:
               | grep -v -E 'warning:|^[[:space:]]+[0-9]+ \||^[[:space:]]+\|.*\^|^[[:space:]]*$' \
               | tail -400 | tee -a "$LOG" || true
             # Parallel -j output interleaves clang diagnostics, which is why the
-            # failing bsd file never showed up as a readable "error:" line.
-            # Rebuild the bsd component alone, serially, and keep its own log.
-            echo "=== serial bsd rebuild (de-interleaved) ===" | tee -a "$LOG"
-            BSDLOG="${RUNNER_TEMP}/bsd-serial.log"
-            rc_bsd=0
-            ( cd xnu/bsd && make -j1 do_all MAKEFLAGS= >"$BSDLOG" 2>&1 ) || rc_bsd=$?
-            echo "serial bsd make exit: $rc_bsd (log $(wc -l < "$BSDLOG" 2>/dev/null || echo 0) lines)"
-            sed -e 's/\x1b\[[0-9;]*m//g' "$BSDLOG" 2>/dev/null \
-              | grep -n -B3 -A12 -m5 -E 'error:|Error [0-9]+' | head -160 | tee -a "$LOG" || true
+            # failing bsd file never showed up as a readable "error:" line. The
+            # build.sh environment (SRCROOT/OBJROOT/...) cannot be reproduced by a
+            # bare `make`, so ask build.sh itself to redo the run with -j1: that is
+            # ~10 minutes but its log is de-interleaved.
+            echo "=== serial rebuild via build.sh (MAKEFLAGS=-j1) ===" | tee -a "$LOG"
+            SLOG="${RUNNER_TEMP}/serial.log"
+            rc2=0
+            MAKEFLAGS=-j1 bash build.sh >"$SLOG" 2>&1 || rc2=$?
+            echo "serial rebuild exit: $rc2 ($(wc -l < "$SLOG") lines)" | tee -a "$LOG"
+            echo "=== serial: first 5 errors with context ===" | tee -a "$LOG"
+            sed -e 's/\x1b\[[0-9;]*m//g' "$SLOG" \
+              | grep -n -B4 -A15 -m5 -E ' error: |fatal error|Error [0-9]+' \
+              | head -200 | tee -a "$LOG" || true
           fi
 
           # Only diagnostics go into the job log and into the small artifact;
