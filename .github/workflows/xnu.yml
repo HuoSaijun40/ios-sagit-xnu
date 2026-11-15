@@ -136,6 +136,20 @@ jobs:
           echo "staged bsd/pthread/sagit_libpthread: $(ls dxb/xnu/bsd/pthread/sagit_libpthread | tr '\n' ' ')"
           rm -rf "$T"
 
+          # sagit_pthread_compat.h drops BSD_KERNEL_PRIVATE, so osfmk/kern/debug.h
+          # includes <TargetConditionals.h> the kext way. The kernel build is
+          # -nostdinc, so the SDK copy has to be reachable via -I (0054 adds
+          # bsd/pthread to the include path of the built-in pthread sources).
+          cp "$(xcrun --sdk macosx --show-sdk-path)/usr/include/TargetConditionals.h" dxb/xnu/bsd/pthread/
+          echo "staged bsd/pthread/TargetConditionals.h"
+
+          # Sanity check: every source 0051 pulls must exist too.
+          for f in bsd/pthread/sagit_pthread_init.c bsd/pthread/sagit_pthread_support.c \
+                   bsd/pthread/sagit_pthread_synch.c bsd/pthread/sagit_pthread_compat.h; do
+            [ -e "dxb/xnu/$f" ] || { echo "::error::missing $f (0051)"; exit 1; }
+          done
+          echo "all pthread sources listed by 0051 are present"
+
           # Sanity check: every source 0052 pulls from the tarball must exist.
           # sagit_hfs_iokit.c is created by the patch itself, not staged here.
           miss=""
