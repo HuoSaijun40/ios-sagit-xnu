@@ -111,10 +111,15 @@ jobs:
       - name: Pre-clone xnu and stage vendored sources
         run: |
           set -euo pipefail
-          RELEASE_URL="https://raw.githubusercontent.com/apple-oss-distributions/distribution-macOS/${MACOS_VERSION}/products/release.json"
-          XNU_TAG=$(curl -s "$RELEASE_URL" | jq -r '.projects[] | select(.project=="xnu") | .tag')
-          [ -n "$XNU_TAG" ] || { echo "::error::could not resolve the xnu tag from $RELEASE_URL"; exit 1; }
+          # build.sh maps 13.5 -> distribution-macOS/macos-135/release.json (no "products/"),
+          # and falls back to that branch's tag for the xnu clone. Mirror it exactly.
+          REL_BRANCH="macos-$(echo "$MACOS_VERSION" | tr -d '.')"
+          RELEASE_URL="https://raw.githubusercontent.com/apple-oss-distributions/distribution-macOS/${REL_BRANCH}/release.json"
+          RAW=$(curl -sf "$RELEASE_URL") || { echo "::error::cannot fetch $RELEASE_URL"; exit 1; }
+          XNU_TAG=$(printf '%s' "$RAW" | jq -r '.projects[]? | select(.project=="xnu") | .tag' 2>/dev/null) || XNU_TAG=""
+          [ -n "$XNU_TAG" ] || { echo "::error::could not resolve the xnu tag from $RELEASE_URL"; printf '%s' "$RAW" | head -c 200; exit 1; }
           echo "xnu tag: $XNU_TAG"
+          rm -rf dxb/xnu
           git clone -q --depth 1 --branch "$XNU_TAG" https://github.com/apple-oss-distributions/xnu.git dxb/xnu
           echo "cloned $(git -C dxb/xnu rev-parse --short HEAD) into dxb/xnu"
 
