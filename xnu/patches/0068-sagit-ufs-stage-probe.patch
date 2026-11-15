@@ -1,0 +1,53 @@
+diff --git a/bsd/dev/sagit_ufs.c b/bsd/dev/sagit_ufs.c
+--- a/bsd/dev/sagit_ufs.c
++++ b/bsd/dev/sagit_ufs.c
+@@ -470,8 +470,10 @@
+ 		return ENXIO;
+ 	}
+ 	PE_parse_boot_argn("ufsroot", want, sizeof(want));
++	SAGIT_UFS_STEP(2, "DT node found, about to ml_io_map");
+ 
+ 	su.regs = ml_io_map(reg[0], reg[1]);
++	SAGIT_UFS_STEP(3, "ml_io_map done, about to kmem_alloc_contig");
+ 	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("SAGIT UFS: no contiguous DMA memory\n");
+@@ -482,11 +484,13 @@
+ 		return ENOMEM;
+ 	}
+ 	su.dma_pa = ptoa_64(pn);
++	SAGIT_UFS_STEP(4, "dma mapped, about to take over host");
+ 	su.lun = 0;
+ 	su.secsize = DEV_BSIZE;
+ 
+ 	lck_mtx_lock(&sagit_ufs_lock);
+ 	error = ufs_take_over_host();
++	SAGIT_UFS_STEP(5, "ufs_take_over_host returned");
+ 	if (!error) {
+ 		static const uint8_t tur[6] = { 0x00 };
+ 		/* The first command after the bootloader may report a unit attention. */
+@@ -521,9 +525,24 @@
+ /* Root device for rd=ufsroot0 (IOFindBSDRoot). */
+ int sagit_ufs_rootdev(dev_t *dev);
+ 
++#if defined(SAGIT)
++/* Stage probe: panic at step N so the stall point is visible. 0 = off. */
++#ifndef SAGIT_UFS_STAGE
++#define SAGIT_UFS_STAGE 1
++#endif
++#define SAGIT_UFS_STEP(n, what) do { \
++	if (SAGIT_UFS_STAGE != 0 && (n) == SAGIT_UFS_STAGE) { \
++		panic("SAGIT UFS step %d: %s", (n), what); \
++	} \
++} while (0)
++#else
++#define SAGIT_UFS_STEP(n, what) do { } while (0)
++#endif
++
+ int
+ sagit_ufs_rootdev(dev_t *dev)
+ {
++	SAGIT_UFS_STEP(1, "enter sagit_ufs_rootdev");
+ 	if (!su.ready) {
+ 		int error = sagit_ufs_init();
+ 		if (error) {

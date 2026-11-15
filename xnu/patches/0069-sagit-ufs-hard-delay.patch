@@ -1,0 +1,61 @@
+diff --git a/bsd/dev/sagit_ufs.c b/bsd/dev/sagit_ufs.c
+--- a/bsd/dev/sagit_ufs.c
++++ b/bsd/dev/sagit_ufs.c
+@@ -35,6 +35,22 @@
+ #include <libkern/libkern.h>
+ 
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++
++#if defined(SAGIT)
++/*
++ * Bounded spin that depends on nothing: no clock, no timeout subsystem, no
++ * interrupts. sagit_ufs_rootdev() runs before the timeout machinery is fully
++ * live, and delay() there could hang forever. A plain counter always returns.
++ * ~1000 iterations is roughly a microsecond on Kryo at 1.9 GHz.
++ */
++static inline void
++sagit_ufs_hard_delay(void)
++{
++	for (volatile unsigned int i = 0; i < 2000; i++) {
++		__asm__ volatile("yield" ::: "memory");
++	}
++}
++#endif /* SAGIT */
+ /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+@@ -56,6 +72,7 @@
+ #define PRDT_CHUNK      (256u << 10)            /* PRDT byte count field: 18 bits */
+ #define PRDT_MAX        (BOUNCE_SIZE / PRDT_CHUNK)
+ #define CMD_TIMEOUT_NS  (5ull * NSEC_PER_SEC)
++#define CMD_SPIN_BUDGET  3000000u   /* hard-spin steps, ~3 s */
+ 
+ struct utrd {
+ 	uint32_t dw0, dw1, dw2, dw3;
+@@ -161,16 +178,18 @@
+ 	__builtin_arm_dsb(0xf);
+ 
+ 	ufs_wr(REG_UTRLDBR, 1);
+-	uint64_t deadline;
+-	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
+-	deadline += mach_absolute_time();
+-	while (ufs_rd(REG_UTRLDBR) & 1) {
+-		if (mach_absolute_time() > deadline) {
++	/*
++	 * Poll with a plain iteration budget: no clock reads, no delay(), so this
++	 * cannot stall before the timeout subsystem is up. At ~1 us per step the
++	 * budget below is a few seconds worst case.
++	 */
++	for (uint32_t spin = 0; ufs_rd(REG_UTRLDBR) & 1; spin++) {
++		if (spin >= CMD_SPIN_BUDGET) {
+ 			ufs_wr(REG_UTRLCLR, ~1u);
+-			printf("SAGIT UFS: command 0x%02x timed out\n", cdb[0]);
+-			return ETIMEDOUT;
++			panic("SAGIT UFS: command 0x%02x timed out after %u spins",
++			    cdb[0], spin);
+ 		}
+-		delay(1);
++		sagit_ufs_hard_delay();
+ 	}
+ 	__builtin_arm_dsb(0xf);
+ 	ufs_wr(REG_IS, ufs_rd(REG_IS));         /* acknowledge completion status */

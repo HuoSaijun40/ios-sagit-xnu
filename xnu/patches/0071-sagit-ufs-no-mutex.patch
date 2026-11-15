@@ -1,0 +1,43 @@
+diff --git a/bsd/dev/sagit_ufs.c b/bsd/dev/sagit_ufs.c
+--- a/bsd/dev/sagit_ufs.c
++++ b/bsd/dev/sagit_ufs.c
+@@ -347,7 +347,9 @@
+ 		goto done;
+ 	}
+ 
++#if !defined(SAGIT)
+ 	lck_mtx_lock(&sagit_ufs_lock);
++#endif
+ 	for (uint32_t done = 0; done < count;) {
+ 		uint64_t pos = off + done;
+ 		uint64_t lba = pos / UFS_BLOCK;
+@@ -362,7 +364,9 @@
+ 		done += want;
+ 		buf_setresid(bp, count - done);
+ 	}
++#if !defined(SAGIT)
+ 	lck_mtx_unlock(&sagit_ufs_lock);
++#endif
+ 	buf_unmap(bp);
+ 
+ done:
+@@ -506,7 +510,9 @@
+ 	su.lun = 0;
+ 	su.secsize = DEV_BSIZE;
+ 
++#if !defined(SAGIT)
+ 	lck_mtx_lock(&sagit_ufs_lock);
++#endif
+ 	error = ufs_take_over_host();
+ 	SAGIT_UFS_STEP(5, "ufs_take_over_host returned");
+ 	if (!error) {
+@@ -518,7 +524,9 @@
+ 	if (!error) {
+ 		error = ufs_find_partition(want);
+ 	}
++#if !defined(SAGIT)
+ 	lck_mtx_unlock(&sagit_ufs_lock);
++#endif
+ 	if (error) {
+ 		return error;
+ 	}

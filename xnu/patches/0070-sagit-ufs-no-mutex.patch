@@ -1,0 +1,13 @@
+diff --git a/bsd/dev/sagit_ufs.c b/bsd/dev/sagit_ufs.c
+--- a/bsd/dev/sagit_ufs.c
++++ b/bsd/dev/sagit_ufs.c
+@@ -495,8 +495,7 @@
+ 	SAGIT_UFS_STEP(3, "ml_io_map done, about to kmem_alloc_contig");
+ 	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		printf("SAGIT UFS: no contiguous DMA memory\n");
+-		return ENOMEM;
++		panic("SAGIT UFS: kmem_alloc_contig(%u bytes) failed", (unsigned)DMA_SIZE);
+ 	}
+ 	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)su.dma);
+ 	if (!pn) {
