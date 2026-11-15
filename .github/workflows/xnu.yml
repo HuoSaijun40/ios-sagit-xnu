@@ -185,9 +185,10 @@ jobs:
         working-directory: dxb
         env:
           # -s silences make's recipe echo (that alone is tens of thousands of
-          # lines); -k only when explicitly asked, since it makes a failed run
-          # compile the rest of the tree and dump every warning.
-          MAKEFLAGS: ${{ inputs.keep_going == 'true' && '-s -k' || '-s' }}
+          # lines), but it ALSO hides the failing recipe: a step that dies in a
+          # shell loop prints nothing at all. Keep the log verbose so the failure
+          # is visible, and trim it when writing diagnostics.
+          MAKEFLAGS: ${{ inputs.keep_going == 'true' && '-k' || '' }}
         run: |
           LOG="${RUNNER_TEMP}/build.log"
           rc=0
@@ -196,15 +197,14 @@ jobs:
           echo "full compiler log: $(wc -l < "$LOG") lines, $(du -h "$LOG" | cut -f1) (not shown)"
 
           # The real error in a 2M-line log sits in the last few thousand lines,
-          # above the tail that the plain "last 200 lines" section shows. Dump the
-          # first failing recipe with its context so it reaches diagnostics.
+          # above the tail that the plain "last 200 lines" section shows. Keep the
+          # last 40000 lines (make now echoes recipes, so the failing one is there)
+          # and drop the warning noise.
           if [ "$rc" -ne 0 ]; then
-            echo "=== first failing make target with context ===" | tee -a "$LOG"
-            tail -5000 "$LOG" | grep -n -B8 -A20 -m3 -E '\*\*\* \[[^]]*\] Error [0-9]+|Error [0-9]+$' \
-              | head -120 | tee -a "$LOG" || true
-            echo "=== any error: in the last 5000 lines ===" | tee -a "$LOG"
-            tail -5000 "$LOG" | grep -n -m10 -E ' error: |fatal error|undefined symbol|No such file' \
-              | head -40 | tee -a "$LOG" || true
+            echo "=== filtered tail: last 40000 lines, warnings removed ===" | tee -a "$LOG"
+            tail -40000 "$LOG" | sed -e 's/\x1b\[[0-9;]*m//g' \
+              | grep -v -E 'warning:|^[[:space:]]+[0-9]+ \||^[[:space:]]+\|.*\^|^[[:space:]]*$' \
+              | tail -400 | tee -a "$LOG" || true
           fi
 
           # Only diagnostics go into the job log and into the small artifact;
