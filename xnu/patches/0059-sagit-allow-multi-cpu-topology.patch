@@ -1,0 +1,26 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -46,9 +46,22 @@
+ 	    *(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
+ 		return false;
+ 	}
++#if defined(SAGIT)
++	/*
++	 * Only the boot CPU is brought up (no PSCI secondary start yet), but keep
++	 * going when the device tree describes more CPUs: XNU then sizes its per-CPU
++	 * state for topology->num_cpus while machine_info.max_cpus is still taken
++	 * from the topology, which is the configuration we want to exercise.
++	 */
++	if (topology->num_cpus != 1) {
++		IOLog("SAGIT CPU: %u CPUs in topology, bringing up the boot CPU only\n",
++		    topology->num_cpus);
++	}
++#else
+ 	if (topology->num_cpus != 1) {
+ 		panic("SAGIT CPU: only single-CPU bring-up is supported");
+ 	}
++#endif /* SAGIT */
+ 	if (!IOCPU::start(provider)) {
+ 		return false;
+ 	}
