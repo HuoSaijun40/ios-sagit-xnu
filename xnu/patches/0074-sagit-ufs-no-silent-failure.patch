@@ -1,0 +1,78 @@
+diff --git a/bsd/dev/sagit_ufs.c b/bsd/dev/sagit_ufs.c
+--- a/bsd/dev/sagit_ufs.c
++++ b/bsd/dev/sagit_ufs.c
+@@ -318,16 +318,21 @@
+ 	return ENOENT;
+ }
+ 
++static uint32_t sagit_ufs_last_takeover_err;
++
+ static int
+ ufs_take_over_host(void)
+ {
+ 	uint32_t hce = ufs_rd(REG_HCE), hcs = ufs_rd(REG_HCS);
+ 	if (!(hce & 1) || !(hcs & HCS_DP) || !(hcs & HCS_UTRLRDY)) {
+-		printf("SAGIT UFS: host not ready (hce 0x%x hcs 0x%x)\n", hce, hcs);
++		/* EP: bit0, DP: bit0, UTRLRDY: bit1 */
++		sagit_ufs_last_takeover_err = ENXIO;
+ 		return ENXIO;
+ 	}
+-	if (ufs_rd(REG_UTRLDBR)) {
+-		printf("SAGIT UFS: requests outstanding from the bootloader\n");
++	uint32_t dbr = ufs_rd(REG_UTRLDBR);
++	sagit_ufs_last_takeover_err = 0;
++	if (dbr) {
++		sagit_ufs_last_takeover_err = EBUSY;
+ 		return EBUSY;
+ 	}
+ 	ufs_wr(REG_IE, 0);                      /* polled operation */
+@@ -340,7 +345,7 @@
+ 	/* Never ring a doorbell unless the host uses our list. */
+ 	if (ufs_rd(REG_UTRLBA) != (uint32_t)list || ufs_rd(REG_UTRLBAU) != (uint32_t)(list >> 32) ||
+ 	    !(ufs_rd(REG_UTRLRSR) & 1)) {
+-		printf("SAGIT UFS: host did not take our request list\n");
++		sagit_ufs_last_takeover_err = EIO;
+ 		return EIO;
+ 	}
+ 	return 0;
+@@ -543,7 +548,8 @@
+ 	}
+ 	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)su.dma);
+ 	if (!pn) {
+-		return ENOMEM;
++		panic("SAGIT UFS: pmap_find_phys(%p) found no frame, dma=%p",
++		    (void *)su.dma, (void *)su.dma);
+ 	}
+ 	su.dma_pa = ptoa_64(pn);
+ 	SAGIT_UFS_STEP(3, "dma mapped, about to take over host");
+@@ -569,16 +575,27 @@
+ 	lck_mtx_unlock(&sagit_ufs_lock);
+ #endif
+ 	if (error) {
+-		return error;
++		/*
++		 * printf() is dead this late, so a bare "return error" is
++		 * invisible on screen. Report the whole picture here: this is the
++		 * only place that knows the error came from the init path.
++		 */
++		panic("SAGIT UFS: init failed errno=%d takeover=%d steps=0x%x"
++		    " hcs=0x%x hce=0x%x dbr=0x%x rsr=0x%x utrlba=0x%x"
++		    " dma=0x%llx dmapa=0x%llx",
++		    error, (int)sagit_ufs_last_takeover_err, SAGIT_UFS_TRACE(),
++		    ufs_rd(REG_HCS), ufs_rd(REG_HCE), ufs_rd(REG_UTRLDBR),
++		    ufs_rd(REG_UTRLRSR), ufs_rd(REG_UTRLBA),
++		    (unsigned long long)su.dma, (unsigned long long)su.dma_pa);
+ 	}
+ 
+ 	su.bmajor = bdevsw_add(-1, &sagit_ufs_bdevsw);
+ 	if (su.bmajor < 0) {
+-		return ENXIO;
++		panic("SAGIT UFS: bdevsw_add failed: %d", su.bmajor);
+ 	}
+ 	su.cmajor = cdevsw_add_with_bdev(-1, &sagit_ufs_cdevsw, su.bmajor);
+ 	if (su.cmajor < 0) {
+-		return ENXIO;
++		panic("SAGIT UFS: cdevsw_add_with_bdev failed: %d", su.cmajor);
+ 	}
+ 	su.bdev = makedev(su.bmajor, 0);
+ 	devfs_make_node(su.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "ufsroot0");

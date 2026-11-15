@@ -1,0 +1,31 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -992,11 +992,24 @@
+ 		netboot = (mountroot == netboot_mountroot);
+ #endif
+ 
++		bsd_init_kprintf("vfs_mountroot\n");
++		err = vfs_mountroot();
+ #if defined(SAGIT)
+-		printf("SAGIT: vfs_mountroot (%s)\n", rootdevice[0] ? rootdevice : "no rootdev");
++		/*
++		 * printf() is dead here (BRANDUP 24.3) and the generic error path
++		 * below only retries forever, so a mount failure would hang with no
++		 * visible output. Panic with the errno instead: EINVAL generally
++		 * means the partition is not the filesystem we asked for, which is
++		 * exactly what we need to know about the userdata partition.
++		 */
++		if (err) {
++			panic("SAGIT: vfs_mountroot(%s) failed: %d (errno), "
++			    "rootdev maj %d min %d",
++			    rootdevice[0] ? rootdevice : "no rootdev", err,
++			    major(rootdev), minor(rootdev));
++		}
+ #endif
+-		bsd_init_kprintf("vfs_mountroot\n");
+-		if (0 == (err = vfs_mountroot())) {
++		if (0 == err) {
+ 			break;
+ 		}
+ 		rootdevice[0] = '\0';

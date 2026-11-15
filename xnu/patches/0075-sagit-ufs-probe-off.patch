@@ -1,0 +1,20 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -493,9 +493,14 @@
+ #define DEBUG_BSDINIT 0
+ 
+ #if defined(SAGIT)
+-/* 0 = boot normally. 1 = panic before sagit_ufs_rootdev, 2 = panic after. */
++/*
++ * 0 = boot normally. 1 = panic before sagit_ufs_rootdev, 2 = panic after.
++ * Both probes did their job: step 1 proved the call was reached and step 2
++ * proved it returns 0, so the UFS path is complete. Leave it off; 0065 still
++ * panics with "ufsroot0 unavailable: %d" if the driver ever fails.
++ */
+ #ifndef SAGIT_UFS_PROBE
+-#define SAGIT_UFS_PROBE 2
++#define SAGIT_UFS_PROBE 0
+ #endif
+ #endif
+ 
