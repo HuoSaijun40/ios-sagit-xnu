@@ -1,0 +1,11 @@
+diff --git a/config/MASTER b/config/MASTER
+--- a/config/MASTER
++++ b/config/MASTER
+@@ -113,6 +113,7 @@
+ #	4.4 filesystems
+ #
+ options		MOCKFS		# Boot from an executable	# <mockfs>
++options		SAGIT_HFS	# Built-in Apple OSS HFS (SAGIT)	# <sagit_hfs>
+ options		FIFO		# fifo support			# <fifo>
+ options		FDESC		# fdesc_fs support		# <fdesc>
+ options		DEVFS		# devfs support			# <devfs>
