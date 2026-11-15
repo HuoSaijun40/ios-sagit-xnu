@@ -195,16 +195,16 @@ jobs:
           echo "build.sh exit code: $rc"
           echo "full compiler log: $(wc -l < "$LOG") lines, $(du -h "$LOG" | cut -f1) (not shown)"
 
-          # LDFILELIST (makedefs' file-list generation) can fail without printing
-          # a reason. If the build died right after it, re-run just that step with
-          # make's own tracing so the next diagnostics says what it choked on.
-          if [ "$rc" -ne 0 ] && grep -q 'LDFILELIST' "$LOG"; then
-            echo "=== LDFILELIST failed: retrying the osfmk file list with tracing ===" | tee -a "$LOG"
-            if ! make -C xnu/osfmk LDFILELIST MAKEFLAGS= V=1 2>&1 | tail -60 | tee -a "$LOG"; then
-              echo "(traced retry failed as well)"
-            fi
-            echo "=== make -n on the bootstrap target ===" | tee -a "$LOG"
-            make -C xnu -n build_all_bootstrap_DEVELOPMENT^ARM64^SAGIT MAKEFLAGS= 2>&1 | tail -40 | tee -a "$LOG" || true
+          # The real error in a 2M-line log sits in the last few thousand lines,
+          # above the tail that the plain "last 200 lines" section shows. Dump the
+          # first failing recipe with its context so it reaches diagnostics.
+          if [ "$rc" -ne 0 ]; then
+            echo "=== first failing make target with context ===" | tee -a "$LOG"
+            tail -5000 "$LOG" | grep -n -B8 -A20 -m3 -E '\*\*\* \[[^]]*\] Error [0-9]+|Error [0-9]+$' \
+              | head -120 | tee -a "$LOG" || true
+            echo "=== any error: in the last 5000 lines ===" | tee -a "$LOG"
+            tail -5000 "$LOG" | grep -n -m10 -E ' error: |fatal error|undefined symbol|No such file' \
+              | head -40 | tee -a "$LOG" || true
           fi
 
           # Only diagnostics go into the job log and into the small artifact;
