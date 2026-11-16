@@ -1,0 +1,60 @@
+diff --git a/bsd/dev/sagit_crypto.c b/bsd/dev/sagit_crypto.c
+--- a/bsd/dev/sagit_crypto.c
++++ b/bsd/dev/sagit_crypto.c
+@@ -18,6 +18,7 @@
+ #include <libkern/crypto/md5.h>
+ #include <corecrypto/ccdigest.h>
+ #include <corecrypto/cc.h>
++#include <kern/startup.h>
+ 
+ #define SAGIT_MD5_STATE_WORDS  4
+ #define SAGIT_MD5_BLOCK_BYTES  64
+@@ -237,8 +238,15 @@
+ 	.ccmd5_di           = &sagit_md5_di,
+ };
+ 
+-void
+-sagit_crypto_register(void)
++/*
++ * g_crypto_funcs is SECURITY_READ_ONLY_LATE, i.e. it lives in
++ * __DATA_CONST,__const, and machine_lockdown() makes that section read-only
++ * before bsd_init() ever runs. Registering from the root-device path therefore
++ * faults with "Unexpected fault in kernel static region". Real corecrypto
++ * installs its table during EARLY_BOOT for the same reason, so do the same.
++ */
++static void
++sagit_crypto_bootstrap(const void *arg __unused)
+ {
+ 	if (register_crypto_functions(&sagit_crypto_funcs) != 0) {
+ 		/* Something already installed a table (real corecrypto?).
+@@ -248,3 +256,4 @@
+ 	}
+ 	printf("SAGIT crypto: built-in MD5 registered\n");
+ }
++STARTUP(EARLY_BOOT, STARTUP_RANK_FIRST, sagit_crypto_bootstrap);
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -966,7 +966,6 @@
+ 		 */
+ 		{
+ 			extern int sagit_ufs_rootdev(dev_t * dev);
+-			extern void sagit_crypto_register(void);
+ 			dev_t ufs_dev = 0;
+ 			if (SAGIT_UFS_PROBE == 1) {
+ 				panic("SAGIT probe 1: about to call sagit_ufs_rootdev");
+@@ -994,14 +993,6 @@
+ #endif
+ 
+ 		bsd_init_kprintf("vfs_mountroot\n");
+-#if defined(SAGIT)
+-		/*
+-		 * The HFS+ volume UUID is a version-3 (MD5) UUID, and MD5 goes
+-		 * through g_crypto_funcs, which corecrypto would normally fill.
+-		 * Install our own table first so hfs_getvoluuid() works.
+-		 */
+-		sagit_crypto_register();
+-#endif
+ 		err = vfs_mountroot();
+ #if defined(SAGIT)
+ 		/*
