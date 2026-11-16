@@ -1,0 +1,263 @@
+name: iosroot
+
+# Build a flashable iOS root image for the Xiaomi Mi 6 (sagit) from the split,
+# zstd-compressed file tree published as release assets.
+#
+#   parts (release iOS-RootFS)  ->  merge  ->  8.29 GiB tree
+#     -> HFSX volume (case-sensitive, as iOS uses)
+#     -> ditto -X (symlinks, hard links, owners, modes, xattrs)
+#     -> fsck
+#     -> raw .img  ->  Android sparse (.simg)  ->  zstd
+#
+# Runs on macOS because hdiutil is the only reliable way to build an HFS+
+# volume with correct owners: the WSL host has no hfsplus driver and no
+# apfs-fuse (HANDOFF §5 P1).
+#
+# Flash:
+#   zstd -d ios16-root-sagit.simg.zst
+#   fastboot flash userdata ios16-root-sagit.simg
+
+on:
+  workflow_dispatch:
+    inputs:
+      volume_size:
+        description: >-
+          HFS+ volume size, e.g. 12g. The tree is 8.29 GiB; leave headroom for
+          the journal and catalog growth. Must fit the userdata partition.
+        default: "12g"
+      fs:
+        description: >-
+          Case-sensitive HFS+ (HFSX) matches iOS. Pick plain HFS+ only if
+          something turns out to need case-insensitive lookups.
+        type: choice
+        options:
+          - Case-sensitive HFS+
+          - HFS+
+        default: Case-sensitive HFS+
+      make_sparse:
+        description: Convert to Android sparse before zstd (much smaller upload)
+        default: "true"
+      parts_base:
+        description: Release URL prefix holding the parts
+        default: https://github.com/HuoSaijun40/ios-sweet/releases/download/iOS-RootFS
+
+concurrency:
+  group: iosroot-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-root:
+    runs-on: macos-latest
+    # ~4 GiB download, an 8.29 GiB copy, a 12 GiB image, sparse + zstd.
+    timeout-minutes: 180
+
+    env:
+      PARTS_BASE: ${{ inputs.parts_base || 'https://github.com/HuoSaijun40/ios-sweet/releases/download/iOS-RootFS' }}
+      VOLUME_SIZE: ${{ inputs.volume_size || '12g' }}
+      VOLUME_NAME: iOSRoot
+      FS_TYPE: ${{ inputs.fs || 'Case-sensitive HFS+' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show host toolchain
+        run: |
+          set -x
+          sw_vers
+          uname -m
+          df -h /
+          which hdiutil ditto fsck.hfsplus
+          python3 --version
+          ls -l tools/sparseimg.py
+
+      - name: Free disk
+        # A 12 GiB volume + the 8.29 GiB tree + raw + sparse copies needs room;
+        # the macOS runner image is tight, so reclaim what this job does not use.
+        run: |
+          set -x
+          df -h /
+          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* 2>/dev/null || true
+          sudo rm -rf "/Applications/Xcode_*.app/Contents/Developer/Platforms/iPhoneOS.platform/DeviceSupport" 2>/dev/null || true
+          rm -rf ~/Library/Caches/* 2>/dev/null || true
+          df -h /
+
+      - name: Download and merge the parts
+        run: |
+          set -euo pipefail
+          mkdir -p work && cd work
+          : > iosroot.tar.zst
+          for n in 000 001 002; do
+            echo "=== part-$n ==="
+            curl -fL --retry 5 --retry-delay 5 --retry-all-errors \
+              -o "part-$n" "$PARTS_BASE/iosroot.tar.zst.part-$n"
+            ls -l "part-$n"
+            cat "part-$n" >> iosroot.tar.zst
+            rm -f "part-$n"
+          done
+          ls -l iosroot.tar.zst
+          expect=4139455596   # 1887436800 + 1887436800 + 364581996
+          got=$(stat -f%z iosroot.tar.zst)
+          echo "expected=$expect got=$got"
+          [ "$expect" = "$got" ] || { echo "::error::merged size mismatch"; exit 1; }
+
+      - name: Install zstd
+        run: |
+          if ! command -v zstd >/dev/null; then brew install zstd; fi
+          zstd --version
+
+      - name: Extract the tree
+        run: |
+          set -euo pipefail
+          cd work
+          mkdir -p root
+          # --numeric-owner keeps the iOS uids/gids; the archive was made that way.
+          sudo zstd -dc iosroot.tar.zst | sudo tar --numeric-owner -xf - -C root
+          echo "=== extracted ==="
+          sudo find root -type f | wc -l
+          sudo du -sh root
+          for f in usr/lib/dyld sbin/launchd System/Library/CoreServices/SpringBoard.app; do
+            if sudo test -e "root/$f"; then echo "ok   $f"; else echo "MISS $f"; fi
+          done
+
+      - name: Create and mount the HFS+ volume
+        run: |
+          set -euo pipefail
+          cd work
+          rm -f root.dmg
+          hdiutil create -size "$VOLUME_SIZE" -fs "$FS_TYPE" \
+            -volname "$VOLUME_NAME" -layout NONE -type UDIF -o root
+          ls -l root.dmg
+          hdiutil attach -nobrowse -noautoopen root.dmg
+          test -d "/Volumes/$VOLUME_NAME" || { echo "::error::volume did not mount"; exit 1; }
+          diskutil info "/Volumes/$VOLUME_NAME" | grep -iE 'File System Personality|Volume Name|Case' || true
+
+      - name: Copy the tree onto the volume
+        run: |
+          set -euo pipefail
+          MOUNT="/Volumes/$VOLUME_NAME"
+          test -d "$MOUNT" || { echo "::error::volume is not mounted"; exit 1; }
+          # ditto -X preserves symlinks, hard links, owners, modes and xattrs.
+          sudo ditto -X work/root "$MOUNT"
+          sync
+          echo "=== copied ==="
+          sudo find "$MOUNT" -type f 2>/dev/null | wc -l
+          df -h "$MOUNT"
+
+      - name: Verify and detach
+        run: |
+          set -euo pipefail
+          MOUNT="/Volumes/$VOLUME_NAME"
+          src=$(sudo find work/root -type f | wc -l | tr -d ' ')
+          dst=$(sudo find "$MOUNT" -type f 2>/dev/null | wc -l | tr -d ' ')
+          echo "source=$src target=$dst"
+          [ "$src" = "$dst" ] || echo "::warning::file counts differ"
+          for f in usr/lib/dyld sbin/launchd private/var private/etc; do
+            if sudo test -e "$MOUNT/$f"; then echo "ok   $f"; else echo "MISS $f"; fi
+          done
+          echo "=== ownership (must be numeric, not the runner user) ==="
+          ls -ldn "$MOUNT" "$MOUNT/usr" "$MOUNT/private/var" 2>/dev/null || true
+          sync
+          hdiutil detach "$MOUNT"
+
+      - name: fsck the volume
+        run: |
+          set -euo pipefail
+          cd work
+          # ditto leaves the volume dirty until unmounted: repair, then verify.
+          sudo fsck.hfsplus -f -y root.dmg || true
+          sudo fsck.hfsplus -f -n root.dmg
+
+      - name: Convert to a raw image
+        run: |
+          set -euo pipefail
+          cd work
+          hdiutil convert root.dmg -format UDRW -o root-raw.dmg
+          ls -l root-raw.dmg
+          hdiutil attach -nomount -nobrowse root-raw.dmg > dev.txt
+          cat dev.txt
+          DEV=$(awk 'NR==1{print $1}' dev.txt)
+          [ -n "$DEV" ] || { echo "::error::no device from hdiutil attach"; exit 1; }
+          echo "raw device: $DEV"
+          sudo dd if="$DEV" of=root.img bs=4m
+          sync
+          hdiutil detach "$DEV" -force || true
+          ls -lh root.img
+
+      - name: Check the volume header
+        run: |
+          set -euo pipefail
+          cd work
+          python3 ../tools/sparseimg.py check root.img
+
+      - name: Convert to Android sparse
+        if: ${{ inputs.make_sparse != 'false' }}
+        run: |
+          set -euo pipefail
+          cd work
+          python3 ../tools/sparseimg.py make root.img ios16-root-sagit.simg
+          ls -lh ios16-root-sagit.simg
+
+      - name: Verify the sparse image round-trips
+        if: ${{ inputs.make_sparse != 'false' }}
+        run: |
+          set -euo pipefail
+          cd work
+          # A bad sparse image would flash but boot garbage, so prove the
+          # round-trip is byte-identical before uploading anything.
+          python3 ../tools/sparseimg.py unsparse ios16-root-sagit.simg recon.img
+          ls -l recon.img root.img
+          if cmp root.img recon.img; then
+            echo "round-trip OK"
+          else
+            echo "::error::sparse round-trip mismatch"
+            exit 1
+          fi
+          rm -f recon.img
+
+      - name: Compress
+        run: |
+          set -euo pipefail
+          cd work
+          if [ -f ios16-root-sagit.simg ]; then base=ios16-root-sagit.simg; else base=root.img; fi
+          # -T0 keeps the 180 min budget; --long is not needed for a disk image
+          # and costs RAM, so leave it off.
+          zstd -19 -T0 -o "$base.zst" "$base"
+          ls -lh "$base" "$base.zst"
+          shasum -a 256 "$base" "$base.zst" | tee SHA256SUMS
+
+      - name: Split for distribution
+        run: |
+          set -euo pipefail
+          cd work
+          if [ -f ios16-root-sagit.simg.zst ]; then f=ios16-root-sagit.simg.zst; else f=root.img.zst; fi
+          rm -rf parts && mkdir -p parts
+          # GitHub releases cap a single asset at 2 GB and artifact downloads are
+          # awkward for multi-GB files, so publish at most 1.9 GiB per part --
+          # the same scheme the input tree already uses.
+          split -b 1900m -d -a 3 "$f" "parts/$f.part-"
+          ls -lh parts/
+          (cd parts && shasum -a 256 * > SHA256SUMS)
+          cat parts/SHA256SUMS
+          echo "=== reassembly note ==="
+          echo "cat parts/$f.part-* > $f"
+
+      - name: Report
+        if: always()
+        run: |
+          df -h /
+          ls -lh work/ || true
+          ls -lh work/parts/ 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ios16-root-sagit
+          path: |
+            work/parts/*
+            work/ios16-root-sagit.simg.zst
+            work/root.img.zst
+            work/SHA256SUMS
+            work/dev.txt
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 0     # already zstd-compressed; re-gzipping wastes time
