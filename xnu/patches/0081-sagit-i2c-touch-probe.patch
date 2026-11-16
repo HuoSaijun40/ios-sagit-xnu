@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,795 @@
+@@ -0,0 +1,798 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -45,6 +45,9 @@ new file mode 100644
 +#include <pexpert/pexpert.h>
 +#include <pexpert/device_tree.h>
 +#include <libkern/libkern.h>
++
++/* osfmk/arm/machine_routines.h, not exported to the BSD layer (same as UFS). */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +
 +#if defined(SAGIT)
 +
