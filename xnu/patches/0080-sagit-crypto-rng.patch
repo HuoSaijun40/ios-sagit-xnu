@@ -1,0 +1,70 @@
+diff --git a/bsd/dev/sagit_crypto.c b/bsd/dev/sagit_crypto.c
+--- a/bsd/dev/sagit_crypto.c
++++ b/bsd/dev/sagit_crypto.c
+@@ -19,6 +19,8 @@
+ #include <corecrypto/ccdigest.h>
+ #include <corecrypto/cc.h>
+ #include <kern/startup.h>
++#include <sys/random.h>
++#include <corecrypto/ccrng.h>
+ 
+ #define SAGIT_MD5_STATE_WORDS  4
+ #define SAGIT_MD5_BLOCK_BYTES  64
+@@ -229,6 +231,41 @@
+ 	.impl          = 0,
+ };
+ 
++
++/*
++ * ccrng_fn: cc_rand_generate() asks the table for a ccrng_state, then calls
++ * ccrng_generate() -> rng->generate(rng, outlen, out). The state needs nothing
++ * but that one operation, so ours is a struct whose first member is it (checked
++ * by work/test_rng_layout.sh against the real ccrng_state layout).
++ *
++ * The bytes come from read_random(), i.e. XNU's own kernel PRNG, which 0014
++ * rebuilt on the built-in HMAC-SHA256 DRBG because this port has no corecrypto
++ * kext. That keeps one source of randomness for the whole kernel.
++ */
++struct sagit_rng_state {
++	int (*generate)(struct ccrng_state *rng, size_t outlen, void *out);
++};
++
++static int
++sagit_rng_generate(struct ccrng_state *rng __unused, size_t outlen, void *out)
++{
++	read_random(out, (u_int)outlen);
++	return 0;
++}
++
++static struct sagit_rng_state sagit_rng = {
++	.generate = sagit_rng_generate,
++};
++
++static struct ccrng_state *
++sagit_crypto_get_rng(int *error)
++{
++	if (error != NULL) {
++		*error = 0;
++	}
++	return (struct ccrng_state *)&sagit_rng;
++}
++
+ /* Only the digest half of the table is real; the rest stays NULL. */
+ static struct crypto_functions sagit_crypto_funcs = {
+ 	.ccdigest_init_fn   = sagit_md5_begin,
+@@ -236,6 +273,7 @@
+ 	.ccdigest_final_fn  = sagit_md5_final,
+ 	.ccdigest_fn        = sagit_md5_digest,
+ 	.ccmd5_di           = &sagit_md5_di,
++	.ccrng_fn           = sagit_crypto_get_rng,
+ };
+ 
+ /*
+@@ -255,6 +293,6 @@
+ 		printf("SAGIT crypto: a crypto table was already registered\n");
+ 		return;
+ 	}
+-	printf("SAGIT crypto: built-in MD5 registered\n");
++	printf("SAGIT crypto: built-in MD5 + RNG registered\n");
+ }
+ STARTUP(EARLY_BOOT, STARTUP_RANK_FIRST, sagit_crypto_bootstrap);
