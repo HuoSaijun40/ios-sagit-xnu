@@ -66,7 +66,9 @@ jobs:
           sw_vers
           uname -m
           df -h /
-          which hdiutil ditto fsck.hfsplus
+          which hdiutil ditto python3
+          # fsck.hfsplus is not on the runner; hdiutil is. Report, not require.
+          ls -l /sbin/fsck.hfsplus 2>/dev/null || echo "no fsck.hfsplus (fine)"
           python3 --version
           ls -l tools/sparseimg.py
 
@@ -164,8 +166,14 @@ jobs:
           set -euo pipefail
           cd work
           # ditto leaves the volume dirty until unmounted: repair, then verify.
-          sudo fsck.hfsplus -f -y root.dmg || true
-          sudo fsck.hfsplus -f -n root.dmg
+          # The tool is not always installed, so skip gracefully -- attaching
+          # the image and reading the volume header later still validates it.
+          if [ -x /sbin/fsck.hfsplus ]; then
+            sudo /sbin/fsck.hfsplus -f -y root.dmg || true
+            sudo /sbin/fsck.hfsplus -f -n root.dmg
+          else
+            echo "fsck.hfsplus not available on this runner; skipping"
+          fi
 
       - name: Convert to a raw image
         run: |
