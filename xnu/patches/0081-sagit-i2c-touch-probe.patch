@@ -1,0 +1,845 @@
+diff --git a/bsd/dev/sagit_i2c.c b/bsd/dev/sagit_i2c.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sagit_i2c.c
+--- /dev/null
++++ b/bsd/dev/sagit_i2c.c
+@@ -0,0 +1,795 @@
++/*
++ * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
++ *
++ * Goal of this first cut is diagnosis, not input: bring up BLSP1 QUP5 I2C
++ * (i2c@c179000), read whatever the touch chip answers on address 0x20, and
++ * panic with the register state. If the read works, the whole chain (GCC
++ * clocks, TLMM pin mux, touch power) is proven; if it does not, the panic
++ * text says which stage broke.
++ *
++ * Hardware facts (from live.dtb and drivers/clk/qcom/gcc-msm8998.c):
++ *
++ *   I2C controller   /soc/i2c@c179000   reg 0xc179000, 0x600 (BLSP1 QUP5)
++ *   touch            synaptics_dsi_i2c@20, I2C address 0x20
++ *   chips            S3330 (JDI), S3331 (JDI), TD4322 (LGD) depending on panel
++ *   reset gpio       TLMM 89   (pinctrl@0x3400000)
++ *   irq gpio         TLMM 125, SPI 125
++ *
++ *   GCC clocks (gcc-msm8998.c):
++ *     blsp1_qup5_i2c_apps_clk_src  RCG   cmd_rcgr  = 0x21020
++ *     gcc_blsp1_qup5_i2c_apps_clk  CBCR  enable   = 0x21008, BIT(0)
++ *     gcc_blsp1_ahb_clk            CBCR  enable   = 0x52004, BIT(17)
++ *     GCC_BLSP1_QUP5_BCR           reset          = 0x21000
++ *
++ * Ordering matters: report the state of every register BEFORE writing it, so a
++ * single boot tells us what the bootloader already set up. On this SoC ABL
++ * leaves most peripherals running, and the earlier UFS work showed that
++ * assuming otherwise costs whole CI rounds.
++ *
++ * Everything here is polled and bounded: no interrupts, no clocks framework,
++ * no delayed calls, because those are exactly the subsystems that are not
++ * ready this early (the UFS driver hit the same wall).
++ */
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++
++#if defined(SAGIT)
++
++#define SAGIT_I2C_BASE          0xc179000ULL     /* BLSP1 QUP5 */
++#define SAGIT_I2C_SIZE          0x600
++#define SAGIT_TOUCH_ADDR        0x20
++#define SAGIT_TOUCH_UB_ADDR     0x2c             /* bootloader/update mode */
++
++/* GCC */
++#define SAGIT_GCC_BASE          0xc000000ULL
++#define SAGIT_QUP5_RCGR         0x21020          /* blsp1_qup5_i2c_apps_clk_src */
++#define SAGIT_QUP5_CBCR         0x21008          /* gcc_blsp1_qup5_i2c_apps_clk */
++#define SAGIT_QUP5_BCR          0x21000          /* reset */
++#define SAGIT_BLSP1_AHB_CBCR    0x52004          /* gcc_blsp1_ahb_clk, BIT(17) */
++#define SAGIT_BLSP1_AHB_HALT    0x17004          /* halt status, BIT(0) */
++#define SAGIT_AHB_ENABLE_BIT    17
++
++/* clk-rcg2 field layout, relative to cmd_rcgr */
++#define RCG_CMD_REG             0x00
++#define RCG_CFG_REG             0x04
++#define RCG_N_REG               0x0c
++#define RCG_D_REG               0x10
++#define RCG_ROOT_EN             (1u << 0)
++#define RCG_ROOT_STATUS         (1u << 13)
++#define RCG_UPDATE_SEL          0x3u
++#define RCG_UPDATE_SHIFT        12
++#define RCG_SRC_SEL_MASK        (0x7u << 8)
++#define RCG_SRC_SEL_SHIFT       8
++#define RCG_SRC_XO              0                /* 19.2 MHz crystal, no PLL */
++
++/*
++ * QUP v2.2.1 register offsets and field positions.
++ *
++ * Taken verbatim from drivers/i2c/busses/i2c-qup.c, which is the only
++ * authoritative description of this block. An earlier revision of this file
++ * used the v1.1.1 offsets (IO_MODES 0x00c, FIFOs at 0x070/0x078, state PAUSE
++ * 4) -- those do not exist on v2.2.1 and would have produced nothing but
++ * timeouts.
++ */
++#define QUP_CONFIG              0x000
++#define QUP_STATE               0x004
++#define QUP_IO_MODE             0x008
++#define QUP_SW_RESET            0x00c
++#define QUP_OPERATIONAL         0x018
++#define QUP_ERROR_FLAGS         0x01c
++#define QUP_ERROR_FLAGS_EN      0x020
++#define QUP_OPERATIONAL_MASK    0x028
++#define QUP_HW_VERSION          0x030
++#define QUP_MX_OUTPUT_CNT       0x100
++#define QUP_OUT_FIFO_BASE       0x110
++#define QUP_MX_WRITE_CNT        0x150
++#define QUP_MX_INPUT_CNT        0x200
++#define QUP_MX_READ_CNT         0x208
++#define QUP_IN_FIFO_BASE        0x218
++#define QUP_I2C_CLK_CTL         0x400
++#define QUP_I2C_STATUS          0x404
++#define QUP_I2C_MASTER_GEN      0x408
++
++/* QUP states (i2c-qup.c: QUP_RESET/RUN/PAUSE_STATE) */
++#define QUP_STATE_RESET         0
++#define QUP_STATE_RUN           1
++#define QUP_STATE_PAUSE         3
++#define QUP_STATE_MASK          3
++#define QUP_STATE_VALID         (1u << 2)
++
++/* QUP_OPERATIONAL flags */
++#define QUP_OP_IN_NOT_EMPTY     (1u << 5)
++#define QUP_OP_OUT_SVC_FLAG     (1u << 8)
++#define QUP_OP_IN_SVC_FLAG      (1u << 9)
++#define QUP_OP_MAX_OUTPUT_DONE  (1u << 10)
++#define QUP_OP_MAX_INPUT_DONE   (1u << 11)
++#define QUP_OPERATIONAL_RESET   0x000ff0u
++
++/* QUP_IO_MODE packing */
++#define QUP_IO_OUTPUT_BLK_MODE  (1u << 10)
++#define QUP_IO_INPUT_BLK_MODE   (1u << 12)
++#define QUP_IO_UNPACK_EN        (1u << 14)
++#define QUP_IO_PACK_EN          (1u << 15)
++
++/* I2C mini core: QUP_CONFIG layout */
++#define QUP_CLOCK_AUTO_GATE     (1u << 13)
++#define QUP_NO_INPUT            (1u << 7)
++#define QUP_I2C_MINI_CORE       (2u << 8)
++#define QUP_I2C_N_VAL           15
++#define QUP_I2C_MAST_GEN        (1u << 4)
++
++/* QUP v2 tag bytes: these are what actually start a transfer. */
++#define QUP_TAG_V2_START        0x81
++#define QUP_TAG_V2_DATAWR       0x82
++#define QUP_TAG_V2_DATAWR_STOP  0x83
++#define QUP_TAG_V2_DATARD       0x85
++#define QUP_TAG_V2_DATARD_NACK  0x86
++#define QUP_TAG_V2_DATARD_STOP  0x87
++
++/* Bounded spin: no clock, no timeout subsystem (same rule as the UFS driver). */
++#define SAGIT_I2C_SPIN          200000u
++
++static struct {
++	volatile uint32_t *regs;        /* QUP registers */
++	volatile uint32_t *gcc;         /* GCC registers */
++	uint32_t txn;                   /* rolling diagnostic step */
++} si2c;
++
++static inline uint32_t
++si2c_rdq(uint32_t off)
++{
++	return si2c.regs[off / 4];
++}
++
++static inline void
++si2c_wrq(uint32_t off, uint32_t v)
++{
++	si2c.regs[off / 4] = v;
++}
++
++static inline uint32_t
++si2c_rdg(uint32_t off)
++{
++	return si2c.gcc[off / 4];
++}
++
++static inline void
++si2c_wrg(uint32_t off, uint32_t v)
++{
++	si2c.gcc[off / 4] = v;
++}
++
++/*
++ * Report-and-continue: leave a breadcrumb of the register's previous value in
++ * si2c.txn's high bits so the final panic can show "what it was" without
++ * needing separate panics per stage.
++ */
++static uint32_t
++si2c_enable_branch(uint32_t off, uint32_t bit, uint32_t *before)
++{
++	uint32_t old = si2c_rdg(off);
++
++	*before = old;
++	if (!(old & (1u << bit))) {
++		si2c_wrg(off, old | (1u << bit));
++	}
++	return si2c_rdg(off);
++}
++
++static void
++si2c_report(const char *what, uint32_t a, uint32_t b, uint32_t c, uint32_t d)
++{
++	panic("SAGIT I2C %s: qcfg=0x%x qstate=0x%x qstatus=0x%x qop=0x%x "
++	    "rcgr=0x%x cfg=0x%x qup5c=0x%x ahb=0x%x ahbhalt=0x%x d=%d/%d",
++	    what, a, b, c, d,
++	    si2c_rdg(SAGIT_QUP5_RCGR), si2c_rdg(SAGIT_QUP5_RCGR + RCG_CFG_REG),
++	    si2c_rdg(SAGIT_QUP5_CBCR), si2c_rdg(SAGIT_BLSP1_AHB_CBCR),
++	    si2c_rdg(SAGIT_BLSP1_AHB_HALT),
++	    (int)si2c.txn, 0);
++}
++
++/*
++ * Debug read of the QUP block, tolerating a dead bus: a QUP whose clock is not
++ * running returns garbage or faults, so the probe reports registers only after
++ * the clock stage succeeded. Kept separate from si2c_report() so the clock
++ * failure path does not touch a possibly-unclocked peripheral.
++ */
++static void
++si2c_clock_report(const char *what, uint32_t extra)
++{
++	panic("SAGIT I2C %s: rcgr=0x%x cfg=0x%x n=0x%x d=0x%x "
++	    "qup5c=0x%x ahb=0x%x ahbhalt=0x%x bcr=0x%x extra=0x%x step=%d",
++	    what,
++	    si2c_rdg(SAGIT_QUP5_RCGR + RCG_CMD_REG),
++	    si2c_rdg(SAGIT_QUP5_RCGR + RCG_CFG_REG),
++	    si2c_rdg(SAGIT_QUP5_RCGR + RCG_N_REG),
++	    si2c_rdg(SAGIT_QUP5_RCGR + RCG_D_REG),
++	    si2c_rdg(SAGIT_QUP5_CBCR),
++	    si2c_rdg(SAGIT_BLSP1_AHB_CBCR),
++	    si2c_rdg(SAGIT_BLSP1_AHB_HALT),
++	    si2c_rdg(SAGIT_QUP5_BCR),
++	    extra, (int)si2c.txn);
++}
++
++/* Poll for a condition, bounded. Returns 1 on success. */
++static int
++si2c_poll(uint32_t off, uint32_t mask, uint32_t want, uint32_t spins)
++{
++	for (uint32_t i = 0; i < spins; i++) {
++		if ((si2c_rdq(off) & mask) == want) {
++			return 1;
++		}
++	}
++	return 0;
++}
++
++/*
++ * Bring up the QUP clocks by writing the GCC registers directly.
++ * No clock framework exists yet, so this is the "give it a running clock"
++ * step, and it deliberately leaves a breadcrumb if the root refuses to start.
++ */
++static void
++si2c_clock_up(void)
++{
++	uint32_t before_ahb = 0, before_qup = 0;
++	uint32_t cmd, cfg;
++
++	si2c.txn = 1;
++
++	/* 1. AHB first: the QUP register block needs its bus clock. */
++	si2c_enable_branch(SAGIT_BLSP1_AHB_CBCR, SAGIT_AHB_ENABLE_BIT, &before_ahb);
++
++	/* 2. RCG: select the XO parent (straight 19.2 MHz, no PLL involved). */
++	cmd = si2c_rdg(SAGIT_QUP5_RCGR + RCG_CMD_REG);
++	cfg = si2c_rdg(SAGIT_QUP5_RCGR + RCG_CFG_REG);
++
++	if ((cfg & RCG_SRC_SEL_MASK) != (RCG_SRC_XO << RCG_SRC_SEL_SHIFT)) {
++		si2c_wrg(SAGIT_QUP5_RCGR + RCG_CFG_REG,
++		    (cfg & ~RCG_SRC_SEL_MASK) | (RCG_SRC_XO << RCG_SRC_SEL_SHIFT));
++	}
++	/* F(19200000, P_XO, 1, 0, 0): divide by 1, so N and D stay 0. */
++	si2c_wrg(SAGIT_QUP5_RCGR + RCG_N_REG, 0);
++	si2c_wrg(SAGIT_QUP5_RCGR + RCG_D_REG, 0);
++
++	/* Latch the source/divider change, then enable the root. */
++	si2c_wrg(SAGIT_QUP5_RCGR + RCG_CMD_REG,
++	    (cmd & ~(RCG_UPDATE_SEL << RCG_UPDATE_SHIFT)) |
++	    (RCG_UPDATE_SEL << RCG_UPDATE_SHIFT));
++	si2c_wrg(SAGIT_QUP5_RCGR + RCG_CMD_REG,
++	    (cmd & ~(RCG_UPDATE_SEL << RCG_UPDATE_SHIFT)) |
++	    (RCG_UPDATE_SEL << RCG_UPDATE_SHIFT) | RCG_ROOT_EN);
++
++	si2c.txn = 2;
++
++	/* 3. Apps clock branch. */
++	si2c_enable_branch(SAGIT_QUP5_CBCR, 0, &before_qup);
++
++	si2c.txn = 3;
++
++	/* Report before touching the QUP: if the root never started, say so. */
++	if (!(si2c_rdg(SAGIT_QUP5_RCGR + RCG_CMD_REG) & RCG_ROOT_STATUS)) {
++		si2c_clock_report("RCG root did not start", before_ahb | before_qup);
++	}
++	if (si2c_rdg(SAGIT_BLSP1_AHB_HALT) & 1u) {
++		/* gcc_blsp1_ahb_clk is BRANCH_HALT_VOTED: bit set means halted. */
++		si2c_clock_report("BLSP1 AHB still halted", 0);
++	}
++}
++
++/*
++ * Configure the QUP for a single small read. This mirrors the sequence in
++ * i2c-qup.c: reset -> run -> pause, program the counters, unpause.
++ */
++static int
++si2c_qup_init(void)
++{
++	si2c.txn = 4;
++
++	/* Bring the block back to a known state (i2c-qup.c does the same). */
++	si2c_wrq(QUP_CONFIG, 0);
++	si2c_wrq(QUP_STATE, QUP_STATE_RESET);
++	if (!si2c_poll(QUP_STATE, QUP_STATE_MASK, QUP_STATE_RESET, SAGIT_I2C_SPIN)) {
++		return ENXIO;
++	}
++	si2c.txn = 5;
++
++	si2c_wrq(QUP_SW_RESET, 1);
++	if (!si2c_poll(QUP_SW_RESET, 1u, 0u, SAGIT_I2C_SPIN)) {
++		return EBUSY;
++	}
++	si2c_wrq(QUP_ERROR_FLAGS_EN, 0);
++	si2c_wrq(QUP_OPERATIONAL_MASK, 0);
++	si2c.txn = 6;
++
++	/*
++	 * I2C mini core, master mode. N_VAL selects the FIFO word packing; the
++	 * v2 block uses 7 (i2c-qup.c: I2C_N_VAL_V2).
++	 */
++	si2c_wrq(QUP_CONFIG, QUP_I2C_MINI_CORE | QUP_I2C_MAST_GEN |
++	    (7u << 16) /* N_VAL */ | QUP_CLOCK_AUTO_GATE);
++	si2c.txn = 7;
++
++	si2c_wrq(QUP_STATE, QUP_STATE_RUN);
++	if (!si2c_poll(QUP_STATE, QUP_STATE_MASK, QUP_STATE_RUN, SAGIT_I2C_SPIN)) {
++		return ENXIO;
++	}
++	si2c.txn = 8;
++
++	/* Block mode on both directions, un/pack disabled: one byte per entry. */
++	si2c_wrq(QUP_IO_MODE, QUP_IO_OUTPUT_BLK_MODE | QUP_IO_INPUT_BLK_MODE);
++
++	/*
++	 * Clock divider: with a 19.2 MHz core clock and 400 kHz bus the QUP
++	 * wants high-time = low-time = 24 cycles, but the divider field is
++	 * programmed from the DT frequency in the real driver. Left at reset
++	 * here on purpose -- a wrong divider still transfers, just at the wrong
++	 * rate, and the first goal is to see whether anything answers at all.
++	 */
++
++	return 0;
++}
++
++/*
++ * Wait until the output FIFO has room, then push `nbytes` tag bytes.
++ * Returns 0 on success.
++ */
++static int
++si2c_write_tags(const uint8_t *tags, uint32_t nbytes)
++{
++	uint32_t spins;
++
++	for (uint32_t i = 0; i < nbytes; i++) {
++		for (spins = 0; spins < SAGIT_I2C_SPIN; spins++) {
++			/* OUT_NEED_DATA means the FIFO has space. */
++			if (si2c_rdq(QUP_OPERATIONAL) &
++			    (QUP_OP_MAX_OUTPUT_DONE | QUP_OP_OUT_SVC_FLAG)) {
++				break;
++			}
++		}
++		si2c_wrq(QUP_OUT_FIFO_BASE, tags[i]);
++	}
++	return 0;
++}
++
++/*
++ * One I2C register read using the v2 tag protocol.
++ *
++ * A "read register" is two transactions on the wire, and each one is described
++ * by tag bytes pushed into the output FIFO (i2c-qup.c: qup_i2c_set_tags):
++ *
++ *   write phase : 0x81 addr  0x82 reg   0x83        START, DATAWR, DATAWR_STOP
++ *   read phase  : 0x81 addr  0x85 len   0x87        START, DATARD, DATARD_STOP
++ *
++ * The counts then tell the block how many bytes cross the FIFOs.
++ */
++static int
++si2c_read_addr(uint8_t addr, uint16_t reg, uint32_t regbytes,
++    uint8_t *out, uint32_t len)
++{
++	uint32_t op;
++	uint32_t spins;
++
++	if (len == 0 || len > 256 || regbytes == 0 || regbytes > 2) {
++		return EINVAL;
++	}
++
++	si2c.txn = 10;
++
++	/* Pause the block so the counters and FIFO can be programmed. */
++	si2c_wrq(QUP_STATE, QUP_STATE_PAUSE);
++	if (!si2c_poll(QUP_STATE, QUP_STATE_MASK, QUP_STATE_PAUSE, SAGIT_I2C_SPIN)) {
++		return ETIMEDOUT;
++	}
++	si2c.txn = 11;
++
++	/*
++	 * Write phase: START, addr<<1, DATAWR, then regbytes address bytes.
++	 * RMI4 always uses two address bytes (little endian), a plain I2C
++	 * register uses one.
++	 */
++	uint8_t wtags[5];
++	uint32_t wlen = 0;
++
++	wtags[wlen++] = QUP_TAG_V2_START;
++	wtags[wlen++] = (uint8_t)(addr << 1);
++	wtags[wlen++] = QUP_TAG_V2_DATAWR;
++	wtags[wlen++] = (uint8_t)(reg & 0xff);
++	if (regbytes == 2) {
++		wtags[wlen++] = (uint8_t)(reg >> 8);
++	}
++
++	si2c_wrq(QUP_MX_OUTPUT_CNT, wlen);
++	si2c_wrq(QUP_MX_WRITE_CNT, wlen);
++	si2c_wrq(QUP_MX_INPUT_CNT, 0);
++	si2c_wrq(QUP_MX_READ_CNT, 0);
++
++	/* Clear stale operational flags before running. */
++	si2c_wrq(QUP_OPERATIONAL, QUP_OPERATIONAL_RESET);
++
++	si2c_write_tags(wtags, wlen);
++	si2c_wrq(QUP_STATE, QUP_STATE_RUN);
++	si2c.txn = 12;
++
++	for (spins = 0; spins < SAGIT_I2C_SPIN; spins++) {
++		op = si2c_rdq(QUP_OPERATIONAL);
++		if (op & QUP_OP_MAX_OUTPUT_DONE) {
++			break;
++		}
++	}
++	if (spins == SAGIT_I2C_SPIN) {
++		return ETIMEDOUT;
++	}
++	si2c.txn = 13;
++
++	/* Read phase: 4 tag bytes out, len bytes in. */
++	si2c_wrq(QUP_STATE, QUP_STATE_PAUSE);
++	if (!si2c_poll(QUP_STATE, QUP_STATE_MASK, QUP_STATE_PAUSE, SAGIT_I2C_SPIN)) {
++		return ETIMEDOUT;
++	}
++
++	uint8_t rtags[4] = {
++		QUP_TAG_V2_START, (uint8_t)((addr << 1) | 1),
++		QUP_TAG_V2_DATARD_STOP, (uint8_t)(len == 256 ? 0 : len),
++	};
++	si2c_wrq(QUP_MX_OUTPUT_CNT, 4);
++	si2c_wrq(QUP_MX_WRITE_CNT, 4);
++	si2c_wrq(QUP_MX_INPUT_CNT, len);
++	si2c_wrq(QUP_MX_READ_CNT, len);
++
++	si2c_wrq(QUP_OPERATIONAL, QUP_OPERATIONAL_RESET);
++	si2c_write_tags(rtags, 4);
++	si2c_wrq(QUP_STATE, QUP_STATE_RUN);
++	si2c.txn = 14;
++
++	for (spins = 0; spins < SAGIT_I2C_SPIN; spins++) {
++		op = si2c_rdq(QUP_OPERATIONAL);
++		if (op & QUP_OP_MAX_INPUT_DONE) {
++			break;
++		}
++	}
++	si2c.txn = 15;
++
++	if (spins == SAGIT_I2C_SPIN) {
++		return ETIMEDOUT;
++	}
++
++	/* A NACK shows up here rather than as a timeout. */
++	if (si2c_rdq(QUP_ERROR_FLAGS) || (si2c_rdq(QUP_I2C_STATUS) & 0x38000fc)) {
++		return EIO;
++	}
++
++	for (uint32_t i = 0; i < len; i++) {
++		out[i] = (uint8_t)si2c_rdq(QUP_IN_FIFO_BASE);
++	}
++	si2c.txn = 16;
++
++	return 0;
++}
++
++/*
++ * RMI4 register read: two address bytes, little endian.
++ *
++ * The Synaptics protocol is not plain register I/O -- every transfer carries a
++ * 16-bit address before the data, which is why rmi4_i2c calls it a "0x0000
++ * page descriptor" read at probe time rather than an ID register.
++ */
++static int
++si2c_read_rmi4(uint8_t addr, uint16_t reg, uint8_t *out, uint32_t len)
++{
++	return si2c_read_addr(addr, reg, 2, out, len);
++}
++
++/* Plain single-byte-register I2C read, kept for later non-RMI4 use. */
++static int
++si2c_read(uint8_t addr, uint8_t reg, uint8_t *out, uint32_t len)
++{
++	return si2c_read_addr(addr, reg, 1, out, len);
++}
++
++/*
++ * Entry point, called once from bsd_init() before mounting anything.
++ *
++ * Stage reporting is the point: every exit panics with the register state, so a
++ * screenshot always identifies the failing stage without another CI round.
++ */
++/*
++ * Pin state read-out for the touch bus.
++ *
++ * msm8998 has several TLMM tiles and each pin lives at an offset inside one of
++ * them; from pinctrl-msm8998.c:
++ *
++ *   #define WEST  0x100000
++ *   #define NORTH 0x500000
++ *   #define EAST  0x900000
++ *   PINGROUP(id, base, ...):
++ *       ctl_reg = base + 0x1000 * id
++ *       io_reg  = base + 0x4 + 0x1000 * id
++ *
++ * and the ctl bit layout is fixed for this SoC:
++ *
++ *   mux_bit = 2 (3 bits)   pull_bit = 0 (2 bits)   drv_bit = 6 (3 bits)
++ *   oe_bit  = 9            io_reg: in_bit 0, out_bit 1
++ *
++ * GPIO 87 and 88 are EAST pins whose function list is
++ *   "gpio", "blsp_spi5", "blsp_uart2_b", "blsp_i2c5", ...
++ * so selecting I2C means mux = 3, not mux = 0. Getting either the tile or the
++ * mux index wrong silently drives the wrong pin, which is why the previous
++ * round only READ these registers.
++ *
++ * Pin numbers come straight from live.dtb:
++ *   qcom,i2c-clk  = <&tlmm 0x58 0>   -> GPIO 88 = SCL
++ *   qcom,i2c-dat  = <&tlmm 0x57 0>   -> GPIO 87 = SDA
++ *   synaptics,reset-gpio = <&tlmm 0x59 0> -> GPIO 89
++ */
++#define TLMM_BASE               0x3400000ULL
++#define TLMM_EAST               0x900000
++#define TLMM_WEST               0x100000
++#define TLMM_PIN_STRIDE         0x1000
++#define TLMM_GPIO_CFG           0x00
++#define TLMM_GPIO_IN_OUT        0x04
++
++#define TLMM_CTL_MUX_BIT        2
++#define TLMM_CTL_MUX_MASK       (0x7u << TLMM_CTL_MUX_BIT)
++#define TLMM_CTL_PULL_BIT       0
++#define TLMM_CTL_PULL_MASK      (0x3u << TLMM_CTL_PULL_BIT)
++#define TLMM_CTL_DRV_BIT        6
++#define TLMM_CTL_DRV_MASK       (0x7u << TLMM_CTL_DRV_BIT)
++#define TLMM_CTL_OE_BIT         9
++#define TLMM_PULL_UP            3u              /* kKeeper-free pull up */
++#define TLMM_FUNC_BLSP_I2C5     3               /* index of blsp_i2c5 for 87/88 */
++
++#define SAGIT_PIN_SCL           88
++#define SAGIT_PIN_SDA           87
++#define SAGIT_PIN_RESET         89
++#define SAGIT_PIN_TOUCH_IRQ     125
++/*
++ * disp_vddts_vreg: the touch "vdd" rail in the mainline Mi 6 DTS is a
++ * regulator-fixed on TLMM gpio 50, enable-active-high, regulator-boot-on.
++ * (The Android DT calls the same rail "avdd"; the mainline tree calls it vdd,
++ * and gives the chip its 1.8 V IO rail separately from PM8998 LDO6.)
++ */
++#define SAGIT_PIN_TS_AVDD       50
++
++static volatile uint32_t *si2c_tlmm;
++
++static uint32_t
++si2c_tlmm_rd(uint32_t pin, uint32_t reg)
++{
++	if (si2c_tlmm == NULL) {
++		return 0xffffffffu;
++	}
++	return si2c_tlmm[(TLMM_EAST + pin * TLMM_PIN_STRIDE + reg) / 4];
++}
++
++static void
++si2c_tlmm_wr(uint32_t pin, uint32_t reg, uint32_t v)
++{
++	if (si2c_tlmm != NULL) {
++		si2c_tlmm[(TLMM_EAST + pin * TLMM_PIN_STRIDE + reg) / 4] = v;
++	}
++}
++
++/*
++ * Assert the touch avdd rail (regulator-fixed on gpio 50, active high).
++ *
++ * Same ordering rule as the reset line: set the output value in io_reg before
++ * enabling the pad driver, so the pin never glitches low.
++ */
++static void
++si2c_avdd_on(void)
++{
++	uint32_t cfg = si2c_tlmm_rd(SAGIT_PIN_TS_AVDD, TLMM_GPIO_CFG);
++	uint32_t io = si2c_tlmm_rd(SAGIT_PIN_TS_AVDD, TLMM_GPIO_IN_OUT);
++
++	io |= (1u << 1);                        /* out_bit: drive high */
++	si2c_tlmm_wr(SAGIT_PIN_TS_AVDD, TLMM_GPIO_IN_OUT, io);
++
++	cfg &= ~(TLMM_CTL_MUX_MASK | TLMM_CTL_PULL_MASK);
++	cfg |= (0u << TLMM_CTL_MUX_BIT);        /* function 0 = plain GPIO */
++	cfg |= (1u << TLMM_CTL_OE_BIT);         /* output enable */
++	si2c_tlmm_wr(SAGIT_PIN_TS_AVDD, TLMM_GPIO_CFG, cfg);
++}
++
++/*
++ * Wait about `us` microseconds without delay(): spin on `yield`, the same trick
++ * the UFS driver uses. Each iteration is a handful of cycles, so 2000 yields is
++ * a convenient unit ("one tick"); on Kryo at 1.9 GHz that is on the order of a
++ * few microseconds. Precision does not matter here -- only that it waits long
++ * enough for the rail to settle.
++ */
++static void
++si2c_settle(uint32_t ticks)
++{
++	for (uint32_t t = 0; t < ticks; t++) {
++		for (volatile uint32_t i = 0; i < 2000; i++) {
++			__asm__ volatile("yield" ::: "memory");
++		}
++	}
++}
++
++/*
++ * Mux SCL/SDA onto BLSP I2C and enable pull-ups.
++ *
++ * The I2C lines are open drain: the controller only ever pulls them low, and
++ * something has to pull them back up. The DT's i2c_1_sleep state asks for
++ * bias-pull-up on exactly these pins, so that is what we program.
++ *
++ * mux index 3 is "blsp_i2c5" for GPIO 87/88 (see the function list above).
++ */
++static void
++si2c_pins_to_i2c(void)
++{
++	uint32_t ctl;
++	uint32_t pins[2] = { SAGIT_PIN_SCL, SAGIT_PIN_SDA };
++
++	for (int i = 0; i < 2; i++) {
++		ctl = si2c_tlmm_rd(pins[i], TLMM_GPIO_CFG);
++		ctl &= ~(TLMM_CTL_MUX_MASK | TLMM_CTL_PULL_MASK |
++		    TLMM_CTL_OE_BIT);
++		ctl |= (TLMM_FUNC_BLSP_I2C5 << TLMM_CTL_MUX_BIT);
++		ctl |= (TLMM_PULL_UP << TLMM_CTL_PULL_BIT);
++		si2c_tlmm_wr(pins[i], TLMM_GPIO_CFG, ctl);
++	}
++}
++
++/*
++ * Touch reset (GPIO 89).
++ *
++ * The mainline Xiaomi Mi 6 device tree (msm8998-xiaomi-sagit.dts) describes the
++ * touch node as "syna,rmi4-i2c" with this pinctrl:
++ *
++ *   ts_active_state: pins = "gpio89", "gpio125";
++ *                    function = "gpio"; drive-strength = <16>;
++ *                    bias-pull-up; input-enable;
++ *
++ * i.e. reset is configured as an INPUT with a pull-up, not driven as an output.
++ * The Synaptics part holds the line itself and the driver only watches it; the
++ * previous revision of this file drove it high, which is the opposite of what
++ * the reference design does.
++ *
++ * The suspend state drops the pull-up (bias-disable) for the same pins, so the
++ * active state is the one to program here.
++ */
++static void
++si2c_reset_release(void)
++{
++	uint32_t cfg = si2c_tlmm_rd(SAGIT_PIN_RESET, TLMM_GPIO_CFG);
++
++	/* Function 0 (plain GPIO), pull-up, and OUT OF output mode. */
++	cfg &= ~(TLMM_CTL_MUX_MASK | TLMM_CTL_PULL_MASK | TLMM_CTL_OE_BIT);
++	cfg |= (0u << TLMM_CTL_MUX_BIT);
++	cfg |= (TLMM_PULL_UP << TLMM_CTL_PULL_BIT);
++	/* oe_bit stays clear: input, matching input-enable in the reference DTS. */
++	si2c_tlmm_wr(SAGIT_PIN_RESET, TLMM_GPIO_CFG, cfg);
++}
++
++/*
++ * Touch interrupt line (GPIO 125): same pinctrl group, input with a pull-up.
++ * Not used for anything yet (this probe is polled), but configuring it the way
++ * the reference design does avoids leaving it in whatever the bootloader set.
++ */
++static void
++si2c_irq_pin_input(void)
++{
++	uint32_t cfg = si2c_tlmm_rd(SAGIT_PIN_TOUCH_IRQ, TLMM_GPIO_CFG);
++
++	cfg &= ~(TLMM_CTL_MUX_MASK | TLMM_CTL_PULL_MASK | TLMM_CTL_OE_BIT);
++	cfg |= (0u << TLMM_CTL_MUX_BIT);
++	cfg |= (TLMM_PULL_UP << TLMM_CTL_PULL_BIT);
++	si2c_tlmm_wr(SAGIT_PIN_TOUCH_IRQ, TLMM_GPIO_CFG, cfg);
++}
++
++
++/*
++ * A dead or unconfigured I2C bus shows up as SCL/SDA stuck low (no pull-ups, or
++ * the controller is not driving). Reporting the raw pin registers separates
++ * "pins are wrong" from "pins are fine but the chip is not answering".
++ */
++static void
++si2c_pin_report(const char *what, uint32_t extra)
++{
++	uint32_t scl_cfg = si2c_tlmm_rd(SAGIT_PIN_SCL, TLMM_GPIO_CFG);
++	uint32_t scl_io = si2c_tlmm_rd(SAGIT_PIN_SCL, TLMM_GPIO_IN_OUT);
++	uint32_t sda_cfg = si2c_tlmm_rd(SAGIT_PIN_SDA, TLMM_GPIO_CFG);
++	uint32_t sda_io = si2c_tlmm_rd(SAGIT_PIN_SDA, TLMM_GPIO_IN_OUT);
++	uint32_t rst_cfg = si2c_tlmm_rd(SAGIT_PIN_RESET, TLMM_GPIO_CFG);
++	uint32_t rst_io = si2c_tlmm_rd(SAGIT_PIN_RESET, TLMM_GPIO_IN_OUT);
++
++	panic("SAGIT I2C %s: scl(gpio%d) cfg=0x%x io=0x%x | sda(gpio%d) cfg=0x%x io=0x%x | "
++	    "rst(gpio%d) cfg=0x%x io=0x%x | avdd(gpio%d) cfg=0x%x io=0x%x | "
++	    "qcfg=0x%x qstate=0x%x qop=0x%x qerr=0x%x i2cst=0x%x extra=0x%x",
++	    what,
++	    SAGIT_PIN_SCL, scl_cfg, scl_io,
++	    SAGIT_PIN_SDA, sda_cfg, sda_io,
++	    SAGIT_PIN_RESET, rst_cfg, rst_io,
++	    SAGIT_PIN_TS_AVDD, si2c_tlmm_rd(SAGIT_PIN_TS_AVDD, TLMM_GPIO_CFG),
++	    si2c_tlmm_rd(SAGIT_PIN_TS_AVDD, TLMM_GPIO_IN_OUT),
++	    si2c_rdq(QUP_CONFIG), si2c_rdq(QUP_STATE), si2c_rdq(QUP_OPERATIONAL),
++	    si2c_rdq(QUP_ERROR_FLAGS), si2c_rdq(QUP_I2C_STATUS), extra);
++}
++
++void
++sagit_i2c_touch_probe(void)
++{
++	DTEntry node;
++	uintptr_t const *reg = NULL;
++	unsigned int size = 0;
++	uint8_t idbuf[8] = { 0 };
++	int rc;
++
++	si2c.txn = 0;
++
++	if (SecureDTLookupEntry(NULL, "/sagit-i2c", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
++	    size < 2 * sizeof(uintptr_t)) {
++		panic("SAGIT I2C: no /sagit-i2c node in the device tree");
++	}
++
++	si2c.regs = (volatile uint32_t *)ml_io_map(reg[0], reg[1]);
++	if (si2c.regs == NULL) {
++		panic("SAGIT I2C: ml_io_map(i2c) failed");
++	}
++	/* GCC is a separate window; map it once for the clock writes. */
++	si2c.gcc = (volatile uint32_t *)ml_io_map(SAGIT_GCC_BASE, 0x90000);
++	if (si2c.gcc == NULL) {
++		panic("SAGIT I2C: ml_io_map(gcc) failed");
++	}
++	/* TLMM: mux the bus pins and release touch reset before any transfer. */
++	si2c_tlmm = (volatile uint32_t *)ml_io_map(TLMM_BASE, 0xc00000);
++	if (si2c_tlmm == NULL) {
++		panic("SAGIT I2C: ml_io_map(tlmm) failed");
++	}
++	/*
++	 * Power and pin order:
++	 *   1. avdd rail (gpio 50) -- the chip cannot answer without it
++	 *   2. bus mux + pull-ups
++	 *   3. reset released, after the rail has settled
++	 * Only then is it worth starting clocks.
++	 */
++	si2c_avdd_on();
++	si2c_settle(2);                 /* > the 4 ms startup-delay of the rail */
++	si2c_pins_to_i2c();
++	si2c_reset_release();
++	si2c_irq_pin_input();
++	si2c_settle(1);                 /* reset release to first transfer */
++
++	si2c_clock_up();
++
++	rc = si2c_qup_init();
++	if (rc != 0) {
++		si2c_report("qup init failed", si2c_rdq(QUP_CONFIG),
++		    si2c_rdq(QUP_STATE), si2c_rdq(QUP_IO_MODE), (uint32_t)rc);
++	}
++
++	/*
++	 * RMI4 addressing: the chip is not a plain register device. A transfer
++	 * is always 2 bytes of address followed by data, and the first thing a
++	 * host reads is the page descriptor at address 0x0000 (function
++	 * presence and version). rmi4_i2c does exactly this at probe time.
++	 *
++	 * Read 6 bytes from 0x0000: enough for the page descriptor (which
++	 * reports how many functions and how their bits are distributed).
++	 */
++	rc = si2c_read_rmi4(SAGIT_TOUCH_ADDR, 0x0000, idbuf, sizeof(idbuf));
++	if (rc != 0) {
++		/* Include the pins: this is the point where "wrong pins" and
++		 * "chip not answering" look identical without them. */
++		si2c_pin_report(rc == ETIMEDOUT ? "read timed out" : "read failed",
++		    (uint32_t)rc);
++	}
++
++	panic("SAGIT I2C OK: touch@0x20 page0 = %02x %02x %02x %02x %02x %02x "
++	    "(qop=0x%x) scl io=0x%x sda io=0x%x -- I2C link is up",
++	    idbuf[0], idbuf[1], idbuf[2], idbuf[3], idbuf[4], idbuf[5],
++	    si2c_rdq(QUP_OPERATIONAL),
++	    si2c_tlmm_rd(SAGIT_PIN_SCL, TLMM_GPIO_IN_OUT),
++	    si2c_tlmm_rd(SAGIT_PIN_SDA, TLMM_GPIO_IN_OUT));
++}
++
++#endif /* SAGIT */
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -105,6 +105,7 @@
+ 
+ bsd/dev/memdev.c			standard
+ bsd/dev/sagit_ufs.c			standard
++bsd/dev/sagit_i2c.c			standard
+ bsd/dev/sagit_crypto.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -966,7 +966,28 @@
+ 		 */
+ 		{
+ 			extern int sagit_ufs_rootdev(dev_t * dev);
++			extern void sagit_i2c_touch_probe(void);
+ 			dev_t ufs_dev = 0;
++
++#if defined(SAGIT)
++			/*
++			 * One-shot I2C probe, opt-in via the boot-arg
++			 * "sagit_touch=1". Every path exits through panic(), so
++			 * enabling it steals the boot until the link is proven --
++			 * which is the point: one screenshot then says exactly
++			 * which stage works.
++			 *
++			 * Uses PE_parse_boot_argn with a real destination buffer,
++			 * the same way bsd_init reads "rd" above. A bare
++			 * strstr(PE_boot_args(), ...) would not link: this kernel
++			 * declares no strstr for kernel code.
++			 */
++			int touch_probe = 0;
++			if (PE_parse_boot_argn("sagit_touch", &touch_probe,
++			    sizeof(touch_probe)) && touch_probe != 0) {
++				sagit_i2c_touch_probe();
++			}
++#endif
+ 			if (SAGIT_UFS_PROBE == 1) {
+ 				panic("SAGIT probe 1: about to call sagit_ufs_rootdev");
+ 			}
