@@ -9,7 +9,7 @@ diff --git a/bsd/dev/sagit_crypto.c b/bsd/dev/sagit_crypto.c
  
  #define SAGIT_MD5_STATE_WORDS  4
  #define SAGIT_MD5_BLOCK_BYTES  64
-@@ -237,8 +238,15 @@
+@@ -237,8 +238,16 @@
  	.ccmd5_di           = &sagit_md5_di,
  };
  
@@ -22,12 +22,13 @@ diff --git a/bsd/dev/sagit_crypto.c b/bsd/dev/sagit_crypto.c
 + * faults with "Unexpected fault in kernel static region". Real corecrypto
 + * installs its table during EARLY_BOOT for the same reason, so do the same.
 + */
++__startup_func
 +static void
-+sagit_crypto_bootstrap(const void *arg __unused)
++sagit_crypto_bootstrap(void)
  {
  	if (register_crypto_functions(&sagit_crypto_funcs) != 0) {
  		/* Something already installed a table (real corecrypto?).
-@@ -248,3 +256,4 @@
+@@ -248,3 +257,4 @@
  	}
  	printf("SAGIT crypto: built-in MD5 registered\n");
  }
