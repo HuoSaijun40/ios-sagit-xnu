@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,804 @@
+@@ -0,0 +1,906 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -142,8 +142,17 @@ new file mode 100644
 +#define QUP_TAG_V2_DATARD_NACK  0x86
 +#define QUP_TAG_V2_DATARD_STOP  0x87
 +
-+/* Bounded spin: no clock, no timeout subsystem (same rule as the UFS driver). */
-+#define SAGIT_I2C_SPIN          200000u
++/*
++ * Bounded spin: no clock, no timeout subsystem (same rule as the UFS driver).
++ *
++ * 200000 was not "generous", it was dangerous. If the block being polled is
++ * not clocked, every read costs a bus timeout rather than a few nanoseconds,
++ * so 200000 iterations can take minutes -- far past the SoC watchdog, which is
++ * what the v43 freeze looked like: no panic, just a reset. 20000 keeps the
++ * margin (a real transfer needs ~235 us) while guaranteeing that a dead bus
++ * ends in a panic we can read instead of a silent reset.
++ */
++#define SAGIT_I2C_SPIN          20000u
 +
 +static struct {
 +	volatile uint32_t *regs;        /* QUP registers */
@@ -539,6 +548,7 @@ new file mode 100644
 + */
 +#define TLMM_BASE               0x3400000ULL
 +#define TLMM_EAST               0x900000
++#define TLMM_NORTH              0x500000
 +#define TLMM_WEST               0x100000
 +#define TLMM_PIN_STRIDE         0x1000
 +#define TLMM_GPIO_CFG           0x00
@@ -566,22 +576,56 @@ new file mode 100644
 + */
 +#define SAGIT_PIN_TS_AVDD       50
 +
-+static volatile uint32_t *si2c_tlmm;
++/*
++ * TLMM is split into tiles, and the tile is a property of the pin, not a range:
++ * mainline (drivers/pinctrl/qcom/pinctrl-msm8998.c) writes
++ *
++ *     PINGROUP(id, tile, ...)  ->  ctl_reg = tile_base + 0x1000 * id
++ *
++ * and the tile map is scattered:
++ *
++ *     GPIO 50          NORTH (0x500000)   touch avdd rail
++ *     GPIO 87, 88, 89  EAST  (0x900000)   sda, scl, reset
++ *     GPIO 125         EAST  (0x900000)   interrupt
++ *
++ * The previous version addressed every pin through the EAST base, so avdd on
++ * gpio 50 actually touched EAST+0x32000 -- a hole in the EAST window that no
++ * pin implements. That is a real bug: it drove nothing (so the rail stayed
++ * down) and an access to an unimplemented TLMM window can stall the
++ * interconnect on this SoC, which freezes the boot with no output at all.
++ */
++static volatile uint32_t *si2c_tlmm_east;
++static volatile uint32_t *si2c_tlmm_north;
++
++static volatile uint32_t *
++si2c_tlmm_tile(uint32_t pin)
++{
++	switch (pin) {
++	case SAGIT_PIN_TS_AVDD:
++		return si2c_tlmm_north;
++	default:
++		return si2c_tlmm_east;
++	}
++}
 +
 +static uint32_t
 +si2c_tlmm_rd(uint32_t pin, uint32_t reg)
 +{
-+	if (si2c_tlmm == NULL) {
++	volatile uint32_t *tile = si2c_tlmm_tile(pin);
++
++	if (tile == NULL) {
 +		return 0xffffffffu;
 +	}
-+	return si2c_tlmm[(pin * TLMM_PIN_STRIDE + reg) / 4];
++	return tile[(pin * TLMM_PIN_STRIDE + reg) / 4];
 +}
 +
 +static void
 +si2c_tlmm_wr(uint32_t pin, uint32_t reg, uint32_t v)
 +{
-+	if (si2c_tlmm != NULL) {
-+		si2c_tlmm[(pin * TLMM_PIN_STRIDE + reg) / 4] = v;
++	volatile uint32_t *tile = si2c_tlmm_tile(pin);
++
++	if (tile != NULL) {
++		tile[(pin * TLMM_PIN_STRIDE + reg) / 4] = v;
 +	}
 +}
 +
@@ -735,11 +779,28 @@ new file mode 100644
 +
 +	si2c.txn = 0;
 +
++	/*
++	 * Breadcrumbs, one line per stage.
++	 *
++	 * v43 proved why these are needed: the screen stopped at "inittodr done"
++	 * with no SAGIT I2C line at all, even though every failure path in this
++	 * file ends in panic(). A panic always prints, so the probe was not
++	 * failing -- it was *stuck*, long enough for the SoC watchdog to reset
++	 * the board. printf works at this point (the B09 line just above is
++	 * printed by bsd_init microseconds earlier), so a line per stage is what
++	 * turns "it froze somewhere" into "it froze here".
++	 *
++	 * The last line on screen is therefore the last stage that survived.
++	 */
++	printf("SAGIT I2C 1/9 enter, addr=0x%x\n", SAGIT_TOUCH_ADDR);
++
 +	if (SecureDTLookupEntry(NULL, "/sagit-i2c", &node) != kSuccess ||
 +	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
 +	    size < 2 * sizeof(uintptr_t)) {
 +		panic("SAGIT I2C: no /sagit-i2c node in the device tree");
 +	}
++	printf("SAGIT I2C 2/9 node reg=0x%lx len=0x%lx\n",
++	    (unsigned long)(uint32_t)reg[0], (unsigned long)(uint32_t)reg[1]);
 +
 +	si2c.regs = (volatile uint32_t *)ml_io_map(reg[0], reg[1]);
 +	if (si2c.regs == NULL) {
@@ -751,16 +812,21 @@ new file mode 100644
 +		panic("SAGIT I2C: ml_io_map(gcc) failed");
 +	}
 +	/*
-+	 * TLMM: only the EAST tile is needed, and only up to GPIO 125.
-+	 * Mapping the whole 0xc00000 block needs a 12 MiB contiguous kmem
-+	 * allocation, which fails this early (kmem_alloc ... failed with 3).
-+	 * EAST starts at 0x900000 and GPIO n sits at 0x1000*n inside it, so
-+	 * 0x84000 covers up to GPIO 131 with room to spare.
++	 * TLMM: map the two tiles the touch pins live in, not the whole
++	 * 0xc00000 block -- that needs a 12 MiB contiguous kmem allocation and
++	 * fails this early (kmem_alloc ... 12582912 ... failed with 3).
++	 * Inside a tile the register offset is 0x1000 * gpio, so a window is
++	 * only as big as the highest pin in that tile demands: EAST needs
++	 * 0x84000 to reach gpio 125, NORTH needs 0x40000 to reach gpio 50.
 +	 */
-+	si2c_tlmm = (volatile uint32_t *)ml_io_map(TLMM_BASE + TLMM_EAST, 0x84000);
-+	if (si2c_tlmm == NULL) {
-+		panic("SAGIT I2C: ml_io_map(tlmm) failed");
++	si2c_tlmm_east  = (volatile uint32_t *)ml_io_map(TLMM_BASE + TLMM_EAST, 0x84000);
++	si2c_tlmm_north = (volatile uint32_t *)ml_io_map(TLMM_BASE + TLMM_NORTH, 0x40000);
++	if (si2c_tlmm_east == NULL || si2c_tlmm_north == NULL) {
++		panic("SAGIT I2C: ml_io_map(tlmm) failed east=%p north=%p",
++		    (void *)si2c_tlmm_east, (void *)si2c_tlmm_north);
 +	}
++	printf("SAGIT I2C 3/9 mapped i2c/gcc/east/north ok\n");
++
 +	/*
 +	 * Power and pin order:
 +	 *   1. avdd rail (gpio 50) -- the chip cannot answer without it
@@ -768,20 +834,55 @@ new file mode 100644
 +	 *   3. reset released, after the rail has settled
 +	 * Only then is it worth starting clocks.
 +	 */
++	printf("SAGIT I2C 4/9 avdd before: cfg=0x%x io=0x%x\n",
++	    si2c_tlmm_rd(SAGIT_PIN_TS_AVDD, TLMM_GPIO_CFG),
++	    si2c_tlmm_rd(SAGIT_PIN_TS_AVDD, TLMM_GPIO_IN_OUT));
 +	si2c_avdd_on();
++	printf("SAGIT I2C 5/9 avdd after: cfg=0x%x io=0x%x\n",
++	    si2c_tlmm_rd(SAGIT_PIN_TS_AVDD, TLMM_GPIO_CFG),
++	    si2c_tlmm_rd(SAGIT_PIN_TS_AVDD, TLMM_GPIO_IN_OUT));
 +	si2c_settle(2);                 /* > the 4 ms startup-delay of the rail */
 +	si2c_pins_to_i2c();
++	printf("SAGIT I2C 6/9 pins: scl cfg=0x%x io=0x%x | sda cfg=0x%x io=0x%x\n",
++	    si2c_tlmm_rd(SAGIT_PIN_SCL, TLMM_GPIO_CFG),
++	    si2c_tlmm_rd(SAGIT_PIN_SCL, TLMM_GPIO_IN_OUT),
++	    si2c_tlmm_rd(SAGIT_PIN_SDA, TLMM_GPIO_CFG),
++	    si2c_tlmm_rd(SAGIT_PIN_SDA, TLMM_GPIO_IN_OUT));
 +	si2c_reset_release();
 +	si2c_irq_pin_input();
++	printf("SAGIT I2C 7/9 rst cfg=0x%x io=0x%x | irq cfg=0x%x io=0x%x\n",
++	    si2c_tlmm_rd(SAGIT_PIN_RESET, TLMM_GPIO_CFG),
++	    si2c_tlmm_rd(SAGIT_PIN_RESET, TLMM_GPIO_IN_OUT),
++	    si2c_tlmm_rd(SAGIT_PIN_TOUCH_IRQ, TLMM_GPIO_CFG),
++	    si2c_tlmm_rd(SAGIT_PIN_TOUCH_IRQ, TLMM_GPIO_IN_OUT));
 +	si2c_settle(1);                 /* reset release to first transfer */
 +
++	printf("SAGIT I2C 8/9 clocks: rcgr=0x%x ahb=0x%x ahbhalt=0x%x\n",
++	    si2c_rdg(SAGIT_QUP5_RCGR), si2c_rdg(SAGIT_BLSP1_AHB_CBCR),
++	    si2c_rdg(SAGIT_BLSP1_AHB_HALT));
 +	si2c_clock_up();
++	/*
++	 * These registers are everything the clock stage could have got wrong,
++	 * so print them instead of only reporting them from a panic: if the next
++	 * stage (the first QUP access) is where it dies, this line is the last
++	 * thing on screen and still tells us whether the clock came up.
++	 */
++	printf("SAGIT I2C 9/9 clocks: rcgr=0x%x cfg=0x%x cbcr=0x%x ahb=0x%x "
++	    "ahbhalt=0x%x bcr=0x%x\n",
++	    si2c_rdg(SAGIT_QUP5_RCGR + RCG_CMD_REG),
++	    si2c_rdg(SAGIT_QUP5_RCGR + RCG_CFG_REG),
++	    si2c_rdg(SAGIT_QUP5_CBCR), si2c_rdg(SAGIT_BLSP1_AHB_CBCR),
++	    si2c_rdg(SAGIT_BLSP1_AHB_HALT), si2c_rdg(SAGIT_QUP5_BCR));
++	printf("SAGIT I2C qup: touching the block now (a freeze here means the "
++	    "QUP is not powered/clocked)\n");
 +
 +	rc = si2c_qup_init();
 +	if (rc != 0) {
 +		si2c_report("qup init failed", si2c_rdq(QUP_CONFIG),
 +		    si2c_rdq(QUP_STATE), si2c_rdq(QUP_IO_MODE), (uint32_t)rc);
 +	}
++	printf("SAGIT I2C qup: ready qstate=0x%x qcfg=0x%x iomode=0x%x\n",
++	    si2c_rdq(QUP_STATE), si2c_rdq(QUP_CONFIG), si2c_rdq(QUP_IO_MODE));
 +
 +	/*
 +	 * RMI4 addressing: the chip is not a plain register device. A transfer
@@ -792,6 +893,7 @@ new file mode 100644
 +	 * Read 6 bytes from 0x0000: enough for the page descriptor (which
 +	 * reports how many functions and how their bits are distributed).
 +	 */
++	printf("SAGIT I2C read: page0 @0x00, 6 bytes\n");
 +	rc = si2c_read_rmi4(SAGIT_TOUCH_ADDR, 0x0000, idbuf, sizeof(idbuf));
 +	if (rc != 0) {
 +		/* Include the pins: this is the point where "wrong pins" and
