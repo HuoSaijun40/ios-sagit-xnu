@@ -168,6 +168,26 @@ jobs:
             echo "::error::volume still mounted after detach attempts"
             exit 1
           fi
+          # Unmounting the volume is not the same as ejecting the image: with
+          # -layout NONE the two are the same device, but if a second detach is
+          # ever needed the image stays claimed and the next step fails on it
+          # with no useful message. Check the image itself, not just the mount.
+          if hdiutil info | grep -q 'work/root.dmg'; then
+            echo "image still attached after detach; forcing it out"
+            # Only the devices that belong to root.dmg: hdiutil info prints
+            # 'image-path' then the device lines for that image in one block.
+            hdiutil info |
+              awk '/^image-path/ { mine = ($0 ~ /work\/root\.dmg/) }
+                   mine && /^\/dev\/disk/ { print $1 }' |
+              sort -u | while read -r d; do
+                hdiutil detach "$d" -force || true
+              done
+          fi
+          if hdiutil info | grep -q 'work/root.dmg'; then
+            echo "::error::root.dmg is still attached; the raw conversion would fail"
+            hdiutil info | grep -A2 'work/root.dmg' || true
+            exit 1
+          fi
 
       - name: fsck the volume
         run: |
@@ -185,26 +205,54 @@ jobs:
 
       - name: Convert to a raw image
         run: |
-          set -euo pipefail
-          cd work
-          hdiutil convert root.dmg -format UDRW -o root-raw.dmg
-          ls -l root-raw.dmg
-          hdiutil attach -nomount -nobrowse root-raw.dmg > dev.txt
+          set -uo pipefail
+          # Relative rm -rf follows: never proceed from the wrong directory.
+          cd work || { echo "::error::cannot cd into work"; exit 1; }
+          [ -f root.dmg ] || { echo "::error::root.dmg is missing"; ls -l; exit 1; }
+          # Disk budget on the runner is the binding constraint, so reclaim the
+          # two biggest objects that are no longer needed before writing the
+          # 12 GiB raw copy: the 8.29 GiB tree and the 4 GiB tarball.
+          echo "=== before cleanup ==="; df -h /
+          sudo rm -rf root iosroot.tar.zst
+          echo "=== after cleanup ==="; df -h /
+          # No hdiutil convert: with -layout NONE the image holds a bare HFS+
+          # volume, so the device hdiutil hands back IS the raw byte stream.
+          # Converting to UDRW first (the previous version) needed a second
+          # 12 GiB file and failed here; dd'ing the original saves that copy
+          # and the same bytes come out.
+          if ! hdiutil attach -nomount -nobrowse root.dmg > dev.txt; then
+            echo "::error::hdiutil attach of root.dmg failed"
+            cat dev.txt
+            exit 1
+          fi
           cat dev.txt
           DEV=$(awk 'NR==1{print $1}' dev.txt)
           [ -n "$DEV" ] || { echo "::error::no device from hdiutil attach"; exit 1; }
           echo "raw device: $DEV"
-          sudo dd if="$DEV" of=root.img bs=4m
+          diskutil info "$DEV" | grep -iE 'Disk Size|Device Block Size|Media Name' || true
+          if ! sudo dd if="$DEV" of=root.img bs=4m; then
+            echo "::error::dd from $DEV failed (out of space?)"
+            df -h /
+            exit 1
+          fi
           sync
-          hdiutil detach "$DEV" -force ||
-            sudo umount "$DEV" -f || true
+          hdiutil detach "$DEV" -force || sudo umount -f "$DEV" || true
+          rm -f root.dmg
           ls -lh root.img
+          echo "=== after raw image ==="; df -h /
 
       - name: Check the volume header
         run: |
-          set -euo pipefail
-          cd work
-          python3 ../tools/sparseimg.py check root.img
+          set -uo pipefail
+          cd work || { echo "::error::cannot cd into work"; exit 1; }
+          ls -l root.img
+          if ! python3 ../tools/sparseimg.py check root.img; then
+            echo "::error::root.img has no HFS+ volume header at offset 1024"
+            # 1024..1536 must be the volume header; print the first 32 bytes
+            # there so a bad extraction is obvious from the annotation alone.
+            dd if=root.img bs=1 skip=1024 count=32 2>/dev/null | xxd || true
+            exit 1
+          fi
 
       - name: Convert to Android sparse
         if: ${{ inputs.make_sparse != 'false' }}
@@ -221,8 +269,11 @@ jobs:
           cd work
           # A bad sparse image would flash but boot garbage, so prove the
           # round-trip is byte-identical before uploading anything.
+          # recon.img is written with holes (DONT_CARE chunks seek), so this
+          # check costs almost no disk.
           python3 ../tools/sparseimg.py unsparse ios16-root-sagit.simg recon.img
           ls -l recon.img root.img
+          echo "=== physical usage (holes in recon.img) ==="; du -h recon.img
           if cmp root.img recon.img; then
             echo "round-trip OK"
           else
@@ -235,7 +286,15 @@ jobs:
         run: |
           set -euo pipefail
           cd work
-          if [ -f ios16-root-sagit.simg ]; then base=ios16-root-sagit.simg; else base=root.img; fi
+          if [ -f ios16-root-sagit.simg ]; then
+            base=ios16-root-sagit.simg
+            # The sparse image is verified; the 12 GiB raw copy is dead weight
+            # from here on and zstd needs the room.
+            rm -f root.img recon.img
+          else
+            base=root.img
+          fi
+          df -h /
           # -T0 keeps the 180 min budget; --long is not needed for a disk image
           # and costs RAM, so leave it off.
           zstd -19 -T0 -o "$base.zst" "$base"
