@@ -159,7 +159,15 @@ jobs:
           echo "=== ownership (must be numeric, not the runner user) ==="
           ls -ldn "$MOUNT" "$MOUNT/usr" "$MOUNT/private/var" 2>/dev/null || true
           sync
-          hdiutil detach "$MOUNT"
+          # DiskArbitration sometimes times out with a 12 GiB volume and 179k
+          # files. Fall back to a forced detach, then to umount.
+          hdiutil detach "$MOUNT" ||
+            hdiutil detach "$MOUNT" -force ||
+            sudo umount "$MOUNT" -f || true
+          if [ -d "$MOUNT" ]; then
+            echo "::error::volume still mounted after detach attempts"
+            exit 1
+          fi
 
       - name: fsck the volume
         run: |
@@ -188,7 +196,8 @@ jobs:
           echo "raw device: $DEV"
           sudo dd if="$DEV" of=root.img bs=4m
           sync
-          hdiutil detach "$DEV" -force || true
+          hdiutil detach "$DEV" -force ||
+            sudo umount "$DEV" -f || true
           ls -lh root.img
 
       - name: Check the volume header
