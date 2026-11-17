@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,798 @@
+@@ -0,0 +1,804 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -574,14 +574,14 @@ new file mode 100644
 +	if (si2c_tlmm == NULL) {
 +		return 0xffffffffu;
 +	}
-+	return si2c_tlmm[(TLMM_EAST + pin * TLMM_PIN_STRIDE + reg) / 4];
++	return si2c_tlmm[(pin * TLMM_PIN_STRIDE + reg) / 4];
 +}
 +
 +static void
 +si2c_tlmm_wr(uint32_t pin, uint32_t reg, uint32_t v)
 +{
 +	if (si2c_tlmm != NULL) {
-+		si2c_tlmm[(TLMM_EAST + pin * TLMM_PIN_STRIDE + reg) / 4] = v;
++		si2c_tlmm[(pin * TLMM_PIN_STRIDE + reg) / 4] = v;
 +	}
 +}
 +
@@ -750,8 +750,14 @@ new file mode 100644
 +	if (si2c.gcc == NULL) {
 +		panic("SAGIT I2C: ml_io_map(gcc) failed");
 +	}
-+	/* TLMM: mux the bus pins and release touch reset before any transfer. */
-+	si2c_tlmm = (volatile uint32_t *)ml_io_map(TLMM_BASE, 0xc00000);
++	/*
++	 * TLMM: only the EAST tile is needed, and only up to GPIO 125.
++	 * Mapping the whole 0xc00000 block needs a 12 MiB contiguous kmem
++	 * allocation, which fails this early (kmem_alloc ... failed with 3).
++	 * EAST starts at 0x900000 and GPIO n sits at 0x1000*n inside it, so
++	 * 0x84000 covers up to GPIO 131 with room to spare.
++	 */
++	si2c_tlmm = (volatile uint32_t *)ml_io_map(TLMM_BASE + TLMM_EAST, 0x84000);
 +	if (si2c_tlmm == NULL) {
 +		panic("SAGIT I2C: ml_io_map(tlmm) failed");
 +	}
