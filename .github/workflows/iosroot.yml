@@ -35,8 +35,13 @@ on:
           - HFS+
         default: Case-sensitive HFS+
       make_sparse:
-        description: Convert to Android sparse before zstd (much smaller upload)
-        default: "true"
+        description: >-
+          Convert to Android sparse before zstd. OFF by default: an Android
+          sparse image is capped at 4 GiB *including data*, and the iOS tree
+          is 8.43 GiB, so the conversion cannot finish (run 12 died with
+          struct.error on blob_size). A plain zstd-compressed raw image
+          works with fastboot too, it is just a bigger download.
+        default: "false"
       parts_base:
         description: Release URL prefix holding the parts
         default: https://github.com/HuoSaijun40/ios-sweet/releases/download/iOS-RootFS
@@ -246,6 +251,8 @@ jobs:
           set -uo pipefail
           cd work || { echo "::error::cannot cd into work"; exit 1; }
           ls -l root.img
+          # Also reports whether the used data can even be a sparse image:
+          # that format caps the whole image (data included) at 4 GiB.
           if ! python3 ../tools/sparseimg.py check root.img; then
             echo "::error::root.img has no HFS+ volume header at offset 1024"
             # 1024..1536 must be the volume header; print the first 32 bytes
@@ -257,47 +264,79 @@ jobs:
       - name: Convert to Android sparse
         if: ${{ inputs.make_sparse != 'false' }}
         run: |
-          set -euo pipefail
-          cd work
-          python3 ../tools/sparseimg.py make root.img ios16-root-sagit.simg
+          set -uo pipefail
+          cd work || { echo "::error::cannot cd into work"; exit 1; }
+          # `make` keeps only the HFS+ used region (total - free blocks) and
+          # drops the free tail, which is what keeps blob_size inside its
+          # 32-bit field. Run 12 died here with
+          #   struct.error: 'I' format requires 0 <= number <= 4294967295
+          # after emitting a 3 GB truncated .simg.
+          if ! python3 ../tools/sparseimg.py make root.img ios16-root-sagit.simg; then
+            echo "::error::sparse conversion failed (see the message above)"
+            ls -l ios16-root-sagit.simg 2>/dev/null || true
+            rm -f ios16-root-sagit.simg
+            exit 1
+          fi
+          # Record how many blocks were kept so the round-trip can compare the
+          # right prefix of root.img.
+          python3 ../tools/sparseimg.py info ios16-root-sagit.simg --field total_blocks \
+            > kept_blocks.txt
+          echo "kept blocks: $(cat kept_blocks.txt)"
           ls -lh ios16-root-sagit.simg
 
       - name: Verify the sparse image round-trips
         if: ${{ inputs.make_sparse != 'false' }}
         run: |
-          set -euo pipefail
-          cd work
+          set -uo pipefail
+          cd work || { echo "::error::cannot cd into work"; exit 1; }
           # A bad sparse image would flash but boot garbage, so prove the
           # round-trip is byte-identical before uploading anything.
           # recon.img is written with holes (DONT_CARE chunks seek), so this
-          # check costs almost no disk.
-          python3 ../tools/sparseimg.py unsparse ios16-root-sagit.simg recon.img
-          ls -l recon.img root.img
+          # check costs little disk.
+          if ! python3 ../tools/sparseimg.py unsparse ios16-root-sagit.simg recon.img; then
+            echo "::error::unsparse of the produced image failed"
+            exit 1
+          fi
+          KEPT=$(cat kept_blocks.txt)
+          BYTES=$((KEPT * 4096))
+          ls -l recon.img
+          echo "kept blocks=$KEPT bytes=$BYTES"
           echo "=== physical usage (holes in recon.img) ==="; du -h recon.img
-          if cmp root.img recon.img; then
-            echo "round-trip OK"
+          # Compare only the region the sparse image kept: the rest of root.img
+          # is the dropped free tail and is intentionally absent.
+          if head -c "$BYTES" root.img | cmp - recon.img; then
+            echo "round-trip OK ($BYTES bytes)"
           else
-            echo "::error::sparse round-trip mismatch"
+            echo "::error::sparse round-trip mismatch in the first $BYTES bytes"
             exit 1
           fi
           rm -f recon.img
+          # root.img is 12 GiB and no longer needed once the sparse image is
+          # proven; zstd needs the room.
+          rm -f root.img
+          echo "=== after round-trip ==="; df -h /
 
       - name: Compress
         run: |
-          set -euo pipefail
-          cd work
+          set -uo pipefail
+          cd work || { echo "::error::cannot cd into work"; exit 1; }
           if [ -f ios16-root-sagit.simg ]; then
             base=ios16-root-sagit.simg
-            # The sparse image is verified; the 12 GiB raw copy is dead weight
-            # from here on and zstd needs the room.
+            # The sparse image is verified and root.img has already been
+            # dropped by the round-trip step; belt and braces here.
             rm -f root.img recon.img
           else
             base=root.img
+            # Raw mode: this is the 12 GiB image the device needs.
+            [ -f root.img ] || { echo "::error::root.img is missing"; ls -l; exit 1; }
           fi
           df -h /
           # -T0 keeps the 180 min budget; --long is not needed for a disk image
           # and costs RAM, so leave it off.
-          zstd -19 -T0 -o "$base.zst" "$base"
+          if ! zstd -19 -T0 -o "$base.zst" "$base"; then
+            echo "::error::zstd failed"
+            exit 1
+          fi
           ls -lh "$base" "$base.zst"
           shasum -a 256 "$base" "$base.zst" | tee SHA256SUMS
 
