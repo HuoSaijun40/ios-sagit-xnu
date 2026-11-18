@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1078 @@
+@@ -0,0 +1,1093 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -57,6 +57,14 @@ new file mode 100644
 +#define SAGIT_TOUCH_UB_ADDR     0x2c             /* bootloader/update mode */
 +
 +/* GCC */
++/*
++ * GCC base/size from this phone's ADT (/soc/qcom,gcc@100000). Used only as
++ * a fallback when the kernel-visible device tree does not carry the soc
++ * nodes, which v48 proved it does not (both lookup flavours failed).
++ */
++#define SAGIT_GCC_BASE_ADT      0x100000ULL
++#define SAGIT_GCC_SIZE_ADT      0xb0000ULL
++
 +/*
 + * The GCC base is NOT a constant in this file any more. Through v46 it
 + * was 0xc000000, guessed from the mainline driver; this phone's ADT says
@@ -901,54 +909,61 @@ new file mode 100644
 +		panic("SAGIT I2C: ml_io_map(i2c) failed");
 +	}
 +	/*
-+	 * GCC is a separate window. Take it from the device tree, never from a
-+	 * constant:
++	 * GCC is a separate window. The values come from this phone's ADT:
 +	 *
 +	 *     //soc/qcom,gcc@100000
 +	 *         compatible = "qcom,gcc-8998-v2"
 +	 *         reg        = <0x100000 0xb0000>
 +	 *
-+	 * Through v46 this file mapped 0xc000000 with a 0x90000 window, taken
-+	 * from the mainline driver's address space rather than from this phone's
-+	 * ADT. 0xc000000 is 0xb00000 away from the real block, and the probe hung
-+	 * on the very first read of it (stage 8): the access went to no device at
-+	 * all and took the interconnect down. Every "clock" register the previous
-+	 * versions touched was equally bogus.
++	 * Through v46 this file mapped 0xc000000 (mainline's address space, not
++	 * this phone's), 0xb00000 away from the real block: the first read of it
++	 * hung the board at stage 8.
++	 *
++	 * v47/v48 then tried to read the base from the device tree and both
++	 * failed -- SecureDTLookupEntry (path, strcmp on node names) and
++	 * SecureDTFindEntry (compatible match) each reported "not found". The
++	 * kernel's copy of the tree evidently does not carry the soc nodes, so
++	 * the device tree is not a usable source for this address in the
++	 * bsd_init context.
++	 *
++	 * Therefore: look it up, and if that fails use the ADT value. Both paths
++	 * print what they chose, so a wrong assumption is visible on screen
++	 * instead of silently hanging.
 +	 */
 +	{
 +		DTEntry gcc;
 +		uintptr_t const *greg = NULL;
 +		unsigned int gsize = 0;
++		uint64_t gcc_base = SAGIT_GCC_BASE_ADT;
++		uint64_t gcc_size = SAGIT_GCC_SIZE_ADT;
 +
-+		/*
-+		 * Find GCC by compatible string, not by path.
-+		 *
-+		 * SecureDTLookupEntry() resolves a path with FindChild(), which is a
-+		 * strcmp() against each node's "name" property. v47 tried
-+		 * "/soc/qcom,gcc" and "/soc/qcom,gcc@100000" and both failed even
-+		 * though the ADT shows root child "soc" -> "qcom,gcc@100000", so the
-+		 * lookup cannot be relied on for hardware nodes. SecureDTFindEntry()
-+		 * walks the whole tree matching a property value instead, which is
-+		 * what the rest of the port uses for exactly this reason.
-+		 */
-+		if (SecureDTFindEntry("compatible", "qcom,gcc-8998-v2", &gcc) != kSuccess &&
-+		    SecureDTFindEntry("compatible", "qcom,gcc-8998", &gcc) != kSuccess) {
-+			panic("SAGIT I2C: no node with compatible qcom,gcc-8998(-v2) "
-+			    "in the device tree");
++		if (SecureDTFindEntry("compatible", "qcom,gcc-8998-v2", &gcc) ==
++		    kSuccess ||
++		    SecureDTFindEntry("compatible", "qcom,gcc-8998", &gcc) ==
++		    kSuccess) {
++			if (SecureDTGetProperty(gcc, "reg", (void const **)&greg,
++			    &gsize) == kSuccess && gsize >= 2 * sizeof(uintptr_t)) {
++				gcc_base = greg[0];
++				gcc_size = greg[1];
++				printf("SAGIT I2C gcc: from device tree\n");
++			}
++		} else {
++			printf("SAGIT I2C gcc: device tree has no gcc node, "
++			    "using ADT values\n");
 +		}
 +		si2c_stage(12);
-+		if (SecureDTGetProperty(gcc, "reg", (void const **)&greg,
-+		    &gsize) != kSuccess || gsize < 2 * sizeof(uintptr_t)) {
-+			panic("SAGIT I2C: gcc node has no usable reg (%u bytes)",
-+			    gsize);
++		if (gcc_size < SAGIT_BLSP1_AHB_HALT + 4) {
++			panic("SAGIT I2C: gcc window 0x%llx too small for "
++			    "offset 0x%x", (unsigned long long)gcc_size,
++			    (unsigned)SAGIT_BLSP1_AHB_HALT);
 +		}
-+		printf("SAGIT I2C gcc node reg=0x%lx len=0x%lx\n",
-+		    (unsigned long)(uint32_t)greg[0],
-+		    (unsigned long)(uint32_t)greg[1]);
-+		si2c.gcc = (volatile uint32_t *)ml_io_map(greg[0], greg[1]);
++		printf("SAGIT I2C gcc: base=0x%llx size=0x%llx\n",
++		    (unsigned long long)gcc_base, (unsigned long long)gcc_size);
++
++		si2c.gcc = (volatile uint32_t *)ml_io_map(gcc_base, gcc_size);
 +		if (si2c.gcc == NULL) {
-+			panic("SAGIT I2C: ml_io_map(gcc) failed at 0x%lx",
-+			    (unsigned long)(uint32_t)greg[0]);
++			panic("SAGIT I2C: ml_io_map(gcc) failed at 0x%llx",
++			    (unsigned long long)gcc_base);
 +		}
 +		/* The registers this probe reads must all be inside the window. */
 +		if (greg[1] < SAGIT_BLSP1_AHB_HALT + 4) {
