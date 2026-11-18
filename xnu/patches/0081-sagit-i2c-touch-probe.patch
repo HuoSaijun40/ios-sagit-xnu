@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1019 @@
+@@ -0,0 +1,1076 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -57,7 +57,14 @@ new file mode 100644
 +#define SAGIT_TOUCH_UB_ADDR     0x2c             /* bootloader/update mode */
 +
 +/* GCC */
-+#define SAGIT_GCC_BASE          0xc000000ULL
++/*
++ * The GCC base is NOT a constant in this file any more. Through v46 it
++ * was 0xc000000, guessed from the mainline driver; this phone's ADT says
++ * <0x100000 0xb0000>, i.e. 0xb00000 away. Reading the wrong address hung
++ * the board at stage 8 and every clock register written before that was
++ * equally bogus. The base is now taken from /soc/qcom,gcc at probe time.
++ */
++
 +#define SAGIT_QUP5_RCGR         0x21020          /* blsp1_qup5_i2c_apps_clk_src */
 +#define SAGIT_QUP5_CBCR         0x21008          /* gcc_blsp1_qup5_i2c_apps_clk */
 +#define SAGIT_QUP5_BCR          0x21000          /* reset */
@@ -175,7 +182,7 @@ new file mode 100644
 +si2c_stage(uint32_t n)
 +{
 +	if (si2c.stop_at == n) {
-+		panic("SAGIT I2C STOP reached stage %u of 11 "
++		panic("SAGIT I2C STOP reached stage %u (1-8 probe, 12 gcc-node) "
 +		    "(the next stage is where it hangs)", n);
 +	}
 +	si2c.txn = n;
@@ -893,10 +900,60 @@ new file mode 100644
 +	if (si2c.regs == NULL) {
 +		panic("SAGIT I2C: ml_io_map(i2c) failed");
 +	}
-+	/* GCC is a separate window; map it once for the clock writes. */
-+	si2c.gcc = (volatile uint32_t *)ml_io_map(SAGIT_GCC_BASE, 0x90000);
-+	if (si2c.gcc == NULL) {
-+		panic("SAGIT I2C: ml_io_map(gcc) failed");
++	/*
++	 * GCC is a separate window. Take it from the device tree, never from a
++	 * constant:
++	 *
++	 *     //soc/qcom,gcc@100000
++	 *         compatible = "qcom,gcc-8998-v2"
++	 *         reg        = <0x100000 0xb0000>
++	 *
++	 * Through v46 this file mapped 0xc000000 with a 0x90000 window, taken
++	 * from the mainline driver's address space rather than from this phone's
++	 * ADT. 0xc000000 is 0xb00000 away from the real block, and the probe hung
++	 * on the very first read of it (stage 8): the access went to no device at
++	 * all and took the interconnect down. Every "clock" register the previous
++	 * versions touched was equally bogus.
++	 */
++	{
++		DTEntry gcc;
++		uintptr_t const *greg = NULL;
++		unsigned int gsize = 0;
++
++		if (SecureDTLookupEntry(NULL, "/soc/qcom,gcc", &gcc) != kSuccess ||
++		    SecureDTGetProperty(gcc, "reg", (void const **)&greg,
++		    &gsize) != kSuccess ||
++		    gsize < 2 * sizeof(uintptr_t)) {
++			/*
++			 * The node is qcom,gcc@100000; some lookups want the unit
++			 * address, some do not. Try the full name before giving
++			 * up, and say which paths exist so the next round does not
++			 * have to guess.
++			 */
++			if (SecureDTLookupEntry(NULL, "/soc/qcom,gcc@100000",
++			    &gcc) != kSuccess ||
++			    SecureDTGetProperty(gcc, "reg", (void const **)&greg,
++			    &gsize) != kSuccess ||
++			    gsize < 2 * sizeof(uintptr_t)) {
++				panic("SAGIT I2C: no /soc/qcom,gcc node "
++				    "(tried qcom,gcc and qcom,gcc@100000)");
++			}
++		}
++		si2c_stage(12);
++		printf("SAGIT I2C gcc node reg=0x%lx len=0x%lx\n",
++		    (unsigned long)(uint32_t)greg[0],
++		    (unsigned long)(uint32_t)greg[1]);
++		si2c.gcc = (volatile uint32_t *)ml_io_map(greg[0], greg[1]);
++		if (si2c.gcc == NULL) {
++			panic("SAGIT I2C: ml_io_map(gcc) failed at 0x%lx",
++			    (unsigned long)(uint32_t)greg[0]);
++		}
++		/* The registers this probe reads must all be inside the window. */
++		if (greg[1] < SAGIT_BLSP1_AHB_HALT + 4) {
++			panic("SAGIT I2C: gcc window 0x%lx too small for offset 0x%x",
++			    (unsigned long)(uint32_t)greg[1],
++			    (unsigned)SAGIT_BLSP1_AHB_HALT);
++		}
 +	}
 +	/*
 +	 * TLMM: map the two tiles the touch pins live in, not the whole
