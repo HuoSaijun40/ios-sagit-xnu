@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1076 @@
+@@ -0,0 +1,1078 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -920,26 +920,28 @@ new file mode 100644
 +		uintptr_t const *greg = NULL;
 +		unsigned int gsize = 0;
 +
-+		if (SecureDTLookupEntry(NULL, "/soc/qcom,gcc", &gcc) != kSuccess ||
-+		    SecureDTGetProperty(gcc, "reg", (void const **)&greg,
-+		    &gsize) != kSuccess ||
-+		    gsize < 2 * sizeof(uintptr_t)) {
-+			/*
-+			 * The node is qcom,gcc@100000; some lookups want the unit
-+			 * address, some do not. Try the full name before giving
-+			 * up, and say which paths exist so the next round does not
-+			 * have to guess.
-+			 */
-+			if (SecureDTLookupEntry(NULL, "/soc/qcom,gcc@100000",
-+			    &gcc) != kSuccess ||
-+			    SecureDTGetProperty(gcc, "reg", (void const **)&greg,
-+			    &gsize) != kSuccess ||
-+			    gsize < 2 * sizeof(uintptr_t)) {
-+				panic("SAGIT I2C: no /soc/qcom,gcc node "
-+				    "(tried qcom,gcc and qcom,gcc@100000)");
-+			}
++		/*
++		 * Find GCC by compatible string, not by path.
++		 *
++		 * SecureDTLookupEntry() resolves a path with FindChild(), which is a
++		 * strcmp() against each node's "name" property. v47 tried
++		 * "/soc/qcom,gcc" and "/soc/qcom,gcc@100000" and both failed even
++		 * though the ADT shows root child "soc" -> "qcom,gcc@100000", so the
++		 * lookup cannot be relied on for hardware nodes. SecureDTFindEntry()
++		 * walks the whole tree matching a property value instead, which is
++		 * what the rest of the port uses for exactly this reason.
++		 */
++		if (SecureDTFindEntry("compatible", "qcom,gcc-8998-v2", &gcc) != kSuccess &&
++		    SecureDTFindEntry("compatible", "qcom,gcc-8998", &gcc) != kSuccess) {
++			panic("SAGIT I2C: no node with compatible qcom,gcc-8998(-v2) "
++			    "in the device tree");
 +		}
 +		si2c_stage(12);
++		if (SecureDTGetProperty(gcc, "reg", (void const **)&greg,
++		    &gsize) != kSuccess || gsize < 2 * sizeof(uintptr_t)) {
++			panic("SAGIT I2C: gcc node has no usable reg (%u bytes)",
++			    gsize);
++		}
 +		printf("SAGIT I2C gcc node reg=0x%lx len=0x%lx\n",
 +		    (unsigned long)(uint32_t)greg[0],
 +		    (unsigned long)(uint32_t)greg[1]);
