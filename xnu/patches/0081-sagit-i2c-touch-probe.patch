@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,906 @@
+@@ -0,0 +1,978 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -214,10 +214,10 @@ new file mode 100644
 +}
 +
 +/*
-+ * Debug read of the QUP block, tolerating a dead bus: a QUP whose clock is not
-+ * running returns garbage or faults, so the probe reports registers only after
-+ * the clock stage succeeded. Kept separate from si2c_report() so the clock
-+ * failure path does not touch a possibly-unclocked peripheral.
++ * Clock-stage report, used by the caller after si2c_clock_up() returns an
++ * error. Only GCC registers are read here, never the QUP block: the whole
++ * point of the classification is that the QUP may not be clocked, and a read
++ * of an unclocked block is what takes the bus down.
 + */
 +static void
 +si2c_clock_report(const char *what, uint32_t extra)
@@ -249,11 +249,40 @@ new file mode 100644
 +}
 +
 +/*
++ * Poll a state-machine state the way i2c-qup.c does.
++ *
++ * qup_i2c_poll_state_mask() is:
++ *
++ *     if (state & QUP_STATE_VALID && (state & req_mask) == req_state)
++ *
++ * VALID is BIT(2) of QUP_STATE and it is *not* part of QUP_STATE_MASK (3), so
++ * comparing only the low two bits accepts a state register that has not
++ * finished transitioning -- or, if the block is not clocked at all, whatever
++ * garbage the bus returns. That is exactly how v44 got here: every transition
++ * "succeeded" in a few spins, and the very next access to the block, with the
++ * state machine still wedged, is what took the interconnect down and lost the
++ * 8/9 and 9/9 lines.
++ */
++static int
++si2c_poll_state(uint32_t want, uint32_t spins)
++{
++	for (uint32_t i = 0; i < spins; i++) {
++		uint32_t st = si2c_rdq(QUP_STATE);
++
++		if ((st & QUP_STATE_VALID) &&
++		    (st & QUP_STATE_MASK) == want) {
++			return 1;
++		}
++	}
++	return 0;
++}
++
++/*
 + * Bring up the QUP clocks by writing the GCC registers directly.
 + * No clock framework exists yet, so this is the "give it a running clock"
 + * step, and it deliberately leaves a breadcrumb if the root refuses to start.
 + */
-+static void
++static int
 +si2c_clock_up(void)
 +{
 +	uint32_t before_ahb = 0, before_qup = 0;
@@ -291,14 +320,23 @@ new file mode 100644
 +
 +	si2c.txn = 3;
 +
-+	/* Report before touching the QUP: if the root never started, say so. */
++	/*
++	 * Do NOT panic in here. Through v44 this function panicked on a clock
++	 * failure, which meant the lines after the call -- 8/9 and 9/9 -- were
++	 * compiled but unreachable on a failure, and the screen showed nothing
++	 * between 7/9 and the end of the probe. Returning a code lets the caller
++	 * print the register state first and then panic on purpose.
++	 */
 +	if (!(si2c_rdg(SAGIT_QUP5_RCGR + RCG_CMD_REG) & RCG_ROOT_STATUS)) {
-+		si2c_clock_report("RCG root did not start", before_ahb | before_qup);
++		/* RCG root never started: the parent (XO) or the GDSC is not up. */
++		return EAGAIN;
 +	}
 +	if (si2c_rdg(SAGIT_BLSP1_AHB_HALT) & 1u) {
 +		/* gcc_blsp1_ahb_clk is BRANCH_HALT_VOTED: bit set means halted. */
-+		si2c_clock_report("BLSP1 AHB still halted", 0);
++		return EBUSY;
 +	}
++
++	return 0;
 +}
 +
 +/*
@@ -313,7 +351,7 @@ new file mode 100644
 +	/* Bring the block back to a known state (i2c-qup.c does the same). */
 +	si2c_wrq(QUP_CONFIG, 0);
 +	si2c_wrq(QUP_STATE, QUP_STATE_RESET);
-+	if (!si2c_poll(QUP_STATE, QUP_STATE_MASK, QUP_STATE_RESET, SAGIT_I2C_SPIN)) {
++	if (!si2c_poll_state(QUP_STATE_RESET, SAGIT_I2C_SPIN)) {
 +		return ENXIO;
 +	}
 +	si2c.txn = 5;
@@ -335,7 +373,7 @@ new file mode 100644
 +	si2c.txn = 7;
 +
 +	si2c_wrq(QUP_STATE, QUP_STATE_RUN);
-+	if (!si2c_poll(QUP_STATE, QUP_STATE_MASK, QUP_STATE_RUN, SAGIT_I2C_SPIN)) {
++	if (!si2c_poll_state(QUP_STATE_RUN, SAGIT_I2C_SPIN)) {
 +		return ENXIO;
 +	}
 +	si2c.txn = 8;
@@ -357,6 +395,12 @@ new file mode 100644
 +/*
 + * Wait until the output FIFO has room, then push `nbytes` tag bytes.
 + * Returns 0 on success.
++ *
++ * The FIFO-space test is "MAX_OUTPUT_DONE or OUT_SVC_FLAG", the two bits that
++ * mean the block is ready for more output. If neither ever appears the block
++ * is not running, so give up instead of pushing tags into a wedged FIFO: v44
++ * wrote them regardless, and the transfer that followed is what froze the
++ * board with no output.
 + */
 +static int
 +si2c_write_tags(const uint8_t *tags, uint32_t nbytes)
@@ -370,6 +414,9 @@ new file mode 100644
 +			    (QUP_OP_MAX_OUTPUT_DONE | QUP_OP_OUT_SVC_FLAG)) {
 +				break;
 +			}
++		}
++		if (spins == SAGIT_I2C_SPIN) {
++			return ETIMEDOUT;
 +		}
 +		si2c_wrq(QUP_OUT_FIFO_BASE, tags[i]);
 +	}
@@ -402,7 +449,7 @@ new file mode 100644
 +
 +	/* Pause the block so the counters and FIFO can be programmed. */
 +	si2c_wrq(QUP_STATE, QUP_STATE_PAUSE);
-+	if (!si2c_poll(QUP_STATE, QUP_STATE_MASK, QUP_STATE_PAUSE, SAGIT_I2C_SPIN)) {
++	if (!si2c_poll_state(QUP_STATE_PAUSE, SAGIT_I2C_SPIN)) {
 +		return ETIMEDOUT;
 +	}
 +	si2c.txn = 11;
@@ -431,8 +478,13 @@ new file mode 100644
 +	/* Clear stale operational flags before running. */
 +	si2c_wrq(QUP_OPERATIONAL, QUP_OPERATIONAL_RESET);
 +
-+	si2c_write_tags(wtags, wlen);
++	if (si2c_write_tags(wtags, wlen) != 0) {
++		return ETIMEDOUT;
++	}
 +	si2c_wrq(QUP_STATE, QUP_STATE_RUN);
++	if (!si2c_poll_state(QUP_STATE_RUN, SAGIT_I2C_SPIN)) {
++		return ENXIO;
++	}
 +	si2c.txn = 12;
 +
 +	for (spins = 0; spins < SAGIT_I2C_SPIN; spins++) {
@@ -448,7 +500,7 @@ new file mode 100644
 +
 +	/* Read phase: 4 tag bytes out, len bytes in. */
 +	si2c_wrq(QUP_STATE, QUP_STATE_PAUSE);
-+	if (!si2c_poll(QUP_STATE, QUP_STATE_MASK, QUP_STATE_PAUSE, SAGIT_I2C_SPIN)) {
++	if (!si2c_poll_state(QUP_STATE_PAUSE, SAGIT_I2C_SPIN)) {
 +		return ETIMEDOUT;
 +	}
 +
@@ -462,8 +514,13 @@ new file mode 100644
 +	si2c_wrq(QUP_MX_READ_CNT, len);
 +
 +	si2c_wrq(QUP_OPERATIONAL, QUP_OPERATIONAL_RESET);
-+	si2c_write_tags(rtags, 4);
++	if (si2c_write_tags(rtags, 4) != 0) {
++		return ETIMEDOUT;
++	}
 +	si2c_wrq(QUP_STATE, QUP_STATE_RUN);
++	if (!si2c_poll_state(QUP_STATE_RUN, SAGIT_I2C_SPIN)) {
++		return ENXIO;
++	}
 +	si2c.txn = 14;
 +
 +	for (spins = 0; spins < SAGIT_I2C_SPIN; spins++) {
@@ -857,24 +914,39 @@ new file mode 100644
 +	    si2c_tlmm_rd(SAGIT_PIN_TOUCH_IRQ, TLMM_GPIO_IN_OUT));
 +	si2c_settle(1);                 /* reset release to first transfer */
 +
-+	printf("SAGIT I2C 8/9 clocks: rcgr=0x%x ahb=0x%x ahbhalt=0x%x\n",
++	printf("SAGIT I2C 8/9 clocks before: rcgr=0x%x ahb=0x%x ahbhalt=0x%x\n",
 +	    si2c_rdg(SAGIT_QUP5_RCGR), si2c_rdg(SAGIT_BLSP1_AHB_CBCR),
 +	    si2c_rdg(SAGIT_BLSP1_AHB_HALT));
-+	si2c_clock_up();
++
++	rc = si2c_clock_up();
++
 +	/*
-+	 * These registers are everything the clock stage could have got wrong,
-+	 * so print them instead of only reporting them from a panic: if the next
-+	 * stage (the first QUP access) is where it dies, this line is the last
-+	 * thing on screen and still tells us whether the clock came up.
++	 * Print the clock registers whether or not the bring-up succeeded, and
++	 * print them BEFORE the first QUP access. v44 froze on that first access,
++	 * which lost the state we needed; this ordering means the last line on
++	 * screen already carries the answer.
 +	 */
-+	printf("SAGIT I2C 9/9 clocks: rcgr=0x%x cfg=0x%x cbcr=0x%x ahb=0x%x "
-+	    "ahbhalt=0x%x bcr=0x%x\n",
-+	    si2c_rdg(SAGIT_QUP5_RCGR + RCG_CMD_REG),
++	printf("SAGIT I2C 9/9 clocks after: rc=%d rcgr=0x%x cfg=0x%x n=0x%x "
++	    "d=0x%x cbcr=0x%x ahb=0x%x ahbhalt=0x%x bcr=0x%x\n",
++	    rc, si2c_rdg(SAGIT_QUP5_RCGR + RCG_CMD_REG),
 +	    si2c_rdg(SAGIT_QUP5_RCGR + RCG_CFG_REG),
++	    si2c_rdg(SAGIT_QUP5_RCGR + RCG_N_REG),
++	    si2c_rdg(SAGIT_QUP5_RCGR + RCG_D_REG),
 +	    si2c_rdg(SAGIT_QUP5_CBCR), si2c_rdg(SAGIT_BLSP1_AHB_CBCR),
 +	    si2c_rdg(SAGIT_BLSP1_AHB_HALT), si2c_rdg(SAGIT_QUP5_BCR));
-+	printf("SAGIT I2C qup: touching the block now (a freeze here means the "
-+	    "QUP is not powered/clocked)\n");
++
++	if (rc != 0) {
++		/*
++		 * Classified, and now an intentional panic: the two codes map to
++		 * the two things a bare-register clock bring-up can get wrong.
++		 */
++		si2c_clock_report(rc == EAGAIN ?
++		    "RCG root did not start" : "BLSP1 AHB still halted",
++		    (uint32_t)rc);
++	}
++
++	printf("SAGIT I2C qup: touching block 0xc179000 now (a freeze here means "
++	    "the QUP block is not powered/clocked)\n");
 +
 +	rc = si2c_qup_init();
 +	if (rc != 0) {
