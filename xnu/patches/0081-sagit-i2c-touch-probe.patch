@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,978 @@
+@@ -0,0 +1,1019 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -158,7 +158,35 @@ new file mode 100644
 +	volatile uint32_t *regs;        /* QUP registers */
 +	volatile uint32_t *gcc;         /* GCC registers */
 +	uint32_t txn;                   /* rolling diagnostic step */
++	uint32_t stop_at;               /* sagit_tstop=N: panic on entering N */
 +} si2c;
++
++/*
++ * Stage gate.
++ *
++ * The board froze between two printf() calls and never reset, so "which line
++ * is last on screen" cannot distinguish "printf never ran" from "we never got
++ * there". Every stage therefore calls this first, and a boot argument turns
++ * any single stage into a panic: with sagit_tstop=N, reaching stage N prints
++ * "reached N" through panic() and stops. The run stops on the LAST stage
++ * before the freeze, so one screenshot names the frozen stage exactly.
++ */
++static void
++si2c_stage(uint32_t n)
++{
++	if (si2c.stop_at == n) {
++		panic("SAGIT I2C STOP reached stage %u of 11 "
++		    "(the next stage is where it hangs)", n);
++	}
++	si2c.txn = n;
++}
++
++/* Called from bsd_init with the parsed sagit_tstop value (0 = never stop). */
++void
++sagit_i2c_set_stop_at(uint32_t n)
++{
++	si2c.stop_at = n;
++}
 +
 +static inline uint32_t
 +si2c_rdq(uint32_t off)
@@ -849,6 +877,7 @@ new file mode 100644
 +	 *
 +	 * The last line on screen is therefore the last stage that survived.
 +	 */
++	si2c_stage(1);
 +	printf("SAGIT I2C 1/9 enter, addr=0x%x\n", SAGIT_TOUCH_ADDR);
 +
 +	if (SecureDTLookupEntry(NULL, "/sagit-i2c", &node) != kSuccess ||
@@ -856,6 +885,7 @@ new file mode 100644
 +	    size < 2 * sizeof(uintptr_t)) {
 +		panic("SAGIT I2C: no /sagit-i2c node in the device tree");
 +	}
++	si2c_stage(2);
 +	printf("SAGIT I2C 2/9 node reg=0x%lx len=0x%lx\n",
 +	    (unsigned long)(uint32_t)reg[0], (unsigned long)(uint32_t)reg[1]);
 +
@@ -882,6 +912,7 @@ new file mode 100644
 +		panic("SAGIT I2C: ml_io_map(tlmm) failed east=%p north=%p",
 +		    (void *)si2c_tlmm_east, (void *)si2c_tlmm_north);
 +	}
++	si2c_stage(3);
 +	printf("SAGIT I2C 3/9 mapped i2c/gcc/east/north ok\n");
 +
 +	/*
@@ -891,15 +922,18 @@ new file mode 100644
 +	 *   3. reset released, after the rail has settled
 +	 * Only then is it worth starting clocks.
 +	 */
++	si2c_stage(4);
 +	printf("SAGIT I2C 4/9 avdd before: cfg=0x%x io=0x%x\n",
 +	    si2c_tlmm_rd(SAGIT_PIN_TS_AVDD, TLMM_GPIO_CFG),
 +	    si2c_tlmm_rd(SAGIT_PIN_TS_AVDD, TLMM_GPIO_IN_OUT));
 +	si2c_avdd_on();
++	si2c_stage(5);
 +	printf("SAGIT I2C 5/9 avdd after: cfg=0x%x io=0x%x\n",
 +	    si2c_tlmm_rd(SAGIT_PIN_TS_AVDD, TLMM_GPIO_CFG),
 +	    si2c_tlmm_rd(SAGIT_PIN_TS_AVDD, TLMM_GPIO_IN_OUT));
 +	si2c_settle(2);                 /* > the 4 ms startup-delay of the rail */
 +	si2c_pins_to_i2c();
++	si2c_stage(6);
 +	printf("SAGIT I2C 6/9 pins: scl cfg=0x%x io=0x%x | sda cfg=0x%x io=0x%x\n",
 +	    si2c_tlmm_rd(SAGIT_PIN_SCL, TLMM_GPIO_CFG),
 +	    si2c_tlmm_rd(SAGIT_PIN_SCL, TLMM_GPIO_IN_OUT),
@@ -907,18 +941,23 @@ new file mode 100644
 +	    si2c_tlmm_rd(SAGIT_PIN_SDA, TLMM_GPIO_IN_OUT));
 +	si2c_reset_release();
 +	si2c_irq_pin_input();
++	si2c_stage(7);
 +	printf("SAGIT I2C 7/9 rst cfg=0x%x io=0x%x | irq cfg=0x%x io=0x%x\n",
 +	    si2c_tlmm_rd(SAGIT_PIN_RESET, TLMM_GPIO_CFG),
 +	    si2c_tlmm_rd(SAGIT_PIN_RESET, TLMM_GPIO_IN_OUT),
 +	    si2c_tlmm_rd(SAGIT_PIN_TOUCH_IRQ, TLMM_GPIO_CFG),
 +	    si2c_tlmm_rd(SAGIT_PIN_TOUCH_IRQ, TLMM_GPIO_IN_OUT));
 +	si2c_settle(1);                 /* reset release to first transfer */
++	/* Stage 8 is the freeze point of v44 and v45: the very first GCC
++	 * read happens on the next line, so mark it before going in. */
++	si2c_stage(8);
 +
 +	printf("SAGIT I2C 8/9 clocks before: rcgr=0x%x ahb=0x%x ahbhalt=0x%x\n",
 +	    si2c_rdg(SAGIT_QUP5_RCGR), si2c_rdg(SAGIT_BLSP1_AHB_CBCR),
 +	    si2c_rdg(SAGIT_BLSP1_AHB_HALT));
 +
 +	rc = si2c_clock_up();
++	si2c_stage(9);
 +
 +	/*
 +	 * Print the clock registers whether or not the bring-up succeeded, and
@@ -945,6 +984,7 @@ new file mode 100644
 +		    (uint32_t)rc);
 +	}
 +
++	si2c_stage(10);
 +	printf("SAGIT I2C qup: touching block 0xc179000 now (a freeze here means "
 +	    "the QUP block is not powered/clocked)\n");
 +
@@ -965,6 +1005,7 @@ new file mode 100644
 +	 * Read 6 bytes from 0x0000: enough for the page descriptor (which
 +	 * reports how many functions and how their bits are distributed).
 +	 */
++	si2c_stage(11);
 +	printf("SAGIT I2C read: page0 @0x00, 6 bytes\n");
 +	rc = si2c_read_rmi4(SAGIT_TOUCH_ADDR, 0x0000, idbuf, sizeof(idbuf));
 +	if (rc != 0) {
@@ -997,11 +1038,12 @@ diff --git a/bsd/conf/files b/bsd/conf/files
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -966,7 +966,28 @@
+@@ -966,7 +966,41 @@
  		 */
  		{
  			extern int sagit_ufs_rootdev(dev_t * dev);
 +			extern void sagit_i2c_touch_probe(void);
++			extern void sagit_i2c_set_stop_at(uint32_t);
  			dev_t ufs_dev = 0;
 +
 +#if defined(SAGIT)
@@ -1020,6 +1062,18 @@ diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
 +			int touch_probe = 0;
 +			if (PE_parse_boot_argn("sagit_touch", &touch_probe,
 +			    sizeof(touch_probe)) && touch_probe != 0) {
++				/*
++				 * sagit_tstop=N makes stage N panic on entry.
++				 * The board can freeze between two printf() calls
++				 * without resetting, so a screenshot alone cannot say
++				 * which stage was entered; panic() always prints.
++				 */
++				int touch_stop = 0;
++				PE_parse_boot_argn("sagit_tstop", &touch_stop,
++				    sizeof(touch_stop));
++				if (touch_stop > 0) {
++					sagit_i2c_set_stop_at((uint32_t)touch_stop);
++				}
 +				sagit_i2c_touch_probe();
 +			}
 +#endif
