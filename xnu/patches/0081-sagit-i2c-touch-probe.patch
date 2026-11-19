@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1214 @@
+@@ -0,0 +1,1256 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -186,6 +186,19 @@ new file mode 100644
 +#define QUP_IO_INPUT_BLK_MODE   (1u << 12)
 +#define QUP_IO_UNPACK_EN        (1u << 14)
 +#define QUP_IO_PACK_EN          (1u << 15)
++/*
++ * i2c-qup.c always starts from QUP_REPACK_EN and ORs the block-mode bits in:
++ *     u32 io_mode = QUP_REPACK_EN;   /* = UNPACK_EN | PACK_EN *\/
++ * Without it the FIFO does not pack/unpack 32-bit words the way the tag
++ * protocol expects.
++ */
++#define QUP_REPACK_EN           (QUP_IO_UNPACK_EN | QUP_IO_PACK_EN)
++
++/*
++ * i2c-qup.c: config_run = is_first ? 0 : QUP_I2C_MX_CONFIG_DURING_RUN.
++ * The counts of the second and later sub-transfers carry this bit.
++ */
++#define QUP_I2C_MX_CONFIG_DURING_RUN   (1u << 31)
 +
 +/* I2C mini core: QUP_CONFIG layout */
 +#define QUP_CLOCK_AUTO_GATE     (1u << 13)
@@ -533,55 +546,69 @@ new file mode 100644
 +	}
 +	si2c.txn = 8;
 +
-+	/* Block mode on both directions, un/pack disabled: one byte per entry. */
-+	si2c_wrq(QUP_IO_MODE, QUP_IO_OUTPUT_BLK_MODE | QUP_IO_INPUT_BLK_MODE);
++	/*
++	 * QUP_IO_MODE: REPACK_EN plus block mode only where the transfer is
++	 * bigger than the FIFO. Ours is 4 tags (+6 bytes on the read), which is
++	 * far below any FIFO, so i2c-qup.c would run this in FIFO mode:
++	 *     is_tx_blk_mode = total_tx_len > out_fifo_sz
++	 *     is_rx_blk_mode = total_rx_len > in_fifo_sz
++	 * v54 forced block mode on both directions, which changes how the tags
++	 * are consumed (block mode wants OUT_BLOCK_WRITE_REQ handshaking that
++	 * this probe does not implement).
++	 */
++	si2c_wrq(QUP_IO_MODE, QUP_REPACK_EN);
 +
 +	/*
-+	 * Bus clock divider. v53 left this at reset ("a wrong divider still
-+	 * transfers"), which is not true: QUP_I2C_CLK_CTL supplies the SCL
-+	 * waveform, and with it unprogrammed no START ever reaches the bus --
-+	 * the tags pile up in the output FIFO (qop showed OUT_FULL, 0xc0) and
-+	 * the read times out with the lines idle-high, exactly what v53 saw.
-+	 *
-+	 * i2c-qup.c: for a standard-mode bus (<= 100 kHz) or, as here, the
-+	 * 400 kHz path with the source clock known:
-+	 *     hs_div = 3
-+	 *     fs_div = ((src / bus) / 2) - 3
-+	 * With src = 19.2 MHz (XO, no PLL) and bus = 400 kHz:
-+	 *     fs_div = (48 / 2) - 3 = 21    ->    clk_ctl = (3 << 8) | 21 = 0x315
++	 * Zero the count register of the direction not in use, the way
++	 * qup_i2c_conf_mode_v2() does, so a stale count from an earlier
++	 * sub-transfer can never leak in.
 +	 */
++	si2c_wrq(QUP_MX_OUTPUT_CNT, 0);
++	si2c_wrq(QUP_MX_WRITE_CNT, 0);
++	si2c_wrq(QUP_MX_INPUT_CNT, 0);
++	si2c_wrq(QUP_MX_READ_CNT, 0);
 +	si2c_wrq(QUP_I2C_CLK_CTL, SAGIT_QUP_CLK_CTL_400K);
 +
 +	return 0;
 +}
 +
 +/*
-+ * Wait until the output FIFO has room, then push `nbytes` tag bytes.
-+ * Returns 0 on success.
++ * Push `nbytes` tag bytes into the output FIFO.
 + *
-+ * The FIFO-space test is "MAX_OUTPUT_DONE or OUT_SVC_FLAG", the two bits that
-+ * mean the block is ready for more output. If neither ever appears the block
-+ * is not running, so give up instead of pushing tags into a wedged FIFO: v44
-+ * wrote them regardless, and the transfer that followed is what froze the
-+ * board with no output.
++ * The QUP v2 FIFO takes 32-bit words, and i2c-qup.c's qup_i2c_write_blk_data()
++ * packs FOUR tag bytes into one word, little endian within the word:
++ *
++ *     blk->tx_fifo_data |= *(*data)++ << (j * 8);
++ *     if (j == 3) { writel(blk->tx_fifo_data, QUP_OUT_FIFO_BASE); ... }
++ *
++ * and flushes the partial last word if it is non-zero:
++ *
++ *     if (blk->tx_fifo_data_pos) writel(blk->tx_fifo_data, ...);
++ *
++ * Through v54 this function wrote one byte per register access. That fills
++ * the FIFO with un-packed bytes, so the block sees garbage tags, the output
++ * FIFO goes full (qop = 0xc0, OUT_FULL) and the transfer never starts.
++ *
++ * Returns 0 on success.
 + */
 +static int
 +si2c_write_tags(const uint8_t *tags, uint32_t nbytes)
 +{
-+	uint32_t spins;
++	uint32_t word = 0;
++	uint32_t j = 0;
 +
 +	for (uint32_t i = 0; i < nbytes; i++) {
-+		for (spins = 0; spins < SAGIT_I2C_SPIN; spins++) {
-+			/* OUT_NEED_DATA means the FIFO has space. */
-+			if (si2c_rdq(QUP_OPERATIONAL) &
-+			    (QUP_OP_MAX_OUTPUT_DONE | QUP_OP_OUT_SVC_FLAG)) {
-+				break;
-+			}
++		word |= (uint32_t)tags[i] << (j * 8);
++		if (j == 3) {
++			si2c_wrq(QUP_OUT_FIFO_BASE, word);
++			word = 0;
++			j = 0;
++		} else {
++			j++;
 +		}
-+		if (spins == SAGIT_I2C_SPIN) {
-+			return ETIMEDOUT;
-+		}
-+		si2c_wrq(QUP_OUT_FIFO_BASE, tags[i]);
++	}
++	if (j != 0) {
++		si2c_wrq(QUP_OUT_FIFO_BASE, word);
 +	}
 +	return 0;
 +}
@@ -621,6 +648,11 @@ new file mode 100644
 +	 * Write phase: START, addr<<1, DATAWR, then regbytes address bytes.
 +	 * RMI4 always uses two address bytes (little endian), a plain I2C
 +	 * register uses one.
++	 *
++	 * Counts follow i2c-qup.c's qup_i2c_conf_count_v2(): in FIFO mode the
++	 * TX length goes to QUP_MX_WRITE_CNT and the unused OUTPUT_CNT is
++	 * zeroed, the RX side is zeroed, and because total_rx_len == 0 this
++	 * sub-transfer also sets QUP_NO_INPUT in QUP_CONFIG.
 +	 */
 +	uint8_t wtags[5];
 +	uint32_t wlen = 0;
@@ -633,10 +665,13 @@ new file mode 100644
 +		wtags[wlen++] = (uint8_t)(reg >> 8);
 +	}
 +
-+	si2c_wrq(QUP_MX_OUTPUT_CNT, wlen);
-+	si2c_wrq(QUP_MX_WRITE_CNT, wlen);
++	/* First sub-transfer: config_run is 0. */
++	si2c_wrq(QUP_MX_OUTPUT_CNT, 0);
 +	si2c_wrq(QUP_MX_INPUT_CNT, 0);
 +	si2c_wrq(QUP_MX_READ_CNT, 0);
++	si2c_wrq(QUP_MX_WRITE_CNT, wlen);
++	si2c_wrq(QUP_CONFIG,
++	    QUP_I2C_MINI_CORE | QUP_I2C_N_VAL_V2 | QUP_NO_INPUT);
 +
 +	/* Clear stale operational flags before running. */
 +	si2c_wrq(QUP_OPERATIONAL, QUP_OPERATIONAL_RESET);
@@ -671,10 +706,17 @@ new file mode 100644
 +		QUP_TAG_V2_START, (uint8_t)((addr << 1) | 1),
 +		QUP_TAG_V2_DATARD_STOP, (uint8_t)(len == 256 ? 0 : len),
 +	};
-+	si2c_wrq(QUP_MX_OUTPUT_CNT, 4);
-+	si2c_wrq(QUP_MX_WRITE_CNT, 4);
-+	si2c_wrq(QUP_MX_INPUT_CNT, len);
-+	si2c_wrq(QUP_MX_READ_CNT, len);
++	/*
++	 * Second sub-transfer: config_run = QUP_I2C_MX_CONFIG_DURING_RUN, the
++	 * TX length is the tag bytes, and this one does read, so NO_INPUT is
++	 * clear. QUP_MX_WRITE_CNT gets the run bit too, since the write phase
++	 * already consumed its count.
++	 */
++	si2c_wrq(QUP_MX_OUTPUT_CNT, 0);
++	si2c_wrq(QUP_MX_WRITE_CNT, 4 | QUP_I2C_MX_CONFIG_DURING_RUN);
++	si2c_wrq(QUP_MX_READ_CNT, 0);
++	si2c_wrq(QUP_MX_INPUT_CNT, len | QUP_I2C_MX_CONFIG_DURING_RUN);
++	si2c_wrq(QUP_CONFIG, QUP_I2C_MINI_CORE | QUP_I2C_N_VAL_V2);
 +
 +	si2c_wrq(QUP_OPERATIONAL, QUP_OPERATIONAL_RESET);
 +	if (si2c_write_tags(rtags, 4) != 0) {
