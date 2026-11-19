@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1199 @@
+@@ -0,0 +1,1214 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -155,7 +155,14 @@ new file mode 100644
 +#define QUP_MX_INPUT_CNT        0x200
 +#define QUP_MX_READ_CNT         0x208
 +#define QUP_IN_FIFO_BASE        0x218
-+#define QUP_I2C_CLK_CTL         0x400
++#define QUP_I2C_CLK_CTL         0x400          /* SCL divider: hs_div<<8 | fs_div */
++/*
++ * 400 kHz on a 19.2 MHz source (XO straight through, no PLL):
++ *     hs_div = 3
++ *     fs_div = ((19200000 / 400000) / 2) - 3 = (48 / 2) - 3 = 21
++ *     clk_ctl = (3 << 8) | 21 = 0x315
++ */
++#define SAGIT_QUP_CLK_CTL_400K  0x315u
 +#define QUP_I2C_STATUS          0x404
 +#define QUP_I2C_MASTER_GEN      0x408
 +
@@ -530,12 +537,20 @@ new file mode 100644
 +	si2c_wrq(QUP_IO_MODE, QUP_IO_OUTPUT_BLK_MODE | QUP_IO_INPUT_BLK_MODE);
 +
 +	/*
-+	 * Clock divider: with a 19.2 MHz core clock and 400 kHz bus the QUP
-+	 * wants high-time = low-time = 24 cycles, but the divider field is
-+	 * programmed from the DT frequency in the real driver. Left at reset
-+	 * here on purpose -- a wrong divider still transfers, just at the wrong
-+	 * rate, and the first goal is to see whether anything answers at all.
++	 * Bus clock divider. v53 left this at reset ("a wrong divider still
++	 * transfers"), which is not true: QUP_I2C_CLK_CTL supplies the SCL
++	 * waveform, and with it unprogrammed no START ever reaches the bus --
++	 * the tags pile up in the output FIFO (qop showed OUT_FULL, 0xc0) and
++	 * the read times out with the lines idle-high, exactly what v53 saw.
++	 *
++	 * i2c-qup.c: for a standard-mode bus (<= 100 kHz) or, as here, the
++	 * 400 kHz path with the source clock known:
++	 *     hs_div = 3
++	 *     fs_div = ((src / bus) / 2) - 3
++	 * With src = 19.2 MHz (XO, no PLL) and bus = 400 kHz:
++	 *     fs_div = (48 / 2) - 3 = 21    ->    clk_ctl = (3 << 8) | 21 = 0x315
 +	 */
++	si2c_wrq(QUP_I2C_CLK_CTL, SAGIT_QUP_CLK_CTL_400K);
 +
 +	return 0;
 +}
