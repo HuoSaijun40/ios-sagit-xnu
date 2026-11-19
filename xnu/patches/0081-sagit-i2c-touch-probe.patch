@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1093 @@
+@@ -0,0 +1,1094 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -965,12 +965,13 @@ new file mode 100644
 +			panic("SAGIT I2C: ml_io_map(gcc) failed at 0x%llx",
 +			    (unsigned long long)gcc_base);
 +		}
-+		/* The registers this probe reads must all be inside the window. */
-+		if (greg[1] < SAGIT_BLSP1_AHB_HALT + 4) {
-+			panic("SAGIT I2C: gcc window 0x%lx too small for offset 0x%x",
-+			    (unsigned long)(uint32_t)greg[1],
-+			    (unsigned)SAGIT_BLSP1_AHB_HALT);
-+		}
++		/*
++		 * (v49 dereferenced greg[1] here to re-check the window size. greg is
++		 * only set on the device-tree path, so on the ADT fallback it was
++		 * NULL and the read faulted at address 0x8 -- a kernel data abort
++		 * inside the probe. The size check above already covers both paths;
++		 * nothing may touch greg after this point.)
++		 */
 +	}
 +	/*
 +	 * TLMM: map the two tiles the touch pins live in, not the whole
