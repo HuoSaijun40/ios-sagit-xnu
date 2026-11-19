@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1159 @@
+@@ -0,0 +1,1199 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -185,7 +185,10 @@ new file mode 100644
 +#define QUP_NO_INPUT            (1u << 7)
 +#define QUP_I2C_MINI_CORE       (2u << 8)
 +#define QUP_I2C_N_VAL           15
-+#define QUP_I2C_MAST_GEN        (1u << 4)
++#define QUP_I2C_MAST_GEN        (1u << 4)          /* QUP_STATE bit: master */
++#define QUP_I2C_MASTER_GEN_REG  0x408          /* master-gen config reg */
++#define QUP_V2_TAGS_EN          1              /* must be written to it */
++#define QUP_I2C_N_VAL_V2        7              /* low 3 bits of QUP_CONFIG */
 +
 +/* QUP v2 tag bytes: these are what actually start a transfer. */
 +#define QUP_TAG_V2_START        0x81
@@ -448,6 +451,27 @@ new file mode 100644
 +}
 +
 +/*
++ * Wait until the block reports itself as an I2C master.
++ *
++ * i2c-qup.c: qup_i2c_poll_state_i2c_master() waits for QUP_STATE to be VALID
++ * with QUP_I2C_MAST_GEN (BIT 4) set. This is what tells us the tag-driven v2
++ * transfer engine is actually armed; without it a write of QUP_V2_TAGS_EN to
++ * QUP_I2C_MASTER_GEN may not have taken effect and every transfer times out.
++ */
++static int
++si2c_poll_state_master(uint32_t spins)
++{
++	for (uint32_t i = 0; i < spins; i++) {
++		uint32_t st = si2c_rdq(QUP_STATE);
++
++		if ((st & QUP_STATE_VALID) && (st & QUP_I2C_MAST_GEN)) {
++			return 1;
++		}
++	}
++	return 0;
++}
++
++/*
 + * Configure the QUP for a single small read. This mirrors the sequence in
 + * i2c-qup.c: reset -> run -> pause, program the counters, unpause.
 + */
@@ -473,15 +497,31 @@ new file mode 100644
 +	si2c.txn = 6;
 +
 +	/*
-+	 * I2C mini core, master mode. N_VAL selects the FIFO word packing; the
-+	 * v2 block uses 7 (i2c-qup.c: I2C_N_VAL_V2).
++	 * I2C mini core. This follows i2c-qup.c's v2 bring-up exactly:
++	 *
++	 *     writel(I2C_MINI_CORE | I2C_N_VAL_V2, QUP_CONFIG);
++	 *     writel(QUP_V2_TAGS_EN, QUP_I2C_MASTER_GEN);
++	 *     qup_i2c_poll_state_i2c_master()   (waits for QUP_I2C_MAST_GEN)
++	 *
++	 * Three things were wrong through v52:
++	 *   - N_VAL is the low 3 bits (I2C_N_VAL_V2 = 7 is written as 7, not
++	 *     7 << 16). The old value made qcfg read back 0x32210 instead of
++	 *     0x207.
++	 *   - QUP_I2C_MAST_GEN (BIT 4) is a bit of the SEPARATE
++	 *     QUP_I2C_MASTER_GEN register at 0x408, not of QUP_CONFIG.
++	 *   - QUP_V2_TAGS_EN (1) must be written there, otherwise the block
++	 *     never accepts tag-driven transfers at all.
 +	 */
-+	si2c_wrq(QUP_CONFIG, QUP_I2C_MINI_CORE | QUP_I2C_MAST_GEN |
-+	    (7u << 16) /* N_VAL */ | QUP_CLOCK_AUTO_GATE);
++	si2c_wrq(QUP_CONFIG, QUP_I2C_MINI_CORE | QUP_I2C_N_VAL_V2);
++	si2c_wrq(QUP_I2C_MASTER_GEN_REG, QUP_V2_TAGS_EN);
 +	si2c.txn = 7;
 +
-+	si2c_wrq(QUP_STATE, QUP_STATE_RUN);
-+	if (!si2c_poll_state(QUP_STATE_RUN, SAGIT_I2C_SPIN)) {
++	/*
++	 * Wait for the block to report itself as an I2C master, exactly like
++	 * qup_i2c_poll_state_i2c_master(): QUP_STATE must be valid AND have
++	 * QUP_I2C_MAST_GEN set.
++	 */
++	if (!si2c_poll_state_master(SAGIT_I2C_SPIN)) {
 +		return ENXIO;
 +	}
 +	si2c.txn = 8;
