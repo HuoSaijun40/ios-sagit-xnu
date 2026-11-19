@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1134 @@
+@@ -0,0 +1,1159 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -85,8 +85,22 @@ new file mode 100644
 +#define RCG_CFG_REG             0x04
 +#define RCG_N_REG               0x0c
 +#define RCG_D_REG               0x10
-+#define RCG_ROOT_EN             (1u << 0)
-+#define RCG_ROOT_STATUS         (1u << 13)
++/*
++ * cmd_rcgr bits, from clk-rcg2.c (the only authoritative source):
++ *   CMD_UPDATE   BIT(0)    write 1 to latch the new cfg/n/d
++ *   CMD_ROOT_EN  BIT(1)    root enable -- NOT bit 0
++ *   CMD_ROOT_OFF BIT(31)   1 = root is OFF; 0 = running. There is no
++ *                          separate "running" bit, so the check is inverted.
++ *
++ * Through v51 this file had RCG_ROOT_EN = BIT(0) (that is CMD_UPDATE, so
++ * the write did not set the enable at all) and tested BIT(13) for the root
++ * status (no such bit), so the clock could never be seen as running. v51
++ * still made progress -- rcgr went 0x0 -> 0x2, i.e. the hardware set ROOT_EN
++ * itself -- but the status read-back was against the wrong bit.
++ */
++#define RCG_CMD_UPDATE          (1u << 0)
++#define RCG_ROOT_EN             (1u << 1)
++#define RCG_ROOT_OFF            (1u << 31)
 +#define RCG_UPDATE_SEL          0x3u
 +#define RCG_UPDATE_SHIFT        12
 +
@@ -107,8 +121,10 @@ new file mode 100644
 +#define RCG_HID_WIDTH           5
 +#define RCG_UP_ROOT_EN_MASK     (0x7u << RCG_UP_ROOT_EN_SHIFT)
 +#define RCG_UP_GHID_MASK        ((1u << RCG_HID_WIDTH) - 1u)
++/* GHID update code only (bits 8..12); CMD_UPDATE is added separately. */
++#define RCG_GHID_UPDATE         0x3u
 +#define RCG_UPDATE_LATCH        ((0x3u << RCG_UP_ROOT_EN_SHIFT) | \
-+	                         (0x3u << RCG_UP_GHID_SHIFT))
++	                         (RCG_GHID_UPDATE << RCG_UP_GHID_SHIFT))
 +#define RCG_UPDATE_MASK         (RCG_UP_ROOT_EN_MASK | \
 +	                         (RCG_UP_GHID_MASK << RCG_UP_GHID_SHIFT))
 +#define RCG_SRC_SEL_MASK        (0x7u << 8)
@@ -381,20 +397,29 @@ new file mode 100644
 +	si2c_wrg(SAGIT_QUP5_RCGR + RCG_D_REG, 0);
 +
 +	/*
-+	 * Latch the source/divider change, then enable the root.
++	 * Latch the source/divider change, then set the root enable.
 +	 *
-+	 * UP_ROOT_EN lives in bits 0..2 (SEL 0x3 = "update"), and GHID (5 bits
-+	 * here) sits at bit 8 with the same "update" code. clk-rcg2 writes both
-+	 * when it changes a root, so do the same: the first write latches the
-+	 * new source, the second raises the root enable with the same update
-+	 * code still set. Re-reading cmd each time avoids re-using a stale
-+	 * snapshot (v50 reused the first read, which was 0).
++	 * clk-rcg2.c's __clk_rcg2_set_rate() is:
++	 *     regmap_update_bits(regmap, cmd_rcgr + CMD_REG, CMD_UPDATE, CMD_UPDATE);
++	 * and the enable path is simply:
++	 *     regmap_update_bits(regmap, cmd_rcgr + CMD_REG, CMD_ROOT_EN, CMD_ROOT_EN);
++	 *
++	 * The GHID half of the update code (bits 8..12, hid_width = 5 on this
++	 * clock) goes along with CMD_UPDATE so the hardware knows a root change
++	 * is in flight; it is not part of the enable write. Writing CMD_ROOT_EN
++	 * as BIT(0) (what v51 did) set CMD_UPDATE instead and never enabled
++	 * anything -- the root only came up because the latch write happened to
++	 * land first.
 +	 */
 +	cmd = si2c_rdg(SAGIT_QUP5_RCGR + RCG_CMD_REG);
++	cmd &= ~RCG_UPDATE_MASK;
++
++	/* latch: CMD_UPDATE | GHID update code */
 +	si2c_wrg(SAGIT_QUP5_RCGR + RCG_CMD_REG,
-+	    (cmd & ~RCG_UPDATE_MASK) | RCG_UPDATE_LATCH);
-+	si2c_wrg(SAGIT_QUP5_RCGR + RCG_CMD_REG,
-+	    ((cmd & ~RCG_UPDATE_MASK) | RCG_UPDATE_LATCH) | RCG_ROOT_EN);
++	    cmd | RCG_CMD_UPDATE | (RCG_GHID_UPDATE << RCG_UP_GHID_SHIFT));
++
++	/* enable the root: CMD_ROOT_EN on its own */
++	si2c_wrg(SAGIT_QUP5_RCGR + RCG_CMD_REG, cmd | RCG_ROOT_EN);
 +
 +	si2c.txn = 2;
 +
@@ -410,7 +435,7 @@ new file mode 100644
 +	 * between 7/9 and the end of the probe. Returning a code lets the caller
 +	 * print the register state first and then panic on purpose.
 +	 */
-+	if (!(si2c_rdg(SAGIT_QUP5_RCGR + RCG_CMD_REG) & RCG_ROOT_STATUS)) {
++	if (si2c_rdg(SAGIT_QUP5_RCGR + RCG_CMD_REG) & RCG_ROOT_OFF) {
 +		/* RCG root never started: the parent (XO) or the GDSC is not up. */
 +		return EAGAIN;
 +	}
