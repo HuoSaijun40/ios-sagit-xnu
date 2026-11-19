@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1094 @@
+@@ -0,0 +1,1134 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -89,6 +89,28 @@ new file mode 100644
 +#define RCG_ROOT_STATUS         (1u << 13)
 +#define RCG_UPDATE_SEL          0x3u
 +#define RCG_UPDATE_SHIFT        12
++
++/*
++ * cmd_rcgr layout (clk-rcg.h / clk-rcg2.c):
++ *   bits 0..2   UP_ROOT_EN  (0x3 = update, 0x2 = root_en)
++ *   bits 8..12  UP_GHID     (same 5-bit update code as hid_width = 5 here)
++ *   bit  13     root status (read only)
++ *
++ * clk-rcg2 programs the new source with both update codes set and then
++ * raises the root enable in a second write that keeps them set; the GHID
++ * half is what tells the hardware a root change is in progress. v50 wrote
++ * only the bits 12..13 field and reused a stale snapshot of cmd (which was
++ * 0), so rcgr read back 0 and the root never started.
++ */
++#define RCG_UP_ROOT_EN_SHIFT    0
++#define RCG_UP_GHID_SHIFT       8
++#define RCG_HID_WIDTH           5
++#define RCG_UP_ROOT_EN_MASK     (0x7u << RCG_UP_ROOT_EN_SHIFT)
++#define RCG_UP_GHID_MASK        ((1u << RCG_HID_WIDTH) - 1u)
++#define RCG_UPDATE_LATCH        ((0x3u << RCG_UP_ROOT_EN_SHIFT) | \
++	                         (0x3u << RCG_UP_GHID_SHIFT))
++#define RCG_UPDATE_MASK         (RCG_UP_ROOT_EN_MASK | \
++	                         (RCG_UP_GHID_MASK << RCG_UP_GHID_SHIFT))
 +#define RCG_SRC_SEL_MASK        (0x7u << 8)
 +#define RCG_SRC_SEL_SHIFT       8
 +#define RCG_SRC_XO              0                /* 19.2 MHz crystal, no PLL */
@@ -336,6 +358,16 @@ new file mode 100644
 +	/* 1. AHB first: the QUP register block needs its bus clock. */
 +	si2c_enable_branch(SAGIT_BLSP1_AHB_CBCR, SAGIT_AHB_ENABLE_BIT, &before_ahb);
 +
++	/*
++	 * 1b. Bring the RCG block out of reset first. bcr (GCC_..._BCR) read as
++	 * 0x0 in v50, which is the un-asserted state, but the block reset is
++	 * what actually gates writes landing in cmd_rcgr: writing ROOT_EN while
++	 * the block is still held shows up as rcgr reading back 0. Assert and
++	 * release it so the block is definitely live before configuring it.
++	 */
++	si2c_wrg(SAGIT_QUP5_BCR, 0x1);
++	si2c_wrg(SAGIT_QUP5_BCR, 0x0);
++
 +	/* 2. RCG: select the XO parent (straight 19.2 MHz, no PLL involved). */
 +	cmd = si2c_rdg(SAGIT_QUP5_RCGR + RCG_CMD_REG);
 +	cfg = si2c_rdg(SAGIT_QUP5_RCGR + RCG_CFG_REG);
@@ -348,13 +380,21 @@ new file mode 100644
 +	si2c_wrg(SAGIT_QUP5_RCGR + RCG_N_REG, 0);
 +	si2c_wrg(SAGIT_QUP5_RCGR + RCG_D_REG, 0);
 +
-+	/* Latch the source/divider change, then enable the root. */
++	/*
++	 * Latch the source/divider change, then enable the root.
++	 *
++	 * UP_ROOT_EN lives in bits 0..2 (SEL 0x3 = "update"), and GHID (5 bits
++	 * here) sits at bit 8 with the same "update" code. clk-rcg2 writes both
++	 * when it changes a root, so do the same: the first write latches the
++	 * new source, the second raises the root enable with the same update
++	 * code still set. Re-reading cmd each time avoids re-using a stale
++	 * snapshot (v50 reused the first read, which was 0).
++	 */
++	cmd = si2c_rdg(SAGIT_QUP5_RCGR + RCG_CMD_REG);
 +	si2c_wrg(SAGIT_QUP5_RCGR + RCG_CMD_REG,
-+	    (cmd & ~(RCG_UPDATE_SEL << RCG_UPDATE_SHIFT)) |
-+	    (RCG_UPDATE_SEL << RCG_UPDATE_SHIFT));
++	    (cmd & ~RCG_UPDATE_MASK) | RCG_UPDATE_LATCH);
 +	si2c_wrg(SAGIT_QUP5_RCGR + RCG_CMD_REG,
-+	    (cmd & ~(RCG_UPDATE_SEL << RCG_UPDATE_SHIFT)) |
-+	    (RCG_UPDATE_SEL << RCG_UPDATE_SHIFT) | RCG_ROOT_EN);
++	    ((cmd & ~RCG_UPDATE_MASK) | RCG_UPDATE_LATCH) | RCG_ROOT_EN);
 +
 +	si2c.txn = 2;
 +
