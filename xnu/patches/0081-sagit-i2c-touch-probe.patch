@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1256 @@
+@@ -0,0 +1,1322 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -348,9 +348,33 @@ new file mode 100644
 +		if ((si2c_rdq(off) & mask) == want) {
 +			return 1;
 +		}
++		/*
++		 * Same reason as the state poll: QUP_SW_RESET self-clears after
++		 * the block finishes resetting, which takes real time.
++		 */
++		si2c_settle(1);
 +	}
 +	return 0;
 +}
++
++/* VALID means the block finished its last transition (i2c-qup.c). */
++static int
++si2c_poll_state_valid(uint32_t spins)
++{
++	for (uint32_t i = 0; i < spins; i++) {
++		if (si2c_rdq(QUP_STATE) & QUP_STATE_VALID) {
++			return 1;
++		}
++		si2c_settle(1);
++	}
++	return 0;
++}
++
++/*
++ * Defined further down with the pin helpers, but the state poll needs it:
++ * a state transition needs real microseconds, not another MMIO read.
++ */
++static void si2c_settle(uint32_t ticks);
 +
 +/*
 + * Poll a state-machine state the way i2c-qup.c does.
@@ -377,6 +401,25 @@ new file mode 100644
 +		    (st & QUP_STATE_MASK) == want) {
 +			return 1;
 +		}
++		/*
++		 * The state machine needs real time, not just another read.
++		 *
++		 * i2c-qup.c, qup_i2c_poll_state_mask():
++		 *   "State transition takes 3 AHB clocks cycles + 3 I2C master
++		 *    clock cycles. So retry once after a 1uS delay."
++		 *   ...
++		 *   udelay(1);
++		 *
++		 * At 400 kHz the I2C half alone is ~15 us, so a tight MMIO spin
++		 * burns all its iterations long before the transition can
++		 * finish. v55 did exactly that and reported qstate = 0x1c (VALID
++		 * and MAST_GEN set, but the low two bits still 0 = RESET) every
++		 * time -- the block was fine, the poll gave up too early.
++		 *
++		 * si2c_settle(1) is a bounded spin that costs microseconds, the
++		 * same unit the clock bring-up already uses.
++		 */
++		si2c_settle(1);
 +	}
 +	return 0;
 +}
@@ -492,6 +535,34 @@ new file mode 100644
 +}
 +
 +/*
++ * Change the QUP state exactly like qup_i2c_change_state():
++ *
++ *     if (qup_i2c_poll_state_valid(qup) != 0) return -EIO;   /* VALID set *\/
++ *     writel(state, QUP_STATE);
++ *     if (qup_i2c_poll_state(qup, state) != 0) return -EIO;
++ *
++ * The up-front VALID check is not optional: writing a state while the block
++ * has not finished a previous transition writes into a register the machine
++ * ignores, which is indistinguishable from the transition silently failing.
++ * v55 wrote RUN unconditionally and then polled -- qstate stayed 0x1c
++ * (VALID|MAST_GEN, low bits 0) and the transfer never started.
++ *
++ * Returns 0 on success.
++ */
++static int
++si2c_change_state(uint32_t state)
++{
++	if (!si2c_poll_state_valid(SAGIT_I2C_SPIN)) {
++		return EBUSY;
++	}
++	si2c_wrq(QUP_STATE, state);
++	if (!si2c_poll_state(state, SAGIT_I2C_SPIN)) {
++		return ENXIO;
++	}
++	return 0;
++}
++
++/*
 + * Configure the QUP for a single small read. This mirrors the sequence in
 + * i2c-qup.c: reset -> run -> pause, program the counters, unpause.
 + */
@@ -502,8 +573,7 @@ new file mode 100644
 +
 +	/* Bring the block back to a known state (i2c-qup.c does the same). */
 +	si2c_wrq(QUP_CONFIG, 0);
-+	si2c_wrq(QUP_STATE, QUP_STATE_RESET);
-+	if (!si2c_poll_state(QUP_STATE_RESET, SAGIT_I2C_SPIN)) {
++	if (si2c_change_state(QUP_STATE_RESET) != 0) {
 +		return ENXIO;
 +	}
 +	si2c.txn = 5;
@@ -638,8 +708,7 @@ new file mode 100644
 +	si2c.txn = 10;
 +
 +	/* Pause the block so the counters and FIFO can be programmed. */
-+	si2c_wrq(QUP_STATE, QUP_STATE_PAUSE);
-+	if (!si2c_poll_state(QUP_STATE_PAUSE, SAGIT_I2C_SPIN)) {
++	if (si2c_change_state(QUP_STATE_PAUSE) != 0) {
 +		return ETIMEDOUT;
 +	}
 +	si2c.txn = 11;
@@ -679,8 +748,7 @@ new file mode 100644
 +	if (si2c_write_tags(wtags, wlen) != 0) {
 +		return ETIMEDOUT;
 +	}
-+	si2c_wrq(QUP_STATE, QUP_STATE_RUN);
-+	if (!si2c_poll_state(QUP_STATE_RUN, SAGIT_I2C_SPIN)) {
++	if (si2c_change_state(QUP_STATE_RUN) != 0) {
 +		return ENXIO;
 +	}
 +	si2c.txn = 12;
@@ -697,8 +765,7 @@ new file mode 100644
 +	si2c.txn = 13;
 +
 +	/* Read phase: 4 tag bytes out, len bytes in. */
-+	si2c_wrq(QUP_STATE, QUP_STATE_PAUSE);
-+	if (!si2c_poll_state(QUP_STATE_PAUSE, SAGIT_I2C_SPIN)) {
++	if (si2c_change_state(QUP_STATE_PAUSE) != 0) {
 +		return ETIMEDOUT;
 +	}
 +
@@ -722,8 +789,7 @@ new file mode 100644
 +	if (si2c_write_tags(rtags, 4) != 0) {
 +		return ETIMEDOUT;
 +	}
-+	si2c_wrq(QUP_STATE, QUP_STATE_RUN);
-+	if (!si2c_poll_state(QUP_STATE_RUN, SAGIT_I2C_SPIN)) {
++	if (si2c_change_state(QUP_STATE_RUN) != 0) {
 +		return ENXIO;
 +	}
 +	si2c.txn = 14;
