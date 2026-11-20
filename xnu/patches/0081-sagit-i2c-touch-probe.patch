@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1469 @@
+@@ -0,0 +1,1517 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -921,6 +921,20 @@ new file mode 100644
 +#define TLMM_CTL_DRV_BIT        6
 +#define TLMM_CTL_DRV_MASK       (0x7u << TLMM_CTL_DRV_BIT)
 +#define TLMM_CTL_OE_BIT         9
++/*
++ * TLMM io register (ctl + 0x04). Bit 0 is the live pad level, bit 1 is the
++ * output latch:
++ *
++ *   read  -> both bits reflect the pin, so a read-modify-write of bit 1 also
++ *            writes bit 0 back, a bit that is read-only on real hardware
++ *   write -> only bit 1 (and bit 0 on later TLMM revs) has meaning; bit 0 on
++ *            msm8998 is input-only
++ *
++ * Every user of this file therefore does the RMW through si2c_tlmm_io_wr(),
++ * which reads a masked copy and writes only the writable bits back.
++ */
++#define TLMM_IO_IN_BIT          0
++#define TLMM_IO_OUT_BIT         1
 +#define TLMM_PULL_UP            3u              /* kKeeper-free pull up */
 +#define TLMM_FUNC_BLSP_I2C5     3               /* index of blsp_i2c5 for 87/88 */
 +
@@ -990,6 +1004,42 @@ new file mode 100644
 +}
 +
 +/*
++ * Read side of the io register (ctl + 0x04) without the input bit.
++ *
++ * The io register packs the live pad level into bit 0 and the output latch
++ * into bit 1. Feeding a full read back into a write also writes bit 0, which
++ * is input-only on this TLMM: the write is either dropped or takes the whole
++ * register with it, and the output latch never changes. That is exactly the
++ * symptom v62-v63 show -- oe goes set (ctl 0x203 = mux 0, pull-up, oe bit 9)
++ * yet rst io stays 0x0 forever, so the latch was never programmed. Mask the
++ * input bit off on every read that is going back into a write.
++ */
++static uint32_t
++si2c_tlmm_io_rd(uint32_t pin)
++{
++	return si2c_tlmm_rd(pin, TLMM_GPIO_IN_OUT) &
++	    ~(1u << TLMM_IO_IN_BIT);
++}
++
++/*
++ * Program the output latch explicitly instead of OR-ing it into whatever the
++ * live level happens to be: output high drives the pad, and clearing either
++ * bit pulls a line low, so the latch has to be set, never inferred.
++ */
++static void
++si2c_tlmm_io_wr(uint32_t pin, int high)
++{
++	uint32_t v = si2c_tlmm_io_rd(pin);
++
++	if (high) {
++		v |= (1u << TLMM_IO_OUT_BIT);
++	} else {
++		v &= ~(1u << TLMM_IO_OUT_BIT);
++	}
++	si2c_tlmm_wr(pin, TLMM_GPIO_IN_OUT, v);
++}
++
++/*
 + * Assert the touch avdd rail (regulator-fixed on gpio 50, active high).
 + *
 + * Same ordering rule as the reset line: set the output value in io_reg before
@@ -999,10 +1049,8 @@ new file mode 100644
 +si2c_avdd_on(void)
 +{
 +	uint32_t cfg = si2c_tlmm_rd(SAGIT_PIN_TS_AVDD, TLMM_GPIO_CFG);
-+	uint32_t io = si2c_tlmm_rd(SAGIT_PIN_TS_AVDD, TLMM_GPIO_IN_OUT);
 +
-+	io |= (1u << 1);                        /* out_bit: drive high */
-+	si2c_tlmm_wr(SAGIT_PIN_TS_AVDD, TLMM_GPIO_IN_OUT, io);
++	si2c_tlmm_io_wr(SAGIT_PIN_TS_AVDD, 1);  /* latch high before oe */
 +
 +	cfg &= ~(TLMM_CTL_MUX_MASK | TLMM_CTL_PULL_MASK);
 +	cfg |= (0u << TLMM_CTL_MUX_BIT);        /* function 0 = plain GPIO */
@@ -1127,12 +1175,12 @@ new file mode 100644
 +	cfg = (TLMM_PULL_UP << TLMM_CTL_PULL_BIT) |
 +	    (0u << TLMM_CTL_MUX_BIT) |
 +	    (1u << TLMM_CTL_OE_BIT);
-+	{
-+		uint32_t io = si2c_tlmm_rd(SAGIT_PIN_RESET, TLMM_GPIO_IN_OUT);
-+
-+		io &= ~(1u << 1);               /* out_bit = 0 -> drive low */
-+		si2c_tlmm_wr(SAGIT_PIN_RESET, TLMM_GPIO_IN_OUT, io);
-+	}
++	/*
++	 * Drive the latch (and therefore the pad) low, then enable the driver.
++	 * Programming the latch is the step the RMW never performed: see
++	 * si2c_tlmm_io_rd().
++	 */
++	si2c_tlmm_io_wr(SAGIT_PIN_RESET, 0);
 +	si2c_tlmm_wr(SAGIT_PIN_RESET, TLMM_GPIO_CFG, cfg);
 +	si2c.rst_cfg_low = si2c_tlmm_rd(SAGIT_PIN_RESET, TLMM_GPIO_CFG);
 +	/*
