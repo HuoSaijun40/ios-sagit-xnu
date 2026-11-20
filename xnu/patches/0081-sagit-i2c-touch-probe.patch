@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1327 @@
+@@ -0,0 +1,1354 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -234,6 +234,7 @@ new file mode 100644
 +	volatile uint32_t *regs;        /* QUP registers */
 +	volatile uint32_t *gcc;         /* GCC registers */
 +	uint32_t txn;                   /* rolling diagnostic step */
++	uint32_t clk_ctl_readback;      /* QUP_I2C_CLK_CTL after programming */
 +	uint32_t stop_at;               /* sagit_tstop=N: panic on entering N */
 +} si2c;
 +
@@ -642,7 +643,11 @@ new file mode 100644
 +	si2c_wrq(QUP_MX_WRITE_CNT, 0);
 +	si2c_wrq(QUP_MX_INPUT_CNT, 0);
 +	si2c_wrq(QUP_MX_READ_CNT, 0);
-+	si2c_wrq(QUP_I2C_CLK_CTL, SAGIT_QUP_CLK_CTL_400K);
++	/*
++	 * clk_ctl is written where i2c-qup.c writes it -- inside the first
++	 * transition (RUN -> clk_ctl -> PAUSE). Writing it here, while the block
++	 * is still in RESET, was v56: the value may simply be dropped.
++	 */
 +
 +	return 0;
 +}
@@ -711,6 +716,25 @@ new file mode 100644
 +	}
 +
 +	si2c.txn = 10;
++
++	/*
++	 * Program the bus clock where i2c-qup.c does it: inside the first
++	 * sub-transfer, between RUN and PAUSE.
++	 *
++	 *     if (is_first) {
++	 *         qup_i2c_change_state(qup, QUP_RUN_STATE);
++	 *         writel(qup->clk_ctl, qup->base + QUP_I2C_CLK_CTL);
++	 *         qup_i2c_change_state(qup, QUP_PAUSE_STATE);
++	 *     }
++	 *
++	 * Without a bus clock the QUP cannot leave RESET, which is exactly the
++	 * qstate=0x1c (reset value) seen since v53.
++	 */
++	if (si2c_change_state(QUP_STATE_RUN) != 0) {
++		return ENXIO;
++	}
++	si2c_wrq(QUP_I2C_CLK_CTL, SAGIT_QUP_CLK_CTL_400K);
++	si2c.clk_ctl_readback = si2c_rdq(QUP_I2C_CLK_CTL);
 +
 +	/* Pause the block so the counters and FIFO can be programmed. */
 +	if (si2c_change_state(QUP_STATE_PAUSE) != 0) {
@@ -1090,7 +1114,8 @@ new file mode 100644
 +
 +	panic("SAGIT I2C %s: scl(gpio%d) cfg=0x%x io=0x%x | sda(gpio%d) cfg=0x%x io=0x%x | "
 +	    "rst(gpio%d) cfg=0x%x io=0x%x | avdd(gpio%d) cfg=0x%x io=0x%x | "
-+	    "qcfg=0x%x qstate=0x%x qop=0x%x qerr=0x%x i2cst=0x%x extra=0x%x",
++	    "qcfg=0x%x qstate=0x%x qop=0x%x qerr=0x%x i2cst=0x%x "
++	    "clkctl=0x%x clkctl_back=0x%x iomode=0x%x extra=0x%x txn=%d",
 +	    what,
 +	    SAGIT_PIN_SCL, scl_cfg, scl_io,
 +	    SAGIT_PIN_SDA, sda_cfg, sda_io,
@@ -1098,7 +1123,9 @@ new file mode 100644
 +	    SAGIT_PIN_TS_AVDD, si2c_tlmm_rd(SAGIT_PIN_TS_AVDD, TLMM_GPIO_CFG),
 +	    si2c_tlmm_rd(SAGIT_PIN_TS_AVDD, TLMM_GPIO_IN_OUT),
 +	    si2c_rdq(QUP_CONFIG), si2c_rdq(QUP_STATE), si2c_rdq(QUP_OPERATIONAL),
-+	    si2c_rdq(QUP_ERROR_FLAGS), si2c_rdq(QUP_I2C_STATUS), extra);
++	    si2c_rdq(QUP_ERROR_FLAGS), si2c_rdq(QUP_I2C_STATUS),
++	    SAGIT_QUP_CLK_CTL_400K, si2c.clk_ctl_readback,
++	    si2c_rdq(QUP_IO_MODE), extra, (int)si2c.txn);
 +}
 +
 +void
