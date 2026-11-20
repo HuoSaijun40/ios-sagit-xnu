@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1384 @@
+@@ -0,0 +1,1409 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -1100,6 +1100,31 @@ new file mode 100644
 +	 * output driver fighting the chip's own reset output would hold the
 +	 * line low and keep the part in reset.
 +	 */
++	/*
++	 * Drive reset LOW first. The RMI4 spec describes RESET as an active-low
++	 * input driven by the host, and every version through v58 only ever
++	 * configured the pin and read it back -- rst io stayed 0 on every run
++	 * and the chip never answered.
++	 *
++	 * Vendor sequence (syna TCM driver):
++	 *     set reset low  -> >=100 us -> release high -> wait for startup
++	 */
++	cfg &= ~(TLMM_CTL_MUX_MASK | TLMM_CTL_PULL_MASK | TLMM_CTL_OE_BIT);
++	cfg |= (0u << TLMM_CTL_MUX_BIT);        /* function 0 = plain GPIO */
++	cfg |= (TLMM_PULL_UP << TLMM_CTL_PULL_BIT);
++	cfg |= (1u << TLMM_CTL_OE_BIT);         /* output enable while driving */
++	{
++		uint32_t io = si2c_tlmm_rd(SAGIT_PIN_RESET, TLMM_GPIO_IN_OUT);
++
++		io &= ~(1u << 1);               /* out_bit = 0 -> drive low */
++		si2c_tlmm_wr(SAGIT_PIN_RESET, TLMM_GPIO_IN_OUT, io);
++	}
++	si2c_tlmm_wr(SAGIT_PIN_RESET, TLMM_GPIO_CFG, cfg);
++	si2c_settle(20);                        /* > the 100 us minimum */
++
++	/* Release: back to input + pull-up, the chip's internal pull-up takes it
++	 * high (active low, so high = out of reset). */
++	cfg &= ~(TLMM_CTL_OE_BIT);
 +	si2c_tlmm_wr(SAGIT_PIN_RESET, TLMM_GPIO_CFG, cfg);
 +	si2c_tlmm_wr(SAGIT_PIN_RESET, TLMM_GPIO_CFG, cfg);
 +}
@@ -1312,7 +1337,7 @@ new file mode 100644
 +	 * v57 waited microseconds and the read timed out with the bus
 +	 * idle-high, which is exactly what an unbooted chip looks like.
 +	 */
-+	si2c_wait_ms(20);               /* reset release to first transfer */
++	si2c_wait_ms(50);               /* reset release -> startup ready */
 +	/* Stage 8 is the freeze point of v44 and v45: the very first GCC
 +	 * read happens on the next line, so mark it before going in. */
 +	si2c_stage(8);
