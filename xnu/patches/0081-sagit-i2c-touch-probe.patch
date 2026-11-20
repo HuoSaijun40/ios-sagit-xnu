@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1448 @@
+@@ -0,0 +1,1457 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -235,6 +235,9 @@ new file mode 100644
 +	volatile uint32_t *gcc;         /* GCC registers */
 +	uint32_t txn;                   /* rolling diagnostic step */
 +	uint32_t clk_ctl_readback;      /* QUP_I2C_CLK_CTL after programming */
++	uint32_t rst_cfg_start;         /* gpio89 ctl before the pulse */
++	uint32_t rst_cfg_low;           /* gpio89 ctl after driving low */
++	uint32_t rst_cfg_after;         /* gpio89 ctl after release */
 +	uint32_t stop_at;               /* sagit_tstop=N: panic on entering N */
 +} si2c;
 +
@@ -1089,6 +1092,8 @@ new file mode 100644
 +{
 +	uint32_t cfg = si2c_tlmm_rd(SAGIT_PIN_RESET, TLMM_GPIO_CFG);
 +
++	si2c.rst_cfg_start = cfg;
++
 +	/* Function 0 (plain GPIO), pull-up, and OUT OF output mode. */
 +	cfg &= ~(TLMM_CTL_MUX_MASK | TLMM_CTL_PULL_MASK | TLMM_CTL_OE_BIT);
 +	cfg |= (0u << TLMM_CTL_MUX_BIT);
@@ -1129,6 +1134,7 @@ new file mode 100644
 +		si2c_tlmm_wr(SAGIT_PIN_RESET, TLMM_GPIO_IN_OUT, io);
 +	}
 +	si2c_tlmm_wr(SAGIT_PIN_RESET, TLMM_GPIO_CFG, cfg);
++	si2c.rst_cfg_low = si2c_tlmm_rd(SAGIT_PIN_RESET, TLMM_GPIO_CFG);
 +	/*
 +	 * 20 ms held-low, the width the vendor uses before releasing reset
 +	 * (a 100 us pulse is enough for a healthy part but leaves a
@@ -1147,6 +1153,7 @@ new file mode 100644
 +	cfg |= (TLMM_PULL_UP << TLMM_CTL_PULL_BIT);
 +	si2c_tlmm_wr(SAGIT_PIN_RESET, TLMM_GPIO_CFG, cfg);
 +	si2c_tlmm_wr(SAGIT_PIN_RESET, TLMM_GPIO_CFG, cfg);
++	si2c.rst_cfg_after = si2c_tlmm_rd(SAGIT_PIN_RESET, TLMM_GPIO_CFG);
 +}
 +
 +/*
@@ -1184,7 +1191,8 @@ new file mode 100644
 +	panic("SAGIT I2C %s: scl(gpio%d) cfg=0x%x io=0x%x | sda(gpio%d) cfg=0x%x io=0x%x | "
 +	    "rst(gpio%d) cfg=0x%x io=0x%x | avdd(gpio%d) cfg=0x%x io=0x%x | "
 +	    "qcfg=0x%x qstate=0x%x qop=0x%x qerr=0x%x i2cst=0x%x "
-+	    "clkctl=0x%x clkctl_back=0x%x iomode=0x%x extra=0x%x txn=%d",
++	    "clkctl=0x%x clkctl_back=0x%x iomode=0x%x extra=0x%x txn=%d "
++	    "rstcfg(start/low/after)=0x%x/0x%x/0x%x",
 +	    what,
 +	    SAGIT_PIN_SCL, scl_cfg, scl_io,
 +	    SAGIT_PIN_SDA, sda_cfg, sda_io,
@@ -1194,7 +1202,8 @@ new file mode 100644
 +	    si2c_rdq(QUP_CONFIG), si2c_rdq(QUP_STATE), si2c_rdq(QUP_OPERATIONAL),
 +	    si2c_rdq(QUP_ERROR_FLAGS), si2c_rdq(QUP_I2C_STATUS),
 +	    SAGIT_QUP_CLK_CTL_400K, si2c.clk_ctl_readback,
-+	    si2c_rdq(QUP_IO_MODE), extra, (int)si2c.txn);
++	    si2c_rdq(QUP_IO_MODE), extra, (int)si2c.txn,
++	    si2c.rst_cfg_start, si2c.rst_cfg_low, si2c.rst_cfg_after);
 +}
 +
 +void
