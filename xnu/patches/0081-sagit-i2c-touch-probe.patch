@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1354 @@
+@@ -0,0 +1,1384 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -1025,6 +1025,23 @@ new file mode 100644
 +}
 +
 +/*
++ * Millisecond-granularity wait.
++ *
++ * The Synaptics part needs tens of milliseconds to come out of reset (the
++ * mainline Mi 6 DT says syna,reset-delay-ms = 20 and syna,startup-delay-ms =
++ * 20). si2c_settle() is a few microseconds per tick, so 20 ms is ~10000
++ * ticks; measured generously at ~2 us per tick, 12000 ticks covers it with
++ * margin and still finishes well inside the watchdog budget.
++ */
++#define SAGIT_TICKS_PER_MS      600u
++
++static void
++si2c_wait_ms(uint32_t ms)
++{
++	si2c_settle(ms * SAGIT_TICKS_PER_MS);
++}
++
++/*
 + * Mux SCL/SDA onto BLSP I2C and enable pull-ups.
 + *
 + * The I2C lines are open drain: the controller only ever pulls them low, and
@@ -1076,7 +1093,14 @@ new file mode 100644
 +	cfg &= ~(TLMM_CTL_MUX_MASK | TLMM_CTL_PULL_MASK | TLMM_CTL_OE_BIT);
 +	cfg |= (0u << TLMM_CTL_MUX_BIT);
 +	cfg |= (TLMM_PULL_UP << TLMM_CTL_PULL_BIT);
-+	/* oe_bit stays clear: input, matching input-enable in the reference DTS. */
++	/*
++	 * ts_active_state in the reference DT is bias-pull-up with
++	 * input-enable, i.e. function 0, pull-up, output driver OFF. Write it
++	 * twice: the read-back after a single write kept bit 9 set, and an
++	 * output driver fighting the chip's own reset output would hold the
++	 * line low and keep the part in reset.
++	 */
++	si2c_tlmm_wr(SAGIT_PIN_RESET, TLMM_GPIO_CFG, cfg);
 +	si2c_tlmm_wr(SAGIT_PIN_RESET, TLMM_GPIO_CFG, cfg);
 +}
 +
@@ -1282,7 +1306,13 @@ new file mode 100644
 +	    si2c_tlmm_rd(SAGIT_PIN_RESET, TLMM_GPIO_IN_OUT),
 +	    si2c_tlmm_rd(SAGIT_PIN_TOUCH_IRQ, TLMM_GPIO_CFG),
 +	    si2c_tlmm_rd(SAGIT_PIN_TOUCH_IRQ, TLMM_GPIO_IN_OUT));
-+	si2c_settle(1);                 /* reset release to first transfer */
++	/*
++	 * syna,reset-delay-ms = <20> and syna,startup-delay-ms = <20>:
++	 * the part does not answer I2C until it has finished booting.
++	 * v57 waited microseconds and the read timed out with the bus
++	 * idle-high, which is exactly what an unbooted chip looks like.
++	 */
++	si2c_wait_ms(20);               /* reset release to first transfer */
 +	/* Stage 8 is the freeze point of v44 and v45: the very first GCC
 +	 * read happens on the next line, so mark it before going in. */
 +	si2c_stage(8);
