@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1433 @@
+@@ -0,0 +1,1448 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -1109,10 +1109,19 @@ new file mode 100644
 +	 * Vendor sequence (syna TCM driver):
 +	 *     set reset low  -> >=100 us -> release high -> wait for startup
 +	 */
-+	cfg &= ~(TLMM_CTL_MUX_MASK | TLMM_CTL_PULL_MASK | TLMM_CTL_OE_BIT);
-+	cfg |= (0u << TLMM_CTL_MUX_BIT);        /* function 0 = plain GPIO */
-+	cfg |= (TLMM_PULL_UP << TLMM_CTL_PULL_BIT);
-+	cfg |= (1u << TLMM_CTL_OE_BIT);         /* output enable while driving */
++	/*
++	 * Rebuild the control word from scratch for both phases: pull is
++	 * PULL_UP (3), function 0, and the output driver is enabled only while
++	 * we actively drive the line low.
++	 *
++	 * v59/v60 ended up with pull = KEEPER (2) in cfg 0x202, so after
++	 * clearing OE nothing pulled the line back up and the chip stayed in
++	 * reset -- which reads as "the chip keeps holding reset low" but is
++	 * actually our own pin configuration.
++	 */
++	cfg = (TLMM_PULL_UP << TLMM_CTL_PULL_BIT) |
++	    (0u << TLMM_CTL_MUX_BIT) |
++	    (1u << TLMM_CTL_OE_BIT);
 +	{
 +		uint32_t io = si2c_tlmm_rd(SAGIT_PIN_RESET, TLMM_GPIO_IN_OUT);
 +
@@ -1127,9 +1136,15 @@ new file mode 100644
 +	 */
 +	si2c_settle(20u * SAGIT_TICKS_PER_MS);
 +
-+	/* Release: back to input + pull-up, the chip's internal pull-up takes it
-+	 * high (active low, so high = out of reset). */
++	/*
++	 * Release: output driver OFF, pull-UP on. RESET is active low, so the
++	 * pull-up is what takes the line high and lets the part boot. This is
++	 * exactly ts_active_state from the reference DT (bias-pull-up,
++	 * input-enable).
++	 */
 +	cfg &= ~(TLMM_CTL_OE_BIT);
++	cfg &= ~TLMM_CTL_PULL_MASK;
++	cfg |= (TLMM_PULL_UP << TLMM_CTL_PULL_BIT);
 +	si2c_tlmm_wr(SAGIT_PIN_RESET, TLMM_GPIO_CFG, cfg);
 +	si2c_tlmm_wr(SAGIT_PIN_RESET, TLMM_GPIO_CFG, cfg);
 +}
