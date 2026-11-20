@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1322 @@
+@@ -0,0 +1,1327 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -305,6 +305,13 @@ new file mode 100644
 +	return si2c_rdg(off);
 +}
 +
++/*
++ * Defined with the pin helpers further down, but the QUP polls need it: a
++ * state transition takes real microseconds (3 AHB + 3 I2C master clock
++ * cycles, ~15 us at 400 kHz), not just another MMIO read.
++ */
++static void si2c_settle(uint32_t ticks);
++
 +static void
 +si2c_report(const char *what, uint32_t a, uint32_t b, uint32_t c, uint32_t d)
 +{
@@ -374,8 +381,6 @@ new file mode 100644
 + * Defined further down with the pin helpers, but the state poll needs it:
 + * a state transition needs real microseconds, not another MMIO read.
 + */
-+static void si2c_settle(uint32_t ticks);
-+
 +/*
 + * Poll a state-machine state the way i2c-qup.c does.
 + *
