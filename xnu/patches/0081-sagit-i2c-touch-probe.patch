@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1409 @@
+@@ -0,0 +1,1433 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -1120,7 +1120,12 @@ new file mode 100644
 +		si2c_tlmm_wr(SAGIT_PIN_RESET, TLMM_GPIO_IN_OUT, io);
 +	}
 +	si2c_tlmm_wr(SAGIT_PIN_RESET, TLMM_GPIO_CFG, cfg);
-+	si2c_settle(20);                        /* > the 100 us minimum */
++	/*
++	 * 20 ms held-low, the width the vendor uses before releasing reset
++	 * (a 100 us pulse is enough for a healthy part but leaves a
++	 * half-initialised one holding its own RESET line low).
++	 */
++	si2c_settle(20u * SAGIT_TICKS_PER_MS);
 +
 +	/* Release: back to input + pull-up, the chip's internal pull-up takes it
 +	 * high (active low, so high = out of reset). */
@@ -1337,7 +1342,7 @@ new file mode 100644
 +	 * v57 waited microseconds and the read timed out with the bus
 +	 * idle-high, which is exactly what an unbooted chip looks like.
 +	 */
-+	si2c_wait_ms(50);               /* reset release -> startup ready */
++	si2c_wait_ms(100);              /* reset release -> startup ready */
 +	/* Stage 8 is the freeze point of v44 and v45: the very first GCC
 +	 * read happens on the next line, so mark it before going in. */
 +	si2c_stage(8);
@@ -1397,20 +1402,39 @@ new file mode 100644
 +	 */
 +	si2c_stage(11);
 +	printf("SAGIT I2C read: page0 @0x00, 6 bytes\n");
++	/*
++	 * Try both addresses a Synaptics part answers on:
++	 *   0x20  normal mode (RMI4 page descriptors available)
++	 *   0x2c  ROM bootloader mode
++	 * The page descriptor at 0x0000 is the RMI4 discovery entry point and is
++	 * what rmi4_i2c reads at probe time.
++	 */
 +	rc = si2c_read_rmi4(SAGIT_TOUCH_ADDR, 0x0000, idbuf, sizeof(idbuf));
-+	if (rc != 0) {
-+		/* Include the pins: this is the point where "wrong pins" and
-+		 * "chip not answering" look identical without them. */
-+		si2c_pin_report(rc == ETIMEDOUT ? "read timed out" : "read failed",
-+		    (uint32_t)rc);
++	if (rc == 0) {
++		panic("SAGIT I2C OK: touch@0x%02x page0 = %02x %02x %02x %02x "
++		    "%02x %02x (qop=0x%x) scl io=0x%x sda io=0x%x -- I2C link is "
++		    "up, device in NORMAL mode",
++		    SAGIT_TOUCH_ADDR, idbuf[0], idbuf[1], idbuf[2], idbuf[3],
++		    idbuf[4], idbuf[5], si2c_rdq(QUP_OPERATIONAL),
++		    si2c_tlmm_rd(SAGIT_PIN_SCL, TLMM_GPIO_IN_OUT),
++		    si2c_tlmm_rd(SAGIT_PIN_SDA, TLMM_GPIO_IN_OUT));
 +	}
 +
-+	panic("SAGIT I2C OK: touch@0x20 page0 = %02x %02x %02x %02x %02x %02x "
-+	    "(qop=0x%x) scl io=0x%x sda io=0x%x -- I2C link is up",
-+	    idbuf[0], idbuf[1], idbuf[2], idbuf[3], idbuf[4], idbuf[5],
-+	    si2c_rdq(QUP_OPERATIONAL),
-+	    si2c_tlmm_rd(SAGIT_PIN_SCL, TLMM_GPIO_IN_OUT),
-+	    si2c_tlmm_rd(SAGIT_PIN_SDA, TLMM_GPIO_IN_OUT));
++	/* Not at 0x20: the part may be sitting in ROM bootloader at 0x2c. */
++	rc = si2c_read_rmi4(SAGIT_TOUCH_UB_ADDR, 0x0000, idbuf, sizeof(idbuf));
++	if (rc == 0) {
++		panic("SAGIT I2C OK: touch@0x%02x page0 = %02x %02x %02x %02x "
++		    "%02x %02x (qop=0x%x) scl io=0x%x sda io=0x%x -- I2C link is "
++		    "up, device in BOOTLOADER mode (needs a firmware reload)",
++		    SAGIT_TOUCH_UB_ADDR, idbuf[0], idbuf[1], idbuf[2], idbuf[3],
++		    idbuf[4], idbuf[5], si2c_rdq(QUP_OPERATIONAL),
++		    si2c_tlmm_rd(SAGIT_PIN_SCL, TLMM_GPIO_IN_OUT),
++		    si2c_tlmm_rd(SAGIT_PIN_SDA, TLMM_GPIO_IN_OUT));
++	}
++
++	/* Neither address answered: report the full state, as before. */
++	si2c_pin_report(rc == ETIMEDOUT ? "read timed out" : "read failed",
++	    (uint32_t)rc);
 +}
 +
 +#endif /* SAGIT */
