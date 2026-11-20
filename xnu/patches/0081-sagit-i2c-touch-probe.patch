@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1457 @@
+@@ -0,0 +1,1469 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -1140,7 +1140,14 @@ new file mode 100644
 +	 * (a 100 us pulse is enough for a healthy part but leaves a
 +	 * half-initialised one holding its own RESET line low).
 +	 */
-+	si2c_settle(20u * SAGIT_TICKS_PER_MS);
++	/*
++	 * 220 ms held-low. The Mi 6 mainline DT says 20 ms, but the
++	 * msm8998 Sony Yoshino boards -- same SoC, same Synaptics part --
++	 * use syna,reset-delay-ms = <220>. The line is held low by
++	 * something outside this driver (v62 proved our pin is input +
++	 * pull-up), so give the part the generous number.
++	 */
++	si2c_settle(220u * SAGIT_TICKS_PER_MS);
 +
 +	/*
 +	 * Release: output driver OFF, pull-UP on. RESET is active low, so the
@@ -1366,7 +1373,12 @@ new file mode 100644
 +	 * v57 waited microseconds and the read timed out with the bus
 +	 * idle-high, which is exactly what an unbooted chip looks like.
 +	 */
-+	si2c_wait_ms(100);              /* reset release -> startup ready */
++	/*
++	 * 1000 ms startup. syna,startup-delay-ms is 20 ms on the Mi 6 DT
++	 * and 1000 ms on the msm8998 Yoshino boards; a part that is still
++	 * arming its IO will not answer I2C earlier than that.
++	 */
++	si2c_wait_ms(1000);             /* reset release -> startup ready */
 +	/* Stage 8 is the freeze point of v44 and v45: the very first GCC
 +	 * read happens on the next line, so mark it before going in. */
 +	si2c_stage(8);
