@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1525 @@
+@@ -0,0 +1,1533 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -246,6 +246,8 @@ new file mode 100644
 +	uint32_t pmic_apid;             /* resolved APID, 0xffffffff if none */
 +	uint32_t pmic_st;               /* STATUS after the ENABLE write */
 +	uint32_t pmic_unit;             /* chnls unit mapped */
++	uint32_t pmic_en_rb;            /* ENABLE read back from the PMIC */
++	uint32_t pmic_md_rb;            /* MODE read back from the PMIC */
 +	uint32_t stop_at;               /* sagit_tstop=N: panic on entering N */
 +} si2c;
 +
@@ -1230,7 +1232,8 @@ new file mode 100644
 +	    "qcfg=0x%x qstate=0x%x qop=0x%x qerr=0x%x i2cst=0x%x "
 +	    "clkctl=0x%x clkctl_back=0x%x iomode=0x%x extra=0x%x txn=%d "
 +	    "rstcfg(start/low/after)=0x%x/0x%x/0x%x rstdrv=%d "
-+	    "pmic(rc/ver/apid/st/unit)=%d/0x%x/0x%x/0x%x/0x%x",
++	    "pmic(rc/ver/apid/st/unit)=%d/0x%x/0x%x/0x%x/0x%x "
++	    "pmic_rb(en/md)=0x%x/0x%x",
 +	    what,
 +	    SAGIT_PIN_SCL, scl_cfg, scl_io,
 +	    SAGIT_PIN_SDA, sda_cfg, sda_io,
@@ -1244,7 +1247,8 @@ new file mode 100644
 +	    si2c.rst_cfg_start, si2c.rst_cfg_low, si2c.rst_cfg_after,
 +	    (int)si2c.rst_driven_high,
 +	    (int)si2c.pmic_rc, si2c.pmic_ver, si2c.pmic_apid,
-+	    si2c.pmic_st, si2c.pmic_unit);
++	    si2c.pmic_st, si2c.pmic_unit,
++	    si2c.pmic_en_rb, si2c.pmic_md_rb);
 +}
 +
 +void
@@ -1402,11 +1406,15 @@ new file mode 100644
 +		si2c.pmic_apid = pmr.apid;
 +		si2c.pmic_st = pmr.enable_status;
 +		si2c.pmic_unit = pmr.chnl_unit;
++		si2c.pmic_en_rb = pmr.enable_rb;
++		si2c.pmic_md_rb = pmr.mode_rb;
 +		printf("SAGIT PMIC: ldo6 rc=%d ver=0x%x apid=%x map=%x "
-+		    "en_st=0x%x en_rc=%d md_st=0x%x md_rc=%d addr=0x%x unit=%x\n",
++		    "en_st=0x%x en_rc=%d md_st=0x%x md_rc=%d addr=0x%x unit=%x "
++		    "rb(en/md)=0x%x/0x%x rb_st=0x%x\n",
 +		    prc, pmr.version, pmr.apid, pmr.map_entry,
 +		    pmr.enable_status, (int)pmr.enable_rc,
-+		    pmr.mode_status, (int)pmr.mode_rc, pmr.addr, pmr.chnl_unit);
++		    pmr.mode_status, (int)pmr.mode_rc, pmr.addr, pmr.chnl_unit,
++		    pmr.enable_rb, pmr.mode_rb, pmr.rb_status);
 +	}
 +	si2c_stage(5);
 +	printf("SAGIT I2C 5/9 avdd after: cfg=0x%x io=0x%x\n",
@@ -1536,7 +1544,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_pmic.c
 --- /dev/null
 +++ b/bsd/dev/sagit_pmic.c
-@@ -0,0 +1,340 @@
+@@ -0,0 +1,422 @@
 +/*
 + * SAGIT: minimal SPMI write to power the touch controller's IO rail.
 + *
@@ -1629,6 +1637,12 @@ new file mode 100644
 +#define PMIC_ARB_STATUS         0x08
 +#define PMIC_ARB_WDATA0         0x10
 +#define PMIC_ARB_WDATA1         0x14
++#define PMIC_ARB_RDATA0         0x18
++#define PMIC_ARB_RDATA1         0x1c
++
++/* observer (read) window, reg-names "obsrvr" in live.dtb */
++#define SAGIT_SPMI_OBSVR_BASE   0x9400000ULL
++#define SAGIT_SPMI_OBSVR_UNIT   0x1000ULL
 +
 +#define PMIC_ARB_STATUS_DONE    0x1u
 +#define PMIC_ARB_STATUS_FAIL    0x2u
@@ -1637,6 +1651,7 @@ new file mode 100644
 +
 +/* opcodes for the v2 command word */
 +#define SPMI_OP_WRITE           14u
++#define SPMI_OP_READ            15u
 +#define SPMI_OP_ZERO_WRITE      16u
 +
 +/* PM8998 LDO6 */
@@ -1765,8 +1780,7 @@ new file mode 100644
 +}
 +
 +/*
-+ * One SPMI register write, 1 byte of payload (opc WRITE with bc=0 means the
-+ * two bytes live in WDATA0, per pmic_arb_write_data()).
++ * One SPMI register write, 1 byte of payload.
 + *
 + * Returns 0 on success; *status always carries the final STATUS register.
 + */
@@ -1782,8 +1796,20 @@ new file mode 100644
 +		return rc;
 +	}
 +
-+	/* register low byte in bits 15:8, payload in bits 7:0 */
-+	spmi_wr_chnl(apid, PMIC_ARB_WDATA0, ((reg & 0xffu) << 8) | (val & 0xffu));
++	/*
++	 * WDATA0 carries ONLY the payload bytes, lowest byte first:
++	 *
++	 *   spmi-pmic-arb.c: pmic_arb_write_data()
++	 *       memcpy(&data, buf, (bc & 3) + 1);
++	 *       __raw_writel(data, wr_base + PMIC_ARB_WDATA0);
++	 *
++	 * The register address is already in the command word (bits 11:4), so
++	 * v71 packing "(reg << 8) | val" here sent the PMIC a payload of
++	 * 0x4680 instead of 0x80 -- the write reported DONE and changed
++	 * nothing. That is why apid resolved (0x70) and st was 0x1 yet the
++	 * touch chip still had no power.
++	 */
++	spmi_wr_chnl(apid, PMIC_ARB_WDATA0, val & 0xffu);
 +	spmi_wr_chnl(apid, PMIC_ARB_CMD, cmd);
 +
 +	for (uint32_t i = 0; i < SAGIT_SPMI_SPIN; i++) {
@@ -1801,6 +1827,52 @@ new file mode 100644
 +		*status = st;
 +	}
 +	return ETIMEDOUT;
++}
++
++/*
++ * One SPMI register read through the observer channel.
++ *
++ * Read transfers use a separate window (reg-names "obsrvr", 0x9400000) and a
++ * different offset rule: 0x40000 * ee + 0x20 * apid (pmic_arb_offset_v2,
++ * PMIC_ARB_CHANNEL_OBS). Returns the byte, or -1 on failure.
++ */
++static int
++spmi_read_byte(uint32_t apid, uint32_t reg, uint32_t *status)
++{
++	volatile uint32_t *obs;
++	uint32_t off = 0x40000u * SAGIT_SPMI_EE + 0x20u * apid;
++	uint32_t cmd = (SPMI_OP_READ << 27) | ((reg & 0xffu) << 4) | 0u;
++	uint32_t st;
++
++	obs = (volatile uint32_t *)ml_io_map(SAGIT_SPMI_OBSVR_BASE + off,
++	    SAGIT_SPMI_OBSVR_UNIT);
++	if (obs == NULL) {
++		return -1;
++	}
++
++	obs[PMIC_ARB_CMD / 4] = cmd;
++	__asm__ volatile("dmb sy" ::: "memory");
++
++	for (uint32_t i = 0; i < SAGIT_SPMI_SPIN; i++) {
++		st = obs[PMIC_ARB_STATUS / 4];
++		if (st & PMIC_ARB_STATUS_DONE) {
++			int v = (int)(obs[PMIC_ARB_RDATA0 / 4] & 0xffu);
++
++			if (status != NULL) {
++				*status = st;
++			}
++			if (st & (PMIC_ARB_STATUS_FAIL |
++			    PMIC_ARB_STATUS_DENIED |
++			    PMIC_ARB_STATUS_DROPPED)) {
++				return -1;
++			}
++			return v;
++		}
++	}
++	if (status != NULL) {
++		*status = st;
++	}
++	return -1;
 +}
 +
 +/*
@@ -1869,6 +1941,24 @@ new file mode 100644
 +	}
 +	spmi_settle(3);
 +
++	/*
++	 * Read back: a DONE status with no FAIL bit only says the arbiter
++	 * completed the bus cycle. Whether the PMIC accepted the byte is what
++	 * the read-back shows, and v71's payload bug hid exactly there.
++	 */
++	{
++		uint32_t rbst = 0;
++		int en = spmi_read_byte(pmic.apid, PM8998_LDO6_ENABLE, &rbst);
++		int md = spmi_read_byte(pmic.apid, PM8998_LDO6_MODE, NULL);
++
++		if (rep != NULL) {
++			rep->enable_rb = (en < 0) ? 0xffffffffu : (uint32_t)en;
++			rep->mode_rb = (md < 0) ? 0xffffffffu : (uint32_t)md;
++			rep->rb_status = rbst;
++		}
++	}
++	spmi_settle(3);
++
 +	if (rep != NULL) {
 +		rep->addr = PM8998_LDO6_ENABLE;
 +		rep->chnl_unit = pmic.chnls_unit;
@@ -1883,7 +1973,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_pmic.h
 --- /dev/null
 +++ b/bsd/dev/sagit_pmic.h
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,29 @@
 +/*
 + * SAGIT PMIC: what the touch probe needs to know about the SPMI write.
 + *
@@ -1905,6 +1995,9 @@ new file mode 100644
 +	uint32_t enable_rc;     /* 0 = done */
 +	uint32_t mode_rc;
 +	uint32_t chnl_unit;     /* chnls window unit mapped (0x4000 bytes each) */
++	uint32_t enable_rb;     /* ENABLE read back, 0xffffffff on read failure */
++	uint32_t mode_rb;       /* MODE read back */
++	uint32_t rb_status;     /* STATUS of the read-back transfer */
 +};
 +
 +int sagit_pmic_ldo6_on(struct sagit_pmic_report *rep);
