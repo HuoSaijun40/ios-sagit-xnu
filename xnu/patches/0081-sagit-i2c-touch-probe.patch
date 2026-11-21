@@ -1385,10 +1385,10 @@ new file mode 100644
 +		memset(&pmr, 0, sizeof(pmr));
 +		prc = sagit_pmic_ldo6_on(&pmr);
 +		printf("SAGIT PMIC: ldo6 rc=%d ver=0x%x apid=%x map=%x "
-+		    "en_st=0x%x en_rc=%d md_st=0x%x md_rc=%d addr=0x%x\n",
++		    "en_st=0x%x en_rc=%d md_st=0x%x md_rc=%d addr=0x%x unit=%x\n",
 +		    prc, pmr.version, pmr.apid, pmr.map_entry,
 +		    pmr.enable_status, (int)pmr.enable_rc,
-+		    pmr.mode_status, (int)pmr.mode_rc, pmr.addr);
++		    pmr.mode_status, (int)pmr.mode_rc, pmr.addr, pmr.chnl_unit);
 +	}
 +	si2c_stage(5);
 +	printf("SAGIT I2C 5/9 avdd after: cfg=0x%x io=0x%x\n",
@@ -1518,7 +1518,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_pmic.c
 --- /dev/null
 +++ b/bsd/dev/sagit_pmic.c
-@@ -0,0 +1,266 @@
+@@ -0,0 +1,323 @@
 +/*
 + * SAGIT: minimal SPMI write to power the touch controller's IO rail.
 + *
@@ -1577,7 +1577,19 @@ new file mode 100644
 +#define SAGIT_SPMI_CORE_BASE    0x800f000ULL
 +#define SAGIT_SPMI_CORE_SIZE    0x1000
 +#define SAGIT_SPMI_CHNLS_BASE   0x8400000ULL
-+#define SAGIT_SPMI_CHNLS_SIZE   0x1000000
++/*
++ * The chnls window is 16 MiB in the DT (reg = <0x8400000 0x1000000>), but a v2
++ * arbiter only ever needs 0x200 * apid for apid < 512, i.e. the first 256 KiB
++ * (PMIC_ARB_MAX_PERIPHS is 512 in spmi-pmic-arb.c; SPMI_MAX_CHANNELS_V5 is 512
++ * in spmi-msm.c). v66 mapped the whole 16 MiB and bsd_init died with
++ * "kmem_alloc(0x1000000) failed with 3" -- ENOMEM, the same wall as v41.
++ *
++ * So map one 16 KiB unit at a time, and only the unit holding the channel we
++ * actually resolved. Nothing else in this window is touched.
++ */
++#define SAGIT_SPMI_CHNLS_UNIT   0x4000ULL       /* 8 channels of 0x200 */
++#define SAGIT_SPMI_MAX_APID     512u
++#define SAGIT_SPMI_APID_MAP_N   512u            /* core + 0x800 + 4*n, 0x800 bytes */
 +
 +#define SAGIT_SPMI_EE           0               /* qcom,ee, apps processor */
 +
@@ -1619,12 +1631,15 @@ new file mode 100644
 +
 +static struct {
 +	volatile uint32_t *core;
-+	volatile uint32_t *chnls;
++	volatile uint32_t *chnls;       /* one 16 KiB unit of the chnls window */
++	uint32_t chnls_unit;            /* index of that unit, or -1 */
 +	uint32_t apid;
 +	uint32_t version;
 +	uint32_t map_entry;
 +	int mapped;
-+} pmic;
++} pmic = {
++	.chnls_unit = 0xffffffffu,
++};
 +
 +static inline uint32_t
 +spmi_rd_core(uint32_t off)
@@ -1632,16 +1647,46 @@ new file mode 100644
 +	return pmic.core[off / 4];
 +}
 +
-+static inline uint32_t
-+spmi_rd_chnl(uint32_t off)
++/*
++ * Map the chnls unit holding `apid`, if it is not already mapped. A v2 arbiter
++ * puts channel TX registers at chnls + 0x200 * apid, so one 16 KiB unit covers
++ * 8 consecutive APIDs; a single LDO only needs one.
++ */
++static int
++spmi_map_chnl(uint32_t apid)
 +{
-+	return pmic.chnls[off / 4];
++	uint32_t unit = (PMIC_ARB_CHANNEL(apid) / SAGIT_SPMI_CHNLS_UNIT);
++
++	if (unit == pmic.chnls_unit) {
++		return 0;
++	}
++	pmic.chnls = (volatile uint32_t *)ml_io_map(
++	    SAGIT_SPMI_CHNLS_BASE + unit * SAGIT_SPMI_CHNLS_UNIT,
++	    SAGIT_SPMI_CHNLS_UNIT);
++	if (pmic.chnls == NULL) {
++		pmic.chnls_unit = 0xffffffffu;
++		return ENOMEM;
++	}
++	pmic.chnls_unit = unit;
++	return 0;
++}
++
++static inline uint32_t
++spmi_chnl_off(uint32_t apid, uint32_t reg)
++{
++	return PMIC_ARB_CHANNEL(apid) - pmic.chnls_unit * SAGIT_SPMI_CHNLS_UNIT + reg;
++}
++
++static inline uint32_t
++spmi_rd_chnl(uint32_t apid, uint32_t reg)
++{
++	return pmic.chnls[spmi_chnl_off(apid, reg) / 4];
 +}
 +
 +static inline void
-+spmi_wr_chnl(uint32_t off, uint32_t v)
++spmi_wr_chnl(uint32_t apid, uint32_t reg, uint32_t v)
 +{
-+	pmic.chnls[off / 4] = v;
++	pmic.chnls[spmi_chnl_off(apid, reg) / 4] = v;
 +	__asm__ volatile("dmb sy" ::: "memory");
 +}
 +
@@ -1663,18 +1708,26 @@ new file mode 100644
 +static int
 +spmi_lookup_apid(uint32_t sid, uint32_t addr, uint32_t *map_entry)
 +{
-+	uint32_t ppid = ((sid & 0xfu) << 8) | ((addr >> 8) & 0xfu);
 +	uint32_t last = 0;
 +
-+	for (uint32_t n = 0; n < 0x200; n++) {
++	for (uint32_t n = 0; n < SAGIT_SPMI_APID_MAP_N && n < SAGIT_SPMI_MAX_APID; n++) {
 +		uint32_t v = spmi_rd_core(SPMI_APID_MAP(n));
 +
 +		if (v == 0) {
 +			continue;
 +		}
 +		last = v;
-+		if ((v & SPMI_PPID_MASK) == ppid || (v & SPMI_PPID_MASK) == (ppid | 0x100)) {
-+			*map_entry = v;
++		/*
++		 * PPID is (sid << 8) | (addr >> 8). For PM8998 LDO6 ENABLE 0x4546
++		 * that is 0x004; compare both the bare and the SID-inclusive
++		 * encoding because the map word layout differs across arbiter
++		 * revisions.
++		 */
++		if ((v & SPMI_PPID_MASK) == ppid ||
++		    (v & SPMI_PPID_MASK) == (((sid & 0xfu) << 8) | (addr >> 8))) {
++			if (map_entry != NULL) {
++				*map_entry = v;
++			}
 +			return (int)n;
 +		}
 +	}
@@ -1693,16 +1746,21 @@ new file mode 100644
 +static int
 +spmi_write_byte(uint32_t apid, uint32_t reg, uint32_t val, uint32_t *status)
 +{
-+	uint32_t base = PMIC_ARB_CHANNEL(apid);
 +	uint32_t cmd = (SPMI_OP_WRITE << 27) | ((reg & 0xffu) << 4) | 1u;
 +	uint32_t st;
++	int rc;
++
++	rc = spmi_map_chnl(apid);
++	if (rc != 0) {
++		return rc;
++	}
 +
 +	/* register low byte in bits 15:8, payload in bits 7:0 */
-+	spmi_wr_chnl(base + PMIC_ARB_WDATA0, ((reg & 0xffu) << 8) | (val & 0xffu));
-+	spmi_wr_chnl(base + PMIC_ARB_CMD, cmd);
++	spmi_wr_chnl(apid, PMIC_ARB_WDATA0, ((reg & 0xffu) << 8) | (val & 0xffu));
++	spmi_wr_chnl(apid, PMIC_ARB_CMD, cmd);
 +
 +	for (uint32_t i = 0; i < SAGIT_SPMI_SPIN; i++) {
-+		st = spmi_rd_chnl(base + PMIC_ARB_STATUS);
++		st = spmi_rd_chnl(apid, PMIC_ARB_STATUS);
 +		if (st & PMIC_ARB_STATUS_DONE) {
 +			if (status != NULL) {
 +				*status = st;
@@ -1733,9 +1791,7 @@ new file mode 100644
 +	if (pmic.mapped == 0) {
 +		pmic.core = (volatile uint32_t *)ml_io_map(SAGIT_SPMI_CORE_BASE,
 +		    SAGIT_SPMI_CORE_SIZE);
-+		pmic.chnls = (volatile uint32_t *)ml_io_map(SAGIT_SPMI_CHNLS_BASE,
-+		    SAGIT_SPMI_CHNLS_SIZE);
-+		if (pmic.core == NULL || pmic.chnls == NULL) {
++		if (pmic.core == NULL) {
 +			return ENOMEM;
 +		}
 +		pmic.mapped = 1;
@@ -1780,6 +1836,7 @@ new file mode 100644
 +
 +	if (rep != NULL) {
 +		rep->addr = PM8998_LDO6_ENABLE;
++		rep->chnl_unit = pmic.chnls_unit;
 +	}
 +	return 0;
 +}
@@ -1791,7 +1848,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_pmic.h
 --- /dev/null
 +++ b/bsd/dev/sagit_pmic.h
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,26 @@
 +/*
 + * SAGIT PMIC: what the touch probe needs to know about the SPMI write.
 + *
@@ -1812,6 +1869,7 @@ new file mode 100644
 +	uint32_t mode_status;   /* STATUS after the MODE write */
 +	uint32_t enable_rc;     /* 0 = done */
 +	uint32_t mode_rc;
++	uint32_t chnl_unit;     /* chnls window unit mapped (0x4000 bytes each) */
 +};
 +
 +int sagit_pmic_ldo6_on(struct sagit_pmic_report *rep);
