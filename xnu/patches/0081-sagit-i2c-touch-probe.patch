@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1556 @@
+@@ -0,0 +1,1568 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -930,6 +930,8 @@ new file mode 100644
 +#define TLMM_CTL_PULL_MASK      (0x3u << TLMM_CTL_PULL_BIT)
 +#define TLMM_CTL_DRV_BIT        6
 +#define TLMM_CTL_DRV_MASK       (0x7u << TLMM_CTL_DRV_BIT)
++/* drive-strength 16 mA == selector 3 in DT terms (pinctrl-msm maps 2mA steps) */
++#define TLMM_DRV_16             3u
 +#define TLMM_CTL_OE_BIT         9
 +/*
 + * TLMM io register (ctl + 0x04). Bit 0 is the live pad level, bit 1 is the
@@ -1173,9 +1175,19 @@ new file mode 100644
 +	cfg = si2c_tlmm_rd(SAGIT_PIN_RESET, TLMM_GPIO_CFG);
 +	si2c.rst_cfg_start = cfg;
 +
-+	/* Function 0 (plain GPIO), pull-up, output driver ON. */
-+	cfg &= ~(TLMM_CTL_MUX_MASK | TLMM_CTL_PULL_MASK | TLMM_CTL_OE_BIT);
++	/*
++	 * Function 0 (plain GPIO), pull-up, output driver ON, and an explicit
++	 * drive strength.
++	 *
++	 * The vendor ts_reset_active group asks for drive-strength = <16>, but
++	 * every version of this file so far left the DRV field at 0 -- the
++	 * weakest setting. cfg stayed 0x203 (= mux 0, pull-up, oe), which is what
++	 * the screen kept showing while the part never came out of reset.
++	 */
++	cfg &= ~(TLMM_CTL_MUX_MASK | TLMM_CTL_PULL_MASK | TLMM_CTL_OE_BIT |
++	    TLMM_CTL_DRV_MASK);
 +	cfg |= (TLMM_PULL_UP << TLMM_CTL_PULL_BIT);
++	cfg |= (TLMM_DRV_16 << TLMM_CTL_DRV_BIT);
 +	cfg |= (1u << TLMM_CTL_OE_BIT);
 +
 +	/* 1. assert: drive low, then enable the driver. */
@@ -1567,7 +1579,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_pmic.c
 --- /dev/null
 +++ b/bsd/dev/sagit_pmic.c
-@@ -0,0 +1,617 @@
+@@ -0,0 +1,631 @@
 +/*
 + * SAGIT: minimal SPMI write to power the touch controller's IO rail.
 + *
@@ -2131,7 +2143,8 @@ new file mode 100644
 +		return ENODEV;
 +	}
 +
-+	apid = spmi_lookup_apid(PM8998_SID, PM8998_LDO6_ENABLE, &entry);	if (rep != NULL) {
++	apid = spmi_lookup_apid(PM8998_SID, PM8998_LDO6_ENABLE, &entry);
++	if (rep != NULL) {
 +		rep->apid = (uint32_t)apid;
 +		rep->map_entry = entry;
 +	}
@@ -2139,6 +2152,19 @@ new file mode 100644
 +		return ENOENT;
 +	}
 +	pmic.apid = (uint32_t)apid;
++
++	/*
++	 * Set the output voltage before enabling. PM8998 LDO6 is a PMOS LDO
++	 * (pm8998_pldo: 1.664 V + 8 mV steps, range 2/3/4). v80 got ENABLE=0x80
++	 * written but the rail still could not feed the touch part, and MODE read
++	 * back 0x0 -- the regulator was enabled with whatever set point the
++	 * bootloader left, which may be outside the band this panel wants.
++	 *
++	 * RANGE = 3 (1.5 V base, 25 mV/step), SET = 12 -> 1.5 + 12*0.025 = 1.8 V.
++	 */
++	(void)spmi_write_byte(pmic.apid, PM8998_LDO6_RANGE, 3u, NULL);
++	(void)spmi_write_byte(pmic.apid, PM8998_LDO6_SET, 12u, NULL);
++	spmi_settle(3);
 +
 +	/* ENABLE = 0x80 */
 +	rc = spmi_write_byte(pmic.apid, PM8998_LDO6_ENABLE, SPMI_ENABLE_BIT, &st);
