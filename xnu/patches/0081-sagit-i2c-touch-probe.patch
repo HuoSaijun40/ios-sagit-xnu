@@ -1567,7 +1567,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_pmic.c
 --- /dev/null
 +++ b/bsd/dev/sagit_pmic.c
-@@ -0,0 +1,522 @@
+@@ -0,0 +1,571 @@
 +/*
 + * SAGIT: minimal SPMI write to power the touch controller's IO rail.
 + *
@@ -1689,6 +1689,19 @@ new file mode 100644
 +/* observer (read) window, reg-names "obsrvr" in live.dtb */
 +#define SAGIT_SPMI_OBSVR_BASE   0x9400000ULL
 +#define SAGIT_SPMI_OBSVR_UNIT   0x1000ULL
++/*
++ * APID ownership table lives in the "cnfg" window at 0x700 + 4 * apid, and the
++ * low 3 bits are the EE that may write to that APID
++ * (SPMI_OWNERSHIP_TABLE_REG / SPMI_OWNERSHIP_PERIPH2OWNER in spmi-pmic-arb.c).
++ *
++ * Writing an APID owned by another EE is not a bus timeout: the arbiter raises
++ * an access violation and the core hangs, which is exactly what v77/v78 did --
++ * the screen stopped on the store into the channel. Check ownership first.
++ */
++#define SAGIT_SPMI_CNFG_BASE    0x800a000ULL
++#define SAGIT_SPMI_CNFG_SIZE    0x3000
++#define SPMI_OWNERSHIP_TABLE(n) (0x700 + 4 * (n))
++#define SPMI_EE_MASK            0x7u
 +
 +#define PMIC_ARB_STATUS_DONE    0x1u
 +#define PMIC_ARB_STATUS_FAIL    0x2u
@@ -1727,7 +1740,8 @@ new file mode 100644
 +
 +static struct {
 +	volatile uint32_t *core;
-+	volatile uint32_t *chnls;       /* one 16 KiB unit of the chnls window */
++	volatile uint32_t *chnls;       /* one 4 KiB page of the chnls window */
++	volatile uint32_t *cnfg;        /* APID ownership window */
 +	uint32_t chnls_unit;            /* index of that unit, or -1 */
 +	uint32_t apid;
 +	uint32_t version;
@@ -1839,7 +1853,16 @@ new file mode 100644
 +static int
 +spmi_lookup_apid(uint32_t sid, uint32_t addr, uint32_t *map_entry)
 +{
-+	uint32_t ppid = ((sid & 0xfu) << 8) | ((addr >> 8) & 0xfu);
++	/*
++	 * spmi-pmic-arb.c:
++	 *     ppid = sid << 8 | ((addr >> 8) & 0xFF);
++	 *
++	 * The AND is 0xFF, not 0xF: LDO6 ENABLE 0x4546 belongs to PPID 0x45, and
++	 * masking with 0xF truncated it to 0x5, so the scan matched a completely
++	 * different peripheral (the screen said "hit n=112 ppid=0x5"). Writing
++	 * that APID then hit the ownership check and hung the core.
++	 */
++	uint32_t ppid = ((sid & 0xfu) << 8) | ((addr >> 8) & 0xffu);
 +	uint32_t last = 0;
 +	uint32_t scanned = 0;
 +
@@ -1888,7 +1911,12 @@ new file mode 100644
 +static int
 +spmi_write_byte(uint32_t apid, uint32_t reg, uint32_t val, uint32_t *status)
 +{
-+	uint32_t cmd = (SPMI_OP_WRITE << 27) | ((reg & 0xffu) << 4) | 1u;
++	/*
++	 * bc is "number of bytes minus one" (spmi-pmic-arb.c: u8 bc = len - 1),
++	 * so a one-byte register write is bc = 0, not 1. Sending bc=1 declared a
++	 * two-byte transfer.
++	 */
++	uint32_t cmd = (SPMI_OP_WRITE << 27) | ((reg & 0xffu) << 4) | 0u;
 +	uint32_t st;
 +	int rc;
 +
@@ -1899,6 +1927,23 @@ new file mode 100644
 +	}
 +	printf("SAGIT PMIC: wr apid=0x%x reg=0x%x val=0x%x unit=0x%x\n",
 +	    apid, reg, val, pmic.chnls_unit);
++
++	/*
++	 * Ownership gate. A store into an APID owned by another EE hangs the
++	 * core (access violation), it does not return an error, so this check
++	 * has to happen before anything is written.
++	 */
++	if (pmic.cnfg != NULL) {
++		uint32_t owner = pmic.cnfg[SPMI_OWNERSHIP_TABLE(apid) / 4];
++
++		printf("SAGIT PMIC: apid 0x%x owner raw=0x%x ee=%u\n",
++		    apid, owner, owner & SPMI_EE_MASK);
++		if ((owner & SPMI_EE_MASK) != SAGIT_SPMI_EE) {
++			printf("SAGIT PMIC: apid 0x%x not owned by ee %u, "
++			    "skipping write\n", apid, SAGIT_SPMI_EE);
++			return EPERM;
++		}
++	}
 +
 +	/*
 +	 * v77 proved the store itself is where the core stops. Read STATUS
@@ -2025,6 +2070,10 @@ new file mode 100644
 +		}
 +		pmic.mapped = 1;
 +		printf("SAGIT PMIC: core mapped, reading version\n");
++		pmic.cnfg = (volatile uint32_t *)ml_io_map(SAGIT_SPMI_CNFG_BASE,
++		    SAGIT_SPMI_CNFG_SIZE);
++		printf("SAGIT PMIC: cnfg %s\n",
++		    pmic.cnfg != NULL ? "mapped" : "NULL (no ownership check)");
 +	}
 +
 +	pmic.version = spmi_rd_core(SPMI_VERSION);
