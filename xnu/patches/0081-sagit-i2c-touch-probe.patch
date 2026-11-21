@@ -1567,7 +1567,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_pmic.c
 --- /dev/null
 +++ b/bsd/dev/sagit_pmic.c
-@@ -0,0 +1,422 @@
+@@ -0,0 +1,445 @@
 +/*
 + * SAGIT: minimal SPMI write to power the touch controller's IO rail.
 + *
@@ -1655,7 +1655,13 @@ new file mode 100644
 +#define SPMI_MAP_PPID_MASK      0xfffu
 +
 +/* channel TX registers (relative to chnls + 0x200 * apid) */
-+#define PMIC_ARB_CHANNEL(c)     (0x200u * (c))
++/*
++ * Channel stride. spmi-pmic-arb.c pmic_arb_offset_v2() returns
++ *     0x1000 * ee + 0x8000 * apid
++ * for BOTH channel types; only the base window differs ("chnls" for writes,
++ * "obsrvr" for reads). 0x200 * apid is the v1 layout and does not apply here.
++ */
++#define SAGIT_SPMI_CHNL_STRIDE  0x8000u
 +#define PMIC_ARB_CMD            0x00
 +#define PMIC_ARB_STATUS         0x08
 +#define PMIC_ARB_WDATA0         0x10
@@ -1711,14 +1717,28 @@ new file mode 100644
 +}
 +
 +/*
-+ * Map the chnls unit holding `apid`, if it is not already mapped. A v2 arbiter
-+ * puts channel TX registers at chnls + 0x200 * apid, so one 16 KiB unit covers
-+ * 8 consecutive APIDs; a single LDO only needs one.
++ * Map the chnls unit holding `apid`, if it is not already mapped.
++ *
++ * This is the rule v72/v73 got wrong. spmi-pmic-arb.c, v2/v3:
++ *
++ *   static int pmic_arb_offset_v2(...)
++ *       return 0x1000 * pmic_arb->ee + 0x8000 * apid;
++ *
++ *   @wr_base:  on v1 "core", on v2 "chnls"
++ *
++ * So the TX channel of APID 0x70 lives at chnls + 0x1000*0 + 0x8000*0x70 =
++ * chnls + 0x380000, and the observer channel at obsrvr + 0x1000*ee + 0x8000*
++ * apid. v72/v73 used 0x200 * apid (which is the v1 layout) and therefore wrote
++ * and read completely unrelated memory -- which is why the read-back came back
++ * as a changing counter value (0xd5, then 0xd6) instead of 0x80.
 + */
++#define SAGIT_SPMI_CHNL_STRIDE  0x8000u
++
 +static int
 +spmi_map_chnl(uint32_t apid)
 +{
-+	uint32_t unit = (PMIC_ARB_CHANNEL(apid) / SAGIT_SPMI_CHNLS_UNIT);
++	uint32_t off = SAGIT_SPMI_CHNL_STRIDE * apid + 0x1000u * SAGIT_SPMI_EE;
++	uint32_t unit = off / SAGIT_SPMI_CHNLS_UNIT;
 +
 +	if (unit == pmic.chnls_unit) {
 +		return 0;
@@ -1737,7 +1757,8 @@ new file mode 100644
 +static inline uint32_t
 +spmi_chnl_off(uint32_t apid, uint32_t reg)
 +{
-+	return PMIC_ARB_CHANNEL(apid) - pmic.chnls_unit * SAGIT_SPMI_CHNLS_UNIT + reg;
++	return SAGIT_SPMI_CHNL_STRIDE * apid + 0x1000u * SAGIT_SPMI_EE + reg -
++	    pmic.chnls_unit * SAGIT_SPMI_CHNLS_UNIT;
 +}
 +
 +static inline uint32_t
@@ -1855,15 +1876,17 @@ new file mode 100644
 +/*
 + * One SPMI register read through the observer channel.
 + *
-+ * Read transfers use a separate window (reg-names "obsrvr", 0x9400000) and a
-+ * different offset rule: 0x40000 * ee + 0x20 * apid (pmic_arb_offset_v2,
-+ * PMIC_ARB_CHANNEL_OBS). Returns the byte, or -1 on failure.
++ * The same pmic_arb_offset_v2 rule applies to every channel type --
++ * 0x1000 * ee + 0x8000 * apid -- only the base window differs: writes use
++ * "chnls", reads use "obsrvr" (rd_base = obsrvr for v2/v3). The 0x40000*ee +
++ * 0x20*apid formula belongs to a different driver revision's observer layout
++ * and was wrong here. Returns the byte, or -1 on failure.
 + */
 +static int
 +spmi_read_byte(uint32_t apid, uint32_t reg, uint32_t *status)
 +{
 +	volatile uint32_t *obs;
-+	uint32_t off = 0x40000u * SAGIT_SPMI_EE + 0x20u * apid;
++	uint32_t off = 0x1000u * SAGIT_SPMI_EE + SAGIT_SPMI_CHNL_STRIDE * apid;
 +	uint32_t cmd = (SPMI_OP_READ << 27) | ((reg & 0xffu) << 4) | 0u;
 +	uint32_t st;
 +
