@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1488 @@
+@@ -0,0 +1,1507 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -45,6 +45,8 @@ new file mode 100644
 +#include <pexpert/pexpert.h>
 +#include <pexpert/device_tree.h>
 +#include <libkern/libkern.h>
++
++#include "sagit_pmic.h"
 +
 +/* osfmk/arm/machine_routines.h, not exported to the BSD layer (same as UFS). */
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -1371,6 +1373,23 @@ new file mode 100644
 +	    si2c_tlmm_rd(SAGIT_PIN_TS_AVDD, TLMM_GPIO_CFG),
 +	    si2c_tlmm_rd(SAGIT_PIN_TS_AVDD, TLMM_GPIO_IN_OUT));
 +	si2c_avdd_on();
++	/*
++	 * The touch 'vdd' rail is PM8998 LDO6, behind the SPMI bus. v65 proved
++	 * every other link good (reset finally driven high) yet both addresses
++	 * still timed out with qerr=0, so this rail is the missing piece.
++	 */
++	{
++		struct sagit_pmic_report pmr;
++		int prc;
++
++		memset(&pmr, 0, sizeof(pmr));
++		prc = sagit_pmic_ldo6_on(&pmr);
++		printf("SAGIT PMIC: ldo6 rc=%d ver=0x%x apid=%x map=%x "
++		    "en_st=0x%x en_rc=%d md_st=0x%x md_rc=%d addr=0x%x\n",
++		    prc, pmr.version, pmr.apid, pmr.map_entry,
++		    pmr.enable_status, (int)pmr.enable_rc,
++		    pmr.mode_status, (int)pmr.mode_rc, pmr.addr);
++	}
 +	si2c_stage(5);
 +	printf("SAGIT I2C 5/9 avdd after: cfg=0x%x io=0x%x\n",
 +	    si2c_tlmm_rd(SAGIT_PIN_TS_AVDD, TLMM_GPIO_CFG),
@@ -1493,14 +1512,320 @@ new file mode 100644
 +}
 +
 +#endif /* SAGIT */
+diff --git a/bsd/dev/sagit_pmic.c b/bsd/dev/sagit_pmic.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sagit_pmic.c
+--- /dev/null
++++ b/bsd/dev/sagit_pmic.c
+@@ -0,0 +1,266 @@
++/*
++ * SAGIT: minimal SPMI write to power the touch controller's IO rail.
++ *
++ * Why this exists
++ * ---------------
++ * The touch chip is wired to several rails. The I2C probe (sagit_i2c.c) already
++ * handles the one that is a TLMM pin; the important one is not:
++ *
++ *   avdd -> disp_vddts_vreg, regulator-fixed on TLMM gpio 50   (done in 0081)
++ *   vdd  -> pm8998_l6, PM8998 LDO6, behind the SPMI bus         (this file)
++ *
++ * By v65 the whole software chain was proven: GCC clocks running, QUP in RUN,
++ * SCL/SDA idle high, and reset finally DRIVEN high (rst io=0x3). Both touch
++ * addresses still timed out with qerr=0 -- no device on the bus at all, which
++ * on a working bus means "nothing is powered".
++ *
++ * Register layout, taken from drivers/spmi/spmi-pmic-arb.c (v2 arbiter, which
++ * is what msm8998 has: version >= 0x20010000) and
++ * drivers/regulator/qcom_spmi-regulator.c:
++ *
++ *   core window   0x0800f000   version, APID -> PPID map, APID ownership
++ *   chnls window  0x08400000   per-channel TX registers
++ *   cnfg window   0x0800a000   APID ownership table
++ *
++ *   APID map        core + 0x800 + 4 * apid      bits 11:0 = PPID
++ *                   PPID = (sid << 8) | (addr >> 8)
++ *   TX channel      chnls + 0x200 * apid
++ *                     +0x00 CMD, +0x04 CONFIG, +0x08 STATUS,
++ *                     +0x10 WDATA0, +0x14 WDATA1
++ *   command word    (opc << 27) | ((addr & 0xff) << 4) | (bc & 0x7)
++ *                   opc 14 = WRITE (length <= 4), 2 = EXT_WRITE
++ *   status          BIT(0) DONE, BIT(1) FAILURE, BIT(2) DENIED, BIT(3) DROPPED
++ *
++ * PM8998 LDO6 (pm8998_regulators[] in qcom_spmi-regulator.c):
++ *
++ *   sid 0 (qcom,pm8998@0), base 0x4500
++ *   0x4546 ENABLE  bit 7 = 0x80
++ *   0x4545 MODE    bit 7 = HPM
++ *
++ * Everything is polled and bounded: no regulator framework, no interrupts.
++ */
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <machine/machine_routines.h>
++#include <libkern/libkern.h>
++
++#include "sagit_pmic.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++#if defined(SAGIT)
++
++/* /soc/qcom,spmi@800f000 in live.dtb (reg-names core | chnls | obsrvr | intr | cnfg) */
++#define SAGIT_SPMI_CORE_BASE    0x800f000ULL
++#define SAGIT_SPMI_CORE_SIZE    0x1000
++#define SAGIT_SPMI_CHNLS_BASE   0x8400000ULL
++#define SAGIT_SPMI_CHNLS_SIZE   0x1000000
++
++#define SAGIT_SPMI_EE           0               /* qcom,ee, apps processor */
++
++/* core window */
++#define SPMI_VERSION            0x000
++#define SPMI_APID_MAP(n)        (0x800 + 4 * (n))
++#define SPMI_PPID_MASK          0xfffu
++
++/* channel TX registers (relative to chnls + 0x200 * apid) */
++#define PMIC_ARB_CHANNEL(c)     (0x200u * (c))
++#define PMIC_ARB_CMD            0x00
++#define PMIC_ARB_STATUS         0x08
++#define PMIC_ARB_WDATA0         0x10
++#define PMIC_ARB_WDATA1         0x14
++
++#define PMIC_ARB_STATUS_DONE    0x1u
++#define PMIC_ARB_STATUS_FAIL    0x2u
++#define PMIC_ARB_STATUS_DENIED  0x4u
++#define PMIC_ARB_STATUS_DROPPED 0x8u
++
++/* opcodes for the v2 command word */
++#define SPMI_OP_WRITE           14u
++#define SPMI_OP_ZERO_WRITE      16u
++
++/* PM8998 LDO6 */
++#define PM8998_SID              0
++#define PM8998_LDO6_BASE        0x4500
++#define PM8998_LDO6_DIG_REV     (PM8998_LDO6_BASE + 0x01)
++#define PM8998_LDO6_TYPE        (PM8998_LDO6_BASE + 0x04)
++#define PM8998_LDO6_SUBTYPE     (PM8998_LDO6_BASE + 0x05)
++#define PM8998_LDO6_RANGE       (PM8998_LDO6_BASE + 0x40)
++#define PM8998_LDO6_SET         (PM8998_LDO6_BASE + 0x41)
++#define PM8998_LDO6_MODE        (PM8998_LDO6_BASE + 0x45)
++#define PM8998_LDO6_ENABLE      (PM8998_LDO6_BASE + 0x46)
++#define SPMI_ENABLE_BIT         0x80u
++#define SPMI_MODE_HPM           0x80u
++
++#define SAGIT_SPMI_SPIN         20000u
++
++static struct {
++	volatile uint32_t *core;
++	volatile uint32_t *chnls;
++	uint32_t apid;
++	uint32_t version;
++	uint32_t map_entry;
++	int mapped;
++} pmic;
++
++static inline uint32_t
++spmi_rd_core(uint32_t off)
++{
++	return pmic.core[off / 4];
++}
++
++static inline uint32_t
++spmi_rd_chnl(uint32_t off)
++{
++	return pmic.chnls[off / 4];
++}
++
++static inline void
++spmi_wr_chnl(uint32_t off, uint32_t v)
++{
++	pmic.chnls[off / 4] = v;
++	__asm__ volatile("dmb sy" ::: "memory");
++}
++
++static void
++spmi_settle(uint32_t ticks)
++{
++	for (uint32_t t = 0; t < ticks; t++) {
++		for (volatile uint32_t i = 0; i < 2000; i++) {
++			__asm__ volatile("yield" ::: "memory");
++		}
++	}
++}
++
++/*
++ * Resolve (sid, addr) to the arbiter's APID by walking the APID -> PPID map.
++ * PPID only carries the top 4 bits of the register address, which is exactly
++ * what the map is keyed on.
++ */
++static int
++spmi_lookup_apid(uint32_t sid, uint32_t addr, uint32_t *map_entry)
++{
++	uint32_t ppid = ((sid & 0xfu) << 8) | ((addr >> 8) & 0xfu);
++	uint32_t last = 0;
++
++	for (uint32_t n = 0; n < 0x200; n++) {
++		uint32_t v = spmi_rd_core(SPMI_APID_MAP(n));
++
++		if (v == 0) {
++			continue;
++		}
++		last = v;
++		if ((v & SPMI_PPID_MASK) == ppid || (v & SPMI_PPID_MASK) == (ppid | 0x100)) {
++			*map_entry = v;
++			return (int)n;
++		}
++	}
++	if (map_entry != NULL) {
++		*map_entry = last;
++	}
++	return -1;
++}
++
++/*
++ * One SPMI register write, 1 byte of payload (opc WRITE with bc=0 means the
++ * two bytes live in WDATA0, per pmic_arb_write_data()).
++ *
++ * Returns 0 on success; *status always carries the final STATUS register.
++ */
++static int
++spmi_write_byte(uint32_t apid, uint32_t reg, uint32_t val, uint32_t *status)
++{
++	uint32_t base = PMIC_ARB_CHANNEL(apid);
++	uint32_t cmd = (SPMI_OP_WRITE << 27) | ((reg & 0xffu) << 4) | 1u;
++	uint32_t st;
++
++	/* register low byte in bits 15:8, payload in bits 7:0 */
++	spmi_wr_chnl(base + PMIC_ARB_WDATA0, ((reg & 0xffu) << 8) | (val & 0xffu));
++	spmi_wr_chnl(base + PMIC_ARB_CMD, cmd);
++
++	for (uint32_t i = 0; i < SAGIT_SPMI_SPIN; i++) {
++		st = spmi_rd_chnl(base + PMIC_ARB_STATUS);
++		if (st & PMIC_ARB_STATUS_DONE) {
++			if (status != NULL) {
++				*status = st;
++			}
++			return (st & (PMIC_ARB_STATUS_FAIL |
++			    PMIC_ARB_STATUS_DENIED |
++			    PMIC_ARB_STATUS_DROPPED)) ? EIO : 0;
++		}
++	}
++	if (status != NULL) {
++		*status = st;
++	}
++	return ETIMEDOUT;
++}
++
++/*
++ * Turn PM8998 LDO6 on. Reports what it found so one screenshot is conclusive:
++ * version, APID, map entry, STATUS of the enable write, and the pointers used.
++ */
++int
++sagit_pmic_ldo6_on(struct sagit_pmic_report *rep)
++{
++	int apid;
++	uint32_t st = 0;
++	uint32_t entry = 0;
++	int rc;
++
++	if (pmic.mapped == 0) {
++		pmic.core = (volatile uint32_t *)ml_io_map(SAGIT_SPMI_CORE_BASE,
++		    SAGIT_SPMI_CORE_SIZE);
++		pmic.chnls = (volatile uint32_t *)ml_io_map(SAGIT_SPMI_CHNLS_BASE,
++		    SAGIT_SPMI_CHNLS_SIZE);
++		if (pmic.core == NULL || pmic.chnls == NULL) {
++			return ENOMEM;
++		}
++		pmic.mapped = 1;
++	}
++
++	pmic.version = spmi_rd_core(SPMI_VERSION);
++	if (rep != NULL) {
++		rep->version = pmic.version;
++	}
++	if (pmic.version == 0xffffffffu || pmic.version == 0) {
++		return ENODEV;
++	}
++
++	apid = spmi_lookup_apid(PM8998_SID, PM8998_LDO6_ENABLE, &entry);
++	if (rep != NULL) {
++		rep->apid = (uint32_t)apid;
++		rep->map_entry = entry;
++	}
++	if (apid < 0) {
++		return ENOENT;
++	}
++	pmic.apid = (uint32_t)apid;
++
++	/* ENABLE = 0x80 */
++	rc = spmi_write_byte(pmic.apid, PM8998_LDO6_ENABLE, SPMI_ENABLE_BIT, &st);
++	if (rep != NULL) {
++		rep->enable_status = st;
++		rep->enable_rc = (uint32_t)rc;
++	}
++	if (rc != 0) {
++		return rc;
++	}
++	spmi_settle(3);
++
++	/* MODE = HPM, best effort */
++	rc = spmi_write_byte(pmic.apid, PM8998_LDO6_MODE, SPMI_MODE_HPM, &st);
++	if (rep != NULL) {
++		rep->mode_status = st;
++		rep->mode_rc = (uint32_t)rc;
++	}
++	spmi_settle(3);
++
++	if (rep != NULL) {
++		rep->addr = PM8998_LDO6_ENABLE;
++	}
++	return 0;
++}
++
++#endif /* SAGIT */
+diff --git a/bsd/dev/sagit_pmic.h b/bsd/dev/sagit_pmic.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sagit_pmic.h
+--- /dev/null
++++ b/bsd/dev/sagit_pmic.h
+@@ -0,0 +1,25 @@
++/*
++ * SAGIT PMIC: what the touch probe needs to know about the SPMI write.
++ *
++ * Kept in its own header so sagit_i2c.c can report the outcome without
++ * pulling in any SPMI detail.
++ */
++#ifndef _BSD_DEV_SAGIT_PMIC_H_
++#define _BSD_DEV_SAGIT_PMIC_H_
++
++#include <sys/types.h>
++
++struct sagit_pmic_report {
++	uint32_t version;       /* arbiter version word (core + 0x000) */
++	uint32_t apid;          /* apid resolved from PPID, or 0xffffffff */
++	uint32_t map_entry;     /* raw APID map word that matched */
++	uint32_t addr;          /* enable register address */
++	uint32_t enable_status; /* STATUS after the ENABLE write */
++	uint32_t mode_status;   /* STATUS after the MODE write */
++	uint32_t enable_rc;     /* 0 = done */
++	uint32_t mode_rc;
++};
++
++int sagit_pmic_ldo6_on(struct sagit_pmic_report *rep);
++
++#endif /* _BSD_DEV_SAGIT_PMIC_H_ */
 diff --git a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -105,6 +105,7 @@
+@@ -105,6 +105,8 @@
  
  bsd/dev/memdev.c			standard
  bsd/dev/sagit_ufs.c			standard
 +bsd/dev/sagit_i2c.c			standard
++bsd/dev/sagit_pmic.c			standard
  bsd/dev/sagit_crypto.c			standard
  bsd/dev/mem.c				standard
  bsd/dev/munge.c 			optional config_requires_u32_munging
