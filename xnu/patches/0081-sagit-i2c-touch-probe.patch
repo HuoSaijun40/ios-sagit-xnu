@@ -1567,7 +1567,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_pmic.c
 --- /dev/null
 +++ b/bsd/dev/sagit_pmic.c
-@@ -0,0 +1,445 @@
+@@ -0,0 +1,485 @@
 +/*
 + * SAGIT: minimal SPMI write to power the touch controller's IO rail.
 + *
@@ -1624,7 +1624,24 @@ new file mode 100644
 +
 +/* /soc/qcom,spmi@800f000 in live.dtb (reg-names core | chnls | obsrvr | intr | cnfg) */
 +#define SAGIT_SPMI_CORE_BASE    0x800f000ULL
-+#define SAGIT_SPMI_CORE_SIZE    0x1000
++/*
++ * The core window is 0x1000 in the DT, and the APID -> PPID table starts at
++ * core + 0x800 with 4 bytes per APID. Reading one entry past the end of a
++ * mapping on this SoC does not fault: it hangs the interconnect, which is what
++ * v74 did (screen stopped right after "mapping core 0x800f000").
++ *
++ * So map the whole 0x1000 declared window and clamp the scan so the last access
++ * stays strictly inside it: n_max = (0x1000 - 0x800) / 4 - 1 = 511.
++ */
++/*
++ * Map the core window a little wider than the DT says (0x1000): the last APID
++ * map entry at core + 0xffc is a 4-byte access whose page sits right at the
++ * boundary, and on this SoC touching one byte past a mapping hangs the
++ * interconnect instead of faulting. Asking for 0x2000 keeps every access well
++ * inside, and the extra 4 KiB is cheap.
++ */
++#define SAGIT_SPMI_CORE_SIZE    0x2000
++#define SAGIT_SPMI_APID_MAP_N   ((0x1000 - 0x800) / 4)   /* last entry at 0xffc */
 +#define SAGIT_SPMI_CHNLS_BASE   0x8400000ULL
 +/*
 + * The chnls window is 16 MiB in the DT (reg = <0x8400000 0x1000000>), but a v2
@@ -1696,7 +1713,17 @@ new file mode 100644
 +#define SPMI_ENABLE_BIT         0x80u
 +#define SPMI_MODE_HPM           0x80u
 +
-+#define SAGIT_SPMI_SPIN         20000u
++/*
++ * Poll budget, taken from spmi-pmic-arb.c: PMIC_ARB_TIMEOUT_US = 100, and
++ * pmic_arb_wait_for_done() turns that into 100 iterations of
++ *     status = readl(...); if (DONE) return; udelay(1);
++ * A stalled SPMI bus must be given up on in ~100 us, not spun on for
++ * milliseconds: v74's hang looked exactly like "watchdog ate a long spin".
++ */
++#define SAGIT_SPMI_TIMEOUT_US   100u
++
++/* One microsecond, roughly: si2c_settle(1) is a few microseconds. */
++#define SAGIT_SPMI_UDELAY_TICKS 1u
 +
 +static struct {
 +	volatile uint32_t *core;
@@ -1803,6 +1830,10 @@ new file mode 100644
 +	uint32_t ppid = ((sid & 0xfu) << 8) | ((addr >> 8) & 0xfu);
 +	uint32_t last = 0;
 +
++	/*
++	 * Clamp to the mapped window: the last valid APID map entry is at
++	 * core + 0xffc, and reading core + 0x1000 would hang the interconnect.
++	 */
 +	for (uint32_t n = 0; n < SAGIT_SPMI_APID_MAP_N && n < SAGIT_SPMI_MAX_APID; n++) {
 +		uint32_t v = spmi_rd_core(SPMI_APID_MAP(n));
 +
@@ -1856,16 +1887,23 @@ new file mode 100644
 +	spmi_wr_chnl(apid, PMIC_ARB_WDATA0, val & 0xffu);
 +	spmi_wr_chnl(apid, PMIC_ARB_CMD, cmd);
 +
-+	for (uint32_t i = 0; i < SAGIT_SPMI_SPIN; i++) {
++	/*
++	 * Bounded poll, shaped like pmic_arb_wait_for_done(): a stale DONE from
++	 * an earlier transfer must not be mistaken for this one's completion,
++	 * so read once, and only accept DONE together with a clean status.
++	 */
++	for (uint32_t i = 0; i < SAGIT_SPMI_TIMEOUT_US; i++) {
 +		st = spmi_rd_chnl(apid, PMIC_ARB_STATUS);
-+		if (st & PMIC_ARB_STATUS_DONE) {
-+			if (status != NULL) {
-+				*status = st;
-+			}
-+			return (st & (PMIC_ARB_STATUS_FAIL |
-+			    PMIC_ARB_STATUS_DENIED |
-+			    PMIC_ARB_STATUS_DROPPED)) ? EIO : 0;
++		if (!(st & PMIC_ARB_STATUS_DONE)) {
++			spmi_settle(SAGIT_SPMI_UDELAY_TICKS);
++			continue;
 +		}
++		if (status != NULL) {
++			*status = st;
++		}
++		return (st & (PMIC_ARB_STATUS_FAIL |
++		    PMIC_ARB_STATUS_DENIED |
++		    PMIC_ARB_STATUS_DROPPED)) ? EIO : 0;
 +	}
 +	if (status != NULL) {
 +		*status = st;
@@ -1899,21 +1937,21 @@ new file mode 100644
 +	obs[PMIC_ARB_CMD / 4] = cmd;
 +	__asm__ volatile("dmb sy" ::: "memory");
 +
-+	for (uint32_t i = 0; i < SAGIT_SPMI_SPIN; i++) {
++	for (uint32_t i = 0; i < SAGIT_SPMI_TIMEOUT_US; i++) {
 +		st = obs[PMIC_ARB_STATUS / 4];
-+		if (st & PMIC_ARB_STATUS_DONE) {
-+			int v = (int)(obs[PMIC_ARB_RDATA0 / 4] & 0xffu);
-+
-+			if (status != NULL) {
-+				*status = st;
-+			}
-+			if (st & (PMIC_ARB_STATUS_FAIL |
-+			    PMIC_ARB_STATUS_DENIED |
-+			    PMIC_ARB_STATUS_DROPPED)) {
-+				return -1;
-+			}
-+			return v;
++		if (!(st & PMIC_ARB_STATUS_DONE)) {
++			spmi_settle(SAGIT_SPMI_UDELAY_TICKS);
++			continue;
 +		}
++		if (status != NULL) {
++			*status = st;
++		}
++		if (st & (PMIC_ARB_STATUS_FAIL |
++		    PMIC_ARB_STATUS_DENIED |
++		    PMIC_ARB_STATUS_DROPPED)) {
++			return -1;
++		}
++		return (int)(obs[PMIC_ARB_RDATA0 / 4] & 0xffu);
 +	}
 +	if (status != NULL) {
 +		*status = st;
@@ -1948,9 +1986,11 @@ new file mode 100644
 +			return ENOMEM;
 +		}
 +		pmic.mapped = 1;
++		printf("SAGIT PMIC: core mapped, reading version\n");
 +	}
 +
 +	pmic.version = spmi_rd_core(SPMI_VERSION);
++	printf("SAGIT PMIC: version=0x%x, scanning apid table\n", pmic.version);
 +	if (rep != NULL) {
 +		rep->version = pmic.version;
 +	}
