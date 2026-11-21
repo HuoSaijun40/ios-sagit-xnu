@@ -1567,7 +1567,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_pmic.c
 --- /dev/null
 +++ b/bsd/dev/sagit_pmic.c
-@@ -0,0 +1,485 @@
+@@ -0,0 +1,498 @@
 +/*
 + * SAGIT: minimal SPMI write to power the touch controller's IO rail.
 + *
@@ -1829,14 +1829,24 @@ new file mode 100644
 +{
 +	uint32_t ppid = ((sid & 0xfu) << 8) | ((addr >> 8) & 0xfu);
 +	uint32_t last = 0;
++	uint32_t scanned = 0;
 +
 +	/*
 +	 * Clamp to the mapped window: the last valid APID map entry is at
 +	 * core + 0xffc, and reading core + 0x1000 would hang the interconnect.
++	 *
++	 * v75 stopped printing anything at all right after "scanning apid table",
++	 * and the kernel then carried on with bsd_init -- i.e. the whole PMIC
++	 * stage silently fell through. To see which APID access is the problem,
++	 * report the first few entries as they are read and log the final count.
 +	 */
 +	for (uint32_t n = 0; n < SAGIT_SPMI_APID_MAP_N && n < SAGIT_SPMI_MAX_APID; n++) {
 +		uint32_t v = spmi_rd_core(SPMI_APID_MAP(n));
 +
++		if (n < 4) {
++			printf("SAGIT PMIC: apid_map[%u]=0x%x\n", n, v);
++		}
++		scanned = n;
 +		if (v == 0) {
 +			continue;
 +		}
@@ -1844,6 +1854,8 @@ new file mode 100644
 +			if (map_entry != NULL) {
 +				*map_entry = v;
 +			}
++			printf("SAGIT PMIC: apid_map hit n=%u ppid=0x%x entry=0x%x\n",
++			    n, ppid, v);
 +			return (int)n;
 +		}
 +		last = v;
@@ -1851,6 +1863,8 @@ new file mode 100644
 +	if (map_entry != NULL) {
 +		*map_entry = last;
 +	}
++	printf("SAGIT PMIC: apid_map miss ppid=0x%x, scanned=%u, last=0x%x\n",
++	    ppid, scanned + 1, last);
 +	return -1;
 +}
 +
@@ -1998,8 +2012,7 @@ new file mode 100644
 +		return ENODEV;
 +	}
 +
-+	apid = spmi_lookup_apid(PM8998_SID, PM8998_LDO6_ENABLE, &entry);
-+	if (rep != NULL) {
++	apid = spmi_lookup_apid(PM8998_SID, PM8998_LDO6_ENABLE, &entry);	if (rep != NULL) {
 +		rep->apid = (uint32_t)apid;
 +		rep->map_entry = entry;
 +	}
