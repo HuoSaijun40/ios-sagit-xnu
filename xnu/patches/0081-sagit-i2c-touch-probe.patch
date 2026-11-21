@@ -1518,7 +1518,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_pmic.c
 --- /dev/null
 +++ b/bsd/dev/sagit_pmic.c
-@@ -0,0 +1,321 @@
+@@ -0,0 +1,329 @@
 +/*
 + * SAGIT: minimal SPMI write to power the touch controller's IO rail.
 + *
@@ -1787,9 +1787,17 @@ new file mode 100644
 +	int rc;
 +
 +	if (pmic.mapped == 0) {
++		/*
++		 * Report before mapping: v68 produced no SAGIT PMIC line at all,
++		 * so we could not tell "map failed" from "line scrolled off".
++		 * Print first, then map.
++		 */
++		printf("SAGIT PMIC: enter, mapping core 0x%llx\n",
++		    (uint64_t)SAGIT_SPMI_CORE_BASE);
 +		pmic.core = (volatile uint32_t *)ml_io_map(SAGIT_SPMI_CORE_BASE,
 +		    SAGIT_SPMI_CORE_SIZE);
 +		if (pmic.core == NULL) {
++			printf("SAGIT PMIC: ml_io_map(core) returned NULL\n");
 +			return ENOMEM;
 +		}
 +		pmic.mapped = 1;
