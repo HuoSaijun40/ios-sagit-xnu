@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1507 @@
+@@ -0,0 +1,1525 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -241,6 +241,11 @@ new file mode 100644
 +	uint32_t rst_cfg_low;           /* gpio89 ctl after driving low */
 +	uint32_t rst_cfg_after;         /* gpio89 ctl after release */
 +	uint32_t rst_driven_high;       /* gpio89 io out_bit after driving high */
++	uint32_t pmic_rc;               /* sagit_pmic_ldo6_on() result */
++	uint32_t pmic_ver;              /* SPMI arbiter version word */
++	uint32_t pmic_apid;             /* resolved APID, 0xffffffff if none */
++	uint32_t pmic_st;               /* STATUS after the ENABLE write */
++	uint32_t pmic_unit;             /* chnls unit mapped */
 +	uint32_t stop_at;               /* sagit_tstop=N: panic on entering N */
 +} si2c;
 +
@@ -1224,7 +1229,8 @@ new file mode 100644
 +	    "rst(gpio%d) cfg=0x%x io=0x%x | avdd(gpio%d) cfg=0x%x io=0x%x | "
 +	    "qcfg=0x%x qstate=0x%x qop=0x%x qerr=0x%x i2cst=0x%x "
 +	    "clkctl=0x%x clkctl_back=0x%x iomode=0x%x extra=0x%x txn=%d "
-+	    "rstcfg(start/low/after)=0x%x/0x%x/0x%x rstdrv=%d",
++	    "rstcfg(start/low/after)=0x%x/0x%x/0x%x rstdrv=%d "
++	    "pmic(rc/ver/apid/st/unit)=%d/0x%x/0x%x/0x%x/0x%x",
 +	    what,
 +	    SAGIT_PIN_SCL, scl_cfg, scl_io,
 +	    SAGIT_PIN_SDA, sda_cfg, sda_io,
@@ -1236,7 +1242,9 @@ new file mode 100644
 +	    SAGIT_QUP_CLK_CTL_400K, si2c.clk_ctl_readback,
 +	    si2c_rdq(QUP_IO_MODE), extra, (int)si2c.txn,
 +	    si2c.rst_cfg_start, si2c.rst_cfg_low, si2c.rst_cfg_after,
-+	    (int)si2c.rst_driven_high);
++	    (int)si2c.rst_driven_high,
++	    (int)si2c.pmic_rc, si2c.pmic_ver, si2c.pmic_apid,
++	    si2c.pmic_st, si2c.pmic_unit);
 +}
 +
 +void
@@ -1384,6 +1392,16 @@ new file mode 100644
 +
 +		memset(&pmr, 0, sizeof(pmr));
 +		prc = sagit_pmic_ldo6_on(&pmr);
++		/*
++		 * Keep the result in si2c as well: v68/v69 showed no SAGIT PMIC
++		 * line on screen at all, so the only reliable carrier of this
++		 * data is the panic string itself.
++		 */
++		si2c.pmic_rc = (uint32_t)prc;
++		si2c.pmic_ver = pmr.version;
++		si2c.pmic_apid = pmr.apid;
++		si2c.pmic_st = pmr.enable_status;
++		si2c.pmic_unit = pmr.chnl_unit;
 +		printf("SAGIT PMIC: ldo6 rc=%d ver=0x%x apid=%x map=%x "
 +		    "en_st=0x%x en_rc=%d md_st=0x%x md_rc=%d addr=0x%x unit=%x\n",
 +		    prc, pmr.version, pmr.apid, pmr.map_entry,
