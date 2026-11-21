@@ -1536,7 +1536,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_pmic.c
 --- /dev/null
 +++ b/bsd/dev/sagit_pmic.c
-@@ -0,0 +1,329 @@
+@@ -0,0 +1,340 @@
 +/*
 + * SAGIT: minimal SPMI write to power the touch controller's IO rail.
 + *
@@ -1614,7 +1614,14 @@ new file mode 100644
 +/* core window */
 +#define SPMI_VERSION            0x000
 +#define SPMI_APID_MAP(n)        (0x800 + 4 * (n))
-+#define SPMI_PPID_MASK          0xfffu
++/*
++ * Map entry layout (spmi-pmic-arb.c pmic_arb_find_apid):
++ *   bits 19:8  PPID   (masked with PMIC_ARB_PPID_MASK = GENMASK(11,0))
++ *   bit  24    IRQ owner flag
++ * The PPID is NOT in bits 11:0.
++ */
++#define SPMI_MAP_PPID_SHIFT     8
++#define SPMI_MAP_PPID_MASK      0xfffu
 +
 +/* channel TX registers (relative to chnls + 0x200 * apid) */
 +#define PMIC_ARB_CHANNEL(c)     (0x200u * (c))
@@ -1721,11 +1728,15 @@ new file mode 100644
 +/*
 + * Resolve (sid, addr) to the arbiter's APID by walking the APID -> PPID map.
 + *
-+ * spmi-pmic-arb.c: pmic_arb_offset_v2() builds
++ * spmi-pmic-arb.c: pmic_arb_find_apid() decodes each map entry as
++ *     id = (regval >> 8) & PMIC_ARB_PPID_MASK     (PPID sits in bits 19:8)
++ * and pmic_arb_offset_v2() builds the key as
 + *     ppid = (sid << 8) | (addr >> 8)
-+ * so only the top byte of the register address takes part; the low byte (the
-+ * actual register, 0x46 for LDO6 ENABLE) selects the register inside the APID.
-+ * For PM8998 (sid 0) LDO6 (0x4500..) that PPID is 0x45.
++ *
++ * v70 read the PPID from bits 11:0, which is not where the hardware puts it,
++ * so the lookup always failed (apid=0xffff, rc=ENOENT). v3 (what this SoC
++ * reports: 0x30000000) uses the same offset/fmt_cmd/apid_map helpers as v2,
++ * so this decoding is the right one here.
 + */
 +static int
 +spmi_lookup_apid(uint32_t sid, uint32_t addr, uint32_t *map_entry)
@@ -1739,13 +1750,13 @@ new file mode 100644
 +		if (v == 0) {
 +			continue;
 +		}
-+		last = v;
-+		if ((v & SPMI_PPID_MASK) == ppid) {
++		if (((v >> SPMI_MAP_PPID_SHIFT) & SPMI_MAP_PPID_MASK) == ppid) {
 +			if (map_entry != NULL) {
 +				*map_entry = v;
 +			}
 +			return (int)n;
 +		}
++		last = v;
 +	}
 +	if (map_entry != NULL) {
 +		*map_entry = last;
