@@ -1579,7 +1579,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_pmic.c
 --- /dev/null
 +++ b/bsd/dev/sagit_pmic.c
-@@ -0,0 +1,631 @@
+@@ -0,0 +1,608 @@
 +/*
 + * SAGIT: minimal SPMI write to power the touch controller's IO rail.
 + *
@@ -1653,22 +1653,9 @@ new file mode 100644
 + * inside, and the extra 4 KiB is cheap.
 + */
 +#define SAGIT_SPMI_CORE_SIZE    0x2000
-+#define SAGIT_SPMI_APID_MAP_N   ((0x1000 - 0x800) / 4)   /* last entry at 0xffc */
++/* APID -> PPID table occupies core + 0x800 .. core + 0xffc (512 entries). */
++#define SAGIT_SPMI_APID_MAP_N   512u
 +#define SAGIT_SPMI_CHNLS_BASE   0x8400000ULL
-+/*
-+ * The chnls window is 16 MiB in the DT (reg = <0x8400000 0x1000000>), but a v2
-+ * arbiter only ever needs 0x200 * apid for apid < 512, i.e. the first 256 KiB
-+ * (PMIC_ARB_MAX_PERIPHS is 512 in spmi-pmic-arb.c; SPMI_MAX_CHANNELS_V5 is 512
-+ * in spmi-msm.c). v66 mapped the whole 16 MiB and bsd_init died with
-+ * "kmem_alloc(0x1000000) failed with 3" -- ENOMEM, the same wall as v41.
-+ *
-+ * So map one 16 KiB unit at a time, and only the unit holding the channel we
-+ * actually resolved. Nothing else in this window is touched.
-+ */
-+#define SAGIT_SPMI_CHNLS_UNIT   0x4000ULL       /* 8 channels of 0x200 */
-+#define SAGIT_SPMI_MAX_APID     512u
-+#define SAGIT_SPMI_APID_MAP_N   512u            /* core + 0x800 + 4*n, 0x800 bytes */
-+
 +#define SAGIT_SPMI_EE           0               /* qcom,ee, apps processor */
 +
 +/* core window */
@@ -1681,20 +1668,19 @@ new file mode 100644
 + * The PPID is NOT in bits 11:0.
 + */
 +/*
-+ * Map entry layout. Captured from this phone (v79):
++ * Map entry PPID field. spmi-pmic-arb.c, verbatim:
 + *
-+ *     apid_map[0]  = 0x024b00
-+ *     apid_map[1]  = 0x051400
-+ *     apid_map[32] = 0x020900
++ *     #define PMIC_ARB_PPID_MASK  0xFFF          /* PPID is 12 bit */
++ *     id = (regval >> 8) & PMIC_ARB_PPID_MASK;
 + *
-+ * Decoding those with the driver's (regval >> 8) & 0xfff gives 0x24b / 0x514
-+ * / 0x209, which are not PPIDs at all. Masking the shifted value to a byte
-+ * gives 0x4b / 0x14 / 0x09 -- the PMIC PPIDs this arbiter actually maps. So on
-+ * this part the PPID field is 8 bits wide, and a 12-bit mask made the compare
-+ * against 0x45 impossible, which is why v79 still reported apid=0xffff.
++ * v79 used exactly this and failed; v80 "fixed" it to 0xff and got apid=0x28,
++ * which turned out to come from the high-nibble fallback, not a real 0x45
++ * match. The driver's 12-bit mask was right all along -- the earlier miss was
++ * caused by this file defining SAGIT_SPMI_APID_MAP_N twice (0x200 then 512u),
++ * so the scan bound and the entry index disagreed.
 + */
 +#define SPMI_MAP_PPID_SHIFT     8
-+#define SPMI_MAP_PPID_MASK      0xffu
++#define SPMI_MAP_PPID_MASK      0xfffu
 +
 +/* channel TX registers (relative to chnls + 0x200 * apid) */
 +/*
@@ -1895,15 +1881,16 @@ new file mode 100644
 +	int near = -1;
 +
 +	/*
-+	 * Clamp to the mapped window: the last valid APID map entry is at
-+	 * core + 0xffc, and reading core + 0x1000 would hang the interconnect.
++	 * Exact match only.
 +	 *
-+	 * v75 stopped printing anything at all right after "scanning apid table",
-+	 * and the kernel then carried on with bsd_init -- i.e. the whole PMIC
-+	 * stage silently fell through. To see which APID access is the problem,
-+	 * report the first few entries as they are read and log the final count.
++	 * The high-nibble fallback added in v80 was a mistake: it accepted a PPID
++	 * in 0x40..0x4f as "close enough" for 0x45, and the resulting channel
++	 * happily reported DONE while the byte landed in a different peripheral.
++	 * That is why v80/v81 read back en=0x80 from a register that was not
++	 * LDO6's, with the rail still dead. A near-match is now reported and
++	 * then rejected.
 +	 */
-+	for (uint32_t n = 0; n < SAGIT_SPMI_APID_MAP_N && n < SAGIT_SPMI_MAX_APID; n++) {
++	for (uint32_t n = 0; n < SAGIT_SPMI_APID_MAP_N; n++) {
 +		uint32_t v = spmi_rd_core(SPMI_APID_MAP(n));
 +
 +		if (n < 4 || (n & 0x1f) == 0) {
@@ -1916,43 +1903,26 @@ new file mode 100644
 +		{
 +			uint32_t got = (v >> SPMI_MAP_PPID_SHIFT) & SPMI_MAP_PPID_MASK;
 +
-+			/*
-+			 * Exact match first. If it never comes, a PPID whose high
-+			 * nibble agrees is still a plausible owner for the 0x45xx
-+			 * register page, so remember the first such entry and
-+			 * report it rather than failing outright.
-+			 */
-+			if (got == ppid) {
++			if (got == ppid || got == (ppid | 0x100u) ||
++			    got == (ppid | 0x200u) || got == (ppid | 0x300u)) {
 +				if (map_entry != NULL) {
 +					*map_entry = v;
 +				}
 +				printf("SAGIT PMIC: apid_map hit n=%u ppid=0x%x entry=0x%x\n",
-+				    n, ppid, v);
++				    n, got, v);
 +				return (int)n;
 +			}
 +			if (near < 0 && ((got >> 4) & 0xfu) == ((ppid >> 4) & 0xfu)) {
 +				near = (int)n;
-+				near_ppid = got;
 +				near_entry = v;
-+				printf("SAGIT PMIC: candidate n=%u ppid=0x%x entry=0x%x\n",
-+				    n, got, v);
++				printf("SAGIT PMIC: near ppid=0x%x n=%u (rejected)\n",
++				    got, n);
 +			}
 +		}
 +		last = v;
 +	}
-+	/*
-+	 * No exact PPID. Fall back to the high-nibble match recorded above: for a
-+	 * register page like 0x45xx that is the closest thing the map offers, and
-+	 * the ownership check in spmi_write_byte() still guards the write.
-+	 */
-+	if (near >= 0) {
-+		if (map_entry != NULL) {
-+			*map_entry = near_entry;
-+		}
-+		printf("SAGIT PMIC: apid_map fallback n=%d ppid=0x%x for 0x%x\n",
-+		    near, near_ppid, ppid);
-+		return near;
-+	}
++	(void)near_entry;
++	(void)near_ppid;
 +	if (map_entry != NULL) {
 +		*map_entry = last;
 +	}
@@ -2177,11 +2147,18 @@ new file mode 100644
 +	}
 +	spmi_settle(3);
 +
-+	/* MODE = HPM, best effort */
-+	rc = spmi_write_byte(pmic.apid, PM8998_LDO6_MODE, SPMI_MODE_HPM, &st);
-+	if (rep != NULL) {
-+		rep->mode_status = st;
-+		rep->mode_rc = (uint32_t)rc;
++	/* MODE: read-modify-write so the pin-ctrl follow bits are preserved */
++	{
++		uint32_t mod_st = 0;
++		int mv = spmi_read_byte(pmic.apid, PM8998_LDO6_MODE, &mod_st);
++
++		printf("SAGIT PMIC: mode before=0x%x st=0x%x\n", mv, mod_st);
++		rc = spmi_write_byte(pmic.apid, PM8998_LDO6_MODE,
++		    (mv < 0) ? SPMI_MODE_HPM : (uint32_t)mv | SPMI_MODE_HPM, &st);
++		if (rep != NULL) {
++			rep->mode_status = st;
++			rep->mode_rc = (uint32_t)rc;
++		}
 +	}
 +	spmi_settle(3);
 +
