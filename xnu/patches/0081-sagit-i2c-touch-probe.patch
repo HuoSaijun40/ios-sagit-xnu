@@ -1518,7 +1518,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_pmic.c
 --- /dev/null
 +++ b/bsd/dev/sagit_pmic.c
-@@ -0,0 +1,323 @@
+@@ -0,0 +1,321 @@
 +/*
 + * SAGIT: minimal SPMI write to power the touch controller's IO rail.
 + *
@@ -1702,12 +1702,17 @@ new file mode 100644
 +
 +/*
 + * Resolve (sid, addr) to the arbiter's APID by walking the APID -> PPID map.
-+ * PPID only carries the top 4 bits of the register address, which is exactly
-+ * what the map is keyed on.
++ *
++ * spmi-pmic-arb.c: pmic_arb_offset_v2() builds
++ *     ppid = (sid << 8) | (addr >> 8)
++ * so only the top byte of the register address takes part; the low byte (the
++ * actual register, 0x46 for LDO6 ENABLE) selects the register inside the APID.
++ * For PM8998 (sid 0) LDO6 (0x4500..) that PPID is 0x45.
 + */
 +static int
 +spmi_lookup_apid(uint32_t sid, uint32_t addr, uint32_t *map_entry)
 +{
++	uint32_t ppid = ((sid & 0xfu) << 8) | ((addr >> 8) & 0xfu);
 +	uint32_t last = 0;
 +
 +	for (uint32_t n = 0; n < SAGIT_SPMI_APID_MAP_N && n < SAGIT_SPMI_MAX_APID; n++) {
@@ -1717,14 +1722,7 @@ new file mode 100644
 +			continue;
 +		}
 +		last = v;
-+		/*
-+		 * PPID is (sid << 8) | (addr >> 8). For PM8998 LDO6 ENABLE 0x4546
-+		 * that is 0x004; compare both the bare and the SID-inclusive
-+		 * encoding because the map word layout differs across arbiter
-+		 * revisions.
-+		 */
-+		if ((v & SPMI_PPID_MASK) == ppid ||
-+		    (v & SPMI_PPID_MASK) == (((sid & 0xfu) << 8) | (addr >> 8))) {
++		if ((v & SPMI_PPID_MASK) == ppid) {
 +			if (map_entry != NULL) {
 +				*map_entry = v;
 +			}
