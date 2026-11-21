@@ -1579,7 +1579,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_pmic.c
 --- /dev/null
 +++ b/bsd/dev/sagit_pmic.c
-@@ -0,0 +1,608 @@
+@@ -0,0 +1,601 @@
 +/*
 + * SAGIT: minimal SPMI write to power the touch controller's IO rail.
 + *
@@ -1662,22 +1662,15 @@ new file mode 100644
 +#define SPMI_VERSION            0x000
 +#define SPMI_APID_MAP(n)        (0x800 + 4 * (n))
 +/*
-+ * Map entry layout (spmi-pmic-arb.c pmic_arb_find_apid):
-+ *   bits 19:8  PPID   (masked with PMIC_ARB_PPID_MASK = GENMASK(11,0))
-+ *   bit  24    IRQ owner flag
-+ * The PPID is NOT in bits 11:0.
-+ */
-+/*
 + * Map entry PPID field. spmi-pmic-arb.c, verbatim:
-+ *
-+ *     #define PMIC_ARB_PPID_MASK  0xFFF          /* PPID is 12 bit */
++ *     #define PMIC_ARB_PPID_MASK  0xFFF        -- PPID is 12 bit
 + *     id = (regval >> 8) & PMIC_ARB_PPID_MASK;
 + *
 + * v79 used exactly this and failed; v80 "fixed" it to 0xff and got apid=0x28,
 + * which turned out to come from the high-nibble fallback, not a real 0x45
 + * match. The driver's 12-bit mask was right all along -- the earlier miss was
-+ * caused by this file defining SAGIT_SPMI_APID_MAP_N twice (0x200 then 512u),
-+ * so the scan bound and the entry index disagreed.
++ * caused by this file defining SAGIT_SPMI_APID_MAP_N twice, so the scan bound
++ * and the entry index disagreed.
 + */
 +#define SPMI_MAP_PPID_SHIFT     8
 +#define SPMI_MAP_PPID_MASK      0xfffu
