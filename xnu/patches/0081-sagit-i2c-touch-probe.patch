@@ -1567,7 +1567,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_pmic.c
 --- /dev/null
 +++ b/bsd/dev/sagit_pmic.c
-@@ -0,0 +1,498 @@
+@@ -0,0 +1,502 @@
 +/*
 + * SAGIT: minimal SPMI write to power the touch controller's IO rail.
 + *
@@ -1843,7 +1843,7 @@ new file mode 100644
 +	for (uint32_t n = 0; n < SAGIT_SPMI_APID_MAP_N && n < SAGIT_SPMI_MAX_APID; n++) {
 +		uint32_t v = spmi_rd_core(SPMI_APID_MAP(n));
 +
-+		if (n < 4) {
++		if (n < 4 || (n & 0x1f) == 0) {
 +			printf("SAGIT PMIC: apid_map[%u]=0x%x\n", n, v);
 +		}
 +		scanned = n;
@@ -1882,8 +1882,11 @@ new file mode 100644
 +
 +	rc = spmi_map_chnl(apid);
 +	if (rc != 0) {
++		printf("SAGIT PMIC: map_chnl(apid=0x%x) rc=%d\n", apid, rc);
 +		return rc;
 +	}
++	printf("SAGIT PMIC: wr apid=0x%x reg=0x%x val=0x%x unit=0x%x\n",
++	    apid, reg, val, pmic.chnls_unit);
 +
 +	/*
 +	 * WDATA0 carries ONLY the payload bytes, lowest byte first:
@@ -1922,6 +1925,7 @@ new file mode 100644
 +	if (status != NULL) {
 +		*status = st;
 +	}
++	printf("SAGIT PMIC: wr timeout apid=0x%x st=0x%x\n", apid, st);
 +	return ETIMEDOUT;
 +}
 +
