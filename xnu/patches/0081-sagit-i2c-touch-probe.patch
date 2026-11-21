@@ -1567,7 +1567,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_pmic.c
 --- /dev/null
 +++ b/bsd/dev/sagit_pmic.c
-@@ -0,0 +1,571 @@
+@@ -0,0 +1,617 @@
 +/*
 + * SAGIT: minimal SPMI write to power the touch controller's IO rail.
 + *
@@ -1668,8 +1668,21 @@ new file mode 100644
 + *   bit  24    IRQ owner flag
 + * The PPID is NOT in bits 11:0.
 + */
++/*
++ * Map entry layout. Captured from this phone (v79):
++ *
++ *     apid_map[0]  = 0x024b00
++ *     apid_map[1]  = 0x051400
++ *     apid_map[32] = 0x020900
++ *
++ * Decoding those with the driver's (regval >> 8) & 0xfff gives 0x24b / 0x514
++ * / 0x209, which are not PPIDs at all. Masking the shifted value to a byte
++ * gives 0x4b / 0x14 / 0x09 -- the PMIC PPIDs this arbiter actually maps. So on
++ * this part the PPID field is 8 bits wide, and a 12-bit mask made the compare
++ * against 0x45 impossible, which is why v79 still reported apid=0xffff.
++ */
 +#define SPMI_MAP_PPID_SHIFT     8
-+#define SPMI_MAP_PPID_MASK      0xfffu
++#define SPMI_MAP_PPID_MASK      0xffu
 +
 +/* channel TX registers (relative to chnls + 0x200 * apid) */
 +/*
@@ -1865,6 +1878,9 @@ new file mode 100644
 +	uint32_t ppid = ((sid & 0xfu) << 8) | ((addr >> 8) & 0xffu);
 +	uint32_t last = 0;
 +	uint32_t scanned = 0;
++	uint32_t near_entry = 0;
++	uint32_t near_ppid = 0;
++	int near = -1;
 +
 +	/*
 +	 * Clamp to the mapped window: the last valid APID map entry is at
@@ -1885,15 +1901,45 @@ new file mode 100644
 +		if (v == 0) {
 +			continue;
 +		}
-+		if (((v >> SPMI_MAP_PPID_SHIFT) & SPMI_MAP_PPID_MASK) == ppid) {
-+			if (map_entry != NULL) {
-+				*map_entry = v;
++		{
++			uint32_t got = (v >> SPMI_MAP_PPID_SHIFT) & SPMI_MAP_PPID_MASK;
++
++			/*
++			 * Exact match first. If it never comes, a PPID whose high
++			 * nibble agrees is still a plausible owner for the 0x45xx
++			 * register page, so remember the first such entry and
++			 * report it rather than failing outright.
++			 */
++			if (got == ppid) {
++				if (map_entry != NULL) {
++					*map_entry = v;
++				}
++				printf("SAGIT PMIC: apid_map hit n=%u ppid=0x%x entry=0x%x\n",
++				    n, ppid, v);
++				return (int)n;
 +			}
-+			printf("SAGIT PMIC: apid_map hit n=%u ppid=0x%x entry=0x%x\n",
-+			    n, ppid, v);
-+			return (int)n;
++			if (near < 0 && ((got >> 4) & 0xfu) == ((ppid >> 4) & 0xfu)) {
++				near = (int)n;
++				near_ppid = got;
++				near_entry = v;
++				printf("SAGIT PMIC: candidate n=%u ppid=0x%x entry=0x%x\n",
++				    n, got, v);
++			}
 +		}
 +		last = v;
++	}
++	/*
++	 * No exact PPID. Fall back to the high-nibble match recorded above: for a
++	 * register page like 0x45xx that is the closest thing the map offers, and
++	 * the ownership check in spmi_write_byte() still guards the write.
++	 */
++	if (near >= 0) {
++		if (map_entry != NULL) {
++			*map_entry = near_entry;
++		}
++		printf("SAGIT PMIC: apid_map fallback n=%d ppid=0x%x for 0x%x\n",
++		    near, near_ppid, ppid);
++		return near;
 +	}
 +	if (map_entry != NULL) {
 +		*map_entry = last;
