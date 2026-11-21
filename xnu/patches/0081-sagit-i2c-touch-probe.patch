@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1517 @@
+@@ -0,0 +1,1488 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -238,6 +238,7 @@ new file mode 100644
 +	uint32_t rst_cfg_start;         /* gpio89 ctl before the pulse */
 +	uint32_t rst_cfg_low;           /* gpio89 ctl after driving low */
 +	uint32_t rst_cfg_after;         /* gpio89 ctl after release */
++	uint32_t rst_driven_high;       /* gpio89 io out_bit after driving high */
 +	uint32_t stop_at;               /* sagit_tstop=N: panic on entering N */
 +} si2c;
 +
@@ -1034,6 +1035,13 @@ new file mode 100644
 +	if (high) {
 +		v |= (1u << TLMM_IO_OUT_BIT);
 +	} else {
++		/*
++		 * v64 emits  and w, w, #0xfffffffc  here (bit 0 and bit 1 both
++		 * cleared) because bit 1 of the masked read is known to the
++		 * compiler to be whatever the latch was. The intent is
++		 * "latch = 0", which is what it computes, so the line is
++		 * driven low either way; keep the readable form.
++		 */
 +		v &= ~(1u << TLMM_IO_OUT_BIT);
 +	}
 +	si2c_tlmm_wr(pin, TLMM_GPIO_IN_OUT, v);
@@ -1120,95 +1128,62 @@ new file mode 100644
 +/*
 + * Touch reset (GPIO 89).
 + *
-+ * The mainline Xiaomi Mi 6 device tree (msm8998-xiaomi-sagit.dts) describes the
-+ * touch node as "syna,rmi4-i2c" with this pinctrl:
++ * v64 lesson: every attempt that relied on "RESET is active low, release by
++ * pull-up" left the line at 0 and the part silent. The vendor device tree in
++ * the bootloader image (live.dtb) disagrees with that reading:
 + *
-+ *   ts_active_state: pins = "gpio89", "gpio125";
-+ *                    function = "gpio"; drive-strength = <16>;
-+ *                    bias-pull-up; input-enable;
++ *   synaptics,reset-on-state  = <0>    <- the pin level that means "running"
++ *   synaptics,reset-active-ms = <5>    <- time to hold the reset state
++ *   synaptics,reset-delay-ms  = <200>  <- wait after releasing
++ *   synaptics,power-delay-ms  = <5>
++ *   synaptics,ub-i2c-addr     = <0x2c>
 + *
-+ * i.e. reset is configured as an INPUT with a pull-up, not driven as an output.
-+ * The Synaptics part holds the line itself and the driver only watches it; the
-+ * previous revision of this file drove it high, which is the opposite of what
-+ * the reference design does.
++ * and the pin config groups do not describe an input either:
 + *
-+ * The suspend state drops the pull-up (bias-disable) for the same pins, so the
-+ * active state is the one to program here.
++ *   ts_reset_active  : gpio89, drive-strength <16>, bias-pull-up
++ *   ts_reset_suspend1: gpio89, drive-strength <2>,  bias-pull-down
++ *
++ * There is no output-high / input-enable anywhere for gpio89, and
++ * "reset-on-state = 0" means the normal (running) level of the line is 0. So
++ * this is an active-HIGH reset whose idle level is low: the host must drive it
++ * HIGH to release, and the pull-up alone can never do that (a pull-up with the
++ * driver off is *not* the same thing as a driven high, which is why rst io
++ * stayed 0 for v59-v64).
++ *
++ * New sequence:
++ *   1. drive LOW  (reset asserted)       and wait reset-active-ms  (5 ms)
++ *   2. drive HIGH (reset deasserted)     and wait reset-delay-ms   (200 ms)
++ * The line is left DRIVEN HIGH, so the part never loses its release.
 + */
 +static void
 +si2c_reset_release(void)
 +{
-+	uint32_t cfg = si2c_tlmm_rd(SAGIT_PIN_RESET, TLMM_GPIO_CFG);
++	uint32_t cfg;
++	uint32_t io;
 +
++	cfg = si2c_tlmm_rd(SAGIT_PIN_RESET, TLMM_GPIO_CFG);
 +	si2c.rst_cfg_start = cfg;
 +
-+	/* Function 0 (plain GPIO), pull-up, and OUT OF output mode. */
++	/* Function 0 (plain GPIO), pull-up, output driver ON. */
 +	cfg &= ~(TLMM_CTL_MUX_MASK | TLMM_CTL_PULL_MASK | TLMM_CTL_OE_BIT);
-+	cfg |= (0u << TLMM_CTL_MUX_BIT);
 +	cfg |= (TLMM_PULL_UP << TLMM_CTL_PULL_BIT);
-+	/*
-+	 * ts_active_state in the reference DT is bias-pull-up with
-+	 * input-enable, i.e. function 0, pull-up, output driver OFF. Write it
-+	 * twice: the read-back after a single write kept bit 9 set, and an
-+	 * output driver fighting the chip's own reset output would hold the
-+	 * line low and keep the part in reset.
-+	 */
-+	/*
-+	 * Drive reset LOW first. The RMI4 spec describes RESET as an active-low
-+	 * input driven by the host, and every version through v58 only ever
-+	 * configured the pin and read it back -- rst io stayed 0 on every run
-+	 * and the chip never answered.
-+	 *
-+	 * Vendor sequence (syna TCM driver):
-+	 *     set reset low  -> >=100 us -> release high -> wait for startup
-+	 */
-+	/*
-+	 * Rebuild the control word from scratch for both phases: pull is
-+	 * PULL_UP (3), function 0, and the output driver is enabled only while
-+	 * we actively drive the line low.
-+	 *
-+	 * v59/v60 ended up with pull = KEEPER (2) in cfg 0x202, so after
-+	 * clearing OE nothing pulled the line back up and the chip stayed in
-+	 * reset -- which reads as "the chip keeps holding reset low" but is
-+	 * actually our own pin configuration.
-+	 */
-+	cfg = (TLMM_PULL_UP << TLMM_CTL_PULL_BIT) |
-+	    (0u << TLMM_CTL_MUX_BIT) |
-+	    (1u << TLMM_CTL_OE_BIT);
-+	/*
-+	 * Drive the latch (and therefore the pad) low, then enable the driver.
-+	 * Programming the latch is the step the RMW never performed: see
-+	 * si2c_tlmm_io_rd().
-+	 */
++	cfg |= (1u << TLMM_CTL_OE_BIT);
++
++	/* 1. assert: drive low, then enable the driver. */
 +	si2c_tlmm_io_wr(SAGIT_PIN_RESET, 0);
 +	si2c_tlmm_wr(SAGIT_PIN_RESET, TLMM_GPIO_CFG, cfg);
 +	si2c.rst_cfg_low = si2c_tlmm_rd(SAGIT_PIN_RESET, TLMM_GPIO_CFG);
-+	/*
-+	 * 20 ms held-low, the width the vendor uses before releasing reset
-+	 * (a 100 us pulse is enough for a healthy part but leaves a
-+	 * half-initialised one holding its own RESET line low).
-+	 */
-+	/*
-+	 * 220 ms held-low. The Mi 6 mainline DT says 20 ms, but the
-+	 * msm8998 Sony Yoshino boards -- same SoC, same Synaptics part --
-+	 * use syna,reset-delay-ms = <220>. The line is held low by
-+	 * something outside this driver (v62 proved our pin is input +
-+	 * pull-up), so give the part the generous number.
-+	 */
-+	si2c_settle(220u * SAGIT_TICKS_PER_MS);
++	si2c_wait_ms(5);                        /* reset-active-ms */
 +
-+	/*
-+	 * Release: output driver OFF, pull-UP on. RESET is active low, so the
-+	 * pull-up is what takes the line high and lets the part boot. This is
-+	 * exactly ts_active_state from the reference DT (bias-pull-up,
-+	 * input-enable).
-+	 */
-+	cfg &= ~(TLMM_CTL_OE_BIT);
-+	cfg &= ~TLMM_CTL_PULL_MASK;
-+	cfg |= (TLMM_PULL_UP << TLMM_CTL_PULL_BIT);
-+	si2c_tlmm_wr(SAGIT_PIN_RESET, TLMM_GPIO_CFG, cfg);
-+	si2c_tlmm_wr(SAGIT_PIN_RESET, TLMM_GPIO_CFG, cfg);
++	/* 2. deassert: drive high and LEAVE IT DRIVEN. */
++	si2c_tlmm_io_wr(SAGIT_PIN_RESET, 1);
 +	si2c.rst_cfg_after = si2c_tlmm_rd(SAGIT_PIN_RESET, TLMM_GPIO_CFG);
++	io = si2c_tlmm_rd(SAGIT_PIN_RESET, TLMM_GPIO_IN_OUT);
++	/*
++	 * If the pad still reads 0 with the driver on and the latch high, we
++	 * are being fought by the chip -- record it rather than guess later.
++	 */
++	si2c.rst_driven_high = (io >> 1) & 1u;
 +}
 +
 +/*
@@ -1247,7 +1222,7 @@ new file mode 100644
 +	    "rst(gpio%d) cfg=0x%x io=0x%x | avdd(gpio%d) cfg=0x%x io=0x%x | "
 +	    "qcfg=0x%x qstate=0x%x qop=0x%x qerr=0x%x i2cst=0x%x "
 +	    "clkctl=0x%x clkctl_back=0x%x iomode=0x%x extra=0x%x txn=%d "
-+	    "rstcfg(start/low/after)=0x%x/0x%x/0x%x",
++	    "rstcfg(start/low/after)=0x%x/0x%x/0x%x rstdrv=%d",
 +	    what,
 +	    SAGIT_PIN_SCL, scl_cfg, scl_io,
 +	    SAGIT_PIN_SDA, sda_cfg, sda_io,
@@ -1258,7 +1233,8 @@ new file mode 100644
 +	    si2c_rdq(QUP_ERROR_FLAGS), si2c_rdq(QUP_I2C_STATUS),
 +	    SAGIT_QUP_CLK_CTL_400K, si2c.clk_ctl_readback,
 +	    si2c_rdq(QUP_IO_MODE), extra, (int)si2c.txn,
-+	    si2c.rst_cfg_start, si2c.rst_cfg_low, si2c.rst_cfg_after);
++	    si2c.rst_cfg_start, si2c.rst_cfg_low, si2c.rst_cfg_after,
++	    (int)si2c.rst_driven_high);
 +}
 +
 +void
@@ -1416,17 +1392,12 @@ new file mode 100644
 +	    si2c_tlmm_rd(SAGIT_PIN_TOUCH_IRQ, TLMM_GPIO_CFG),
 +	    si2c_tlmm_rd(SAGIT_PIN_TOUCH_IRQ, TLMM_GPIO_IN_OUT));
 +	/*
-+	 * syna,reset-delay-ms = <20> and syna,startup-delay-ms = <20>:
-+	 * the part does not answer I2C until it has finished booting.
-+	 * v57 waited microseconds and the read timed out with the bus
-+	 * idle-high, which is exactly what an unbooted chip looks like.
++	 * 200 ms startup, the vendor's synaptics,reset-delay-ms from live.dtb.
++	 * This used to be 1000 ms borrowed from the msm8998 Yoshino boards,
++	 * but those boards use a different panel -- the vendor value for THIS
++	 * panel is 200 ms, and 1000 ms only cost boot time.
 +	 */
-+	/*
-+	 * 1000 ms startup. syna,startup-delay-ms is 20 ms on the Mi 6 DT
-+	 * and 1000 ms on the msm8998 Yoshino boards; a part that is still
-+	 * arming its IO will not answer I2C earlier than that.
-+	 */
-+	si2c_wait_ms(1000);             /* reset release -> startup ready */
++	si2c_wait_ms(200);              /* reset release -> part booted */
 +	/* Stage 8 is the freeze point of v44 and v45: the very first GCC
 +	 * read happens on the next line, so mark it before going in. */
 +	si2c_stage(8);
