@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1533 @@
+@@ -0,0 +1,1556 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -1420,7 +1420,30 @@ new file mode 100644
 +	printf("SAGIT I2C 5/9 avdd after: cfg=0x%x io=0x%x\n",
 +	    si2c_tlmm_rd(SAGIT_PIN_TS_AVDD, TLMM_GPIO_CFG),
 +	    si2c_tlmm_rd(SAGIT_PIN_TS_AVDD, TLMM_GPIO_IN_OUT));
-+	si2c_settle(2);                 /* > the 4 ms startup-delay of the rail */
++	/*
++	 * Power-up ordering, per drivers/input/rmi4/rmi_i2c.c:
++	 *
++	 *   regulator_bulk_enable(vdd, vio);
++	 *   msleep(syna,startup-delay-ms);     <- BEFORE reset
++	 *   ... reset pulse ...
++	 *   msleep(syna,reset-delay-ms);
++	 *   first i2c access
++	 *
++	 * This driver had no startup wait at all: avdd and LDO6 came up and the
++	 * reset pulse started immediately, with si2c_settle(2) standing in for
++	 * the rail delay (that is ~4 microseconds, not the 5 ms the vendor DT
++	 * asks for in synaptics,power-delay-ms). The part was being reset while
++	 * its supplies were still ramping.
++	 */
++	/*
++	 * Generous power-up and startup waits. si2c_wait_ms() is a calibrated
++	 * spin (SAGIT_TICKS_PER_MS), not a timer, so it can only over- or
++	 * under-shoot; use 20 ms (and a further 20 ms margin) instead of the
++	 * bare 5 ms from synaptics,power-delay-ms. Over-waiting costs a few
++	 * milliseconds of boot time; under-waiting costs a boot cycle.
++	 */
++	si2c_wait_ms(20);               /* power-delay-ms: rails settled */
++	si2c_wait_ms(20);               /* startup margin before reset */
 +	si2c_pins_to_i2c();
 +	si2c_stage(6);
 +	printf("SAGIT I2C 6/9 pins: scl cfg=0x%x io=0x%x | sda cfg=0x%x io=0x%x\n",
