@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1630 @@
+@@ -0,0 +1,1637 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -1465,7 +1465,14 @@ new file mode 100644
 +	 * sagit_pmic=1 re-enables the old SPMI attempt for experiments.
 +	 */
 +	{
-+		int want_pmic = 0;
++		/*
++		 * v88 skipped the SPMI attempt and the part still did not answer,
++		 * so this round runs it again -- but now purely as a diagnostic:
++		 * it dumps the whole APID -> PPID table. Either PPID 0x45 is in
++		 * the table (the lookup was wrong) or it is not (this arbiter does
++		 * not expose PM8998's LDOs and RPM is required).
++		 */
++		int want_pmic = 1;
 +
 +		PE_parse_boot_argn("sagit_pmic", &want_pmic, sizeof(want_pmic));
 +		if (want_pmic != 0) {
@@ -1641,7 +1648,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_pmic.c
 --- /dev/null
 +++ b/bsd/dev/sagit_pmic.c
-@@ -0,0 +1,463 @@
+@@ -0,0 +1,468 @@
 +/*
 + * SAGIT: minimal SPMI write to bring up the touch controller's power rail.
 + *
@@ -1884,9 +1891,14 @@ new file mode 100644
 +			    n, got, v);
 +			return (int)n;
 +		}
++		/*
++		 * Print only the entries whose PPID high nibble matches the target:
++		 * for 0x45 that is the 0x4x page, where an LDO of PM8998 would live.
++		 * Keeps the log short and still answers "is 0x45 here at all?".
++		 */
 +		if (((got >> 4) & 0xfu) == ((ppid >> 4) & 0xfu)) {
-+			printf("SAGIT PMIC: near ppid=0x%x n=%u (rejected)\n",
-+			    got, n);
++			printf("SAGIT PMIC: near n=%u ppid=0x%x (rejected)\n",
++			    n, got);
 +		}
 +	}
 +	return -1;
