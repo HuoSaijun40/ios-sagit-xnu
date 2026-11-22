@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1578 @@
+@@ -0,0 +1,1617 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -250,6 +250,10 @@ new file mode 100644
 +	uint32_t pmic_md_rb;            /* MODE read back from the PMIC */
 +	uint32_t pmic_owner;            /* APID ownership word */
 +	uint32_t pmic_md_before;        /* MODE before the RMW */
++	uint32_t avdd_io_after;         /* gpio50 io after enabling the rail */
++	uint32_t avdd_cfg_after;        /* gpio50 ctl after enabling the rail */
++	uint32_t avdd_io_before;        /* gpio50 io before enabling the rail */
++	uint32_t avdd_cfg_before;       /* gpio50 ctl before enabling the rail */
 +	uint32_t pmic_rg_rb;            /* RANGE read back */
 +	uint32_t pmic_sv_rb;            /* VOLTAGE_SET read back */
 +	uint32_t pmic_type_rb;          /* LDO TYPE (0x4504): proves SPMI reads work */
@@ -1074,13 +1078,37 @@ new file mode 100644
 +si2c_avdd_on(void)
 +{
 +	uint32_t cfg = si2c_tlmm_rd(SAGIT_PIN_TS_AVDD, TLMM_GPIO_CFG);
++	uint32_t io;
 +
-+	si2c_tlmm_io_wr(SAGIT_PIN_TS_AVDD, 1);  /* latch high before oe */
-+
-+	cfg &= ~(TLMM_CTL_MUX_MASK | TLMM_CTL_PULL_MASK);
++	/*
++	 * This pin is disp_vddts_vreg's enable: a regulator-fixed on gpio 50,
++	 * enable-active-high, regulator-boot-on, startup-delay-us = 4000. On the
++	 * Mi 6 that enable drives U1100, the load switch that produces the
++	 * touch panel's 3.1 V main rail, so the ordering below matters:
++	 *
++	 *   1. program the output latch HIGH while the driver is still off, so
++	 *      enabling the pad never injects a low glitch that would drop the
++	 *      load switch and make it restart
++	 *   2. enable the output driver (function 0, no pull)
++	 *   3. leave the 4 ms rail delay to the caller
++	 *
++	 * The old order wrote the latch first but then a second write could
++	 * still land while oe was being set; do it as an explicit read-back now.
++	 */
++	cfg &= ~(TLMM_CTL_MUX_MASK | TLMM_CTL_PULL_MASK | TLMM_CTL_OE_BIT);
 +	cfg |= (0u << TLMM_CTL_MUX_BIT);        /* function 0 = plain GPIO */
-+	cfg |= (1u << TLMM_CTL_OE_BIT);         /* output enable */
++
++	/* latch high with the driver still disabled */
++	si2c_tlmm_io_wr(SAGIT_PIN_TS_AVDD, 1);
 +	si2c_tlmm_wr(SAGIT_PIN_TS_AVDD, TLMM_GPIO_CFG, cfg);
++
++	/* now enable the driver; the pad comes up already high */
++	cfg |= (1u << TLMM_CTL_OE_BIT);
++	si2c_tlmm_wr(SAGIT_PIN_TS_AVDD, TLMM_GPIO_CFG, cfg);
++
++	io = si2c_tlmm_rd(SAGIT_PIN_TS_AVDD, TLMM_GPIO_IN_OUT);
++	si2c.avdd_io_after = io;
++	si2c.avdd_cfg_after = si2c_tlmm_rd(SAGIT_PIN_TS_AVDD, TLMM_GPIO_CFG);
 +}
 +
 +/*
@@ -1252,7 +1280,8 @@ new file mode 100644
 +	    "rstcfg(start/low/after)=0x%x/0x%x/0x%x rstdrv=%d "
 +	    "pmic(rc/ver/apid/st)=%d/0x%x/0x%x/0x%x "
 +	    "pmic_rb(en/md)=0x%x/0x%x own=0x%x mdb=0x%x "
-+	    "ldo(rg/sv/ty/st)=0x%x/0x%x/0x%x/0x%x",
++	    "ldo(rg/sv/ty/st)=0x%x/0x%x/0x%x/0x%x "
++	    "avdd_on(cfg/io)=0x%x/0x%x",
 +	    what,
 +	    SAGIT_PIN_SCL, scl_cfg, scl_io,
 +	    SAGIT_PIN_SDA, sda_cfg, sda_io,
@@ -1270,7 +1299,8 @@ new file mode 100644
 +	    si2c.pmic_en_rb, si2c.pmic_md_rb,
 +	    si2c.pmic_owner, si2c.pmic_md_before,
 +	    si2c.pmic_rg_rb, si2c.pmic_sv_rb,
-+	    si2c.pmic_type_rb, si2c.pmic_subtype_rb);
++	    si2c.pmic_type_rb, si2c.pmic_subtype_rb,
++	    si2c.avdd_cfg_after, si2c.avdd_io_after);
 +}
 +
 +void
@@ -1403,10 +1433,19 @@ new file mode 100644
 +	 * Only then is it worth starting clocks.
 +	 */
 +	si2c_stage(4);
++	si2c.avdd_cfg_before = si2c_tlmm_rd(SAGIT_PIN_TS_AVDD, TLMM_GPIO_CFG);
++	si2c.avdd_io_before = si2c_tlmm_rd(SAGIT_PIN_TS_AVDD, TLMM_GPIO_IN_OUT);
 +	printf("SAGIT I2C 4/9 avdd before: cfg=0x%x io=0x%x\n",
-+	    si2c_tlmm_rd(SAGIT_PIN_TS_AVDD, TLMM_GPIO_CFG),
-+	    si2c_tlmm_rd(SAGIT_PIN_TS_AVDD, TLMM_GPIO_IN_OUT));
++	    si2c.avdd_cfg_before, si2c.avdd_io_before);
 +	si2c_avdd_on();
++	/*
++	 * disp_vddts_vreg asks for startup-delay-us = 4000 before anything may
++	 * use the rail, and on the Mi 6 that enable drives U1100 -- the load
++	 * switch behind the touch panel's 3.1 V main rail. Give it a wide margin
++	 * before the SPMI write so the two rails are never sequenced against
++	 * each other.
++	 */
++	si2c_wait_ms(10);
 +	/*
 +	 * The touch 'vdd' rail is PM8998 LDO6, behind the SPMI bus. v65 proved
 +	 * every other link good (reset finally driven high) yet both addresses
