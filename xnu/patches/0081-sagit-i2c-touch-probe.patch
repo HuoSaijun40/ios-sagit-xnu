@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1637 @@
+@@ -0,0 +1,1658 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -47,6 +47,7 @@ new file mode 100644
 +#include <libkern/libkern.h>
 +
 +#include "sagit_pmic.h"
++#include "sagit_smem.h"
 +
 +/* osfmk/arm/machine_routines.h, not exported to the BSD layer (same as UFS). */
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -245,7 +246,6 @@ new file mode 100644
 +	uint32_t pmic_ver;              /* SPMI arbiter version word */
 +	uint32_t pmic_apid;             /* resolved APID, 0xffffffff if none */
 +	uint32_t pmic_st;               /* STATUS after the ENABLE write */
-+	uint32_t pmic_unit;             /* chnls unit mapped */
 +	uint32_t pmic_en_rb;            /* ENABLE read back from the PMIC */
 +	uint32_t pmic_md_rb;            /* MODE read back from the PMIC */
 +	uint32_t pmic_owner;            /* APID ownership word */
@@ -258,6 +258,12 @@ new file mode 100644
 +	uint32_t pmic_sv_rb;            /* VOLTAGE_SET read back */
 +	uint32_t pmic_type_rb;          /* LDO TYPE (0x4504): proves SPMI reads work */
 +	uint32_t pmic_subtype_rb;       /* LDO SUBTYPE (0x4505) */
++	/* SMEM / RPM feasibility, see sagit_smem.c */
++	uint32_t smem_rc;               /* 0 = mapped and magic matched */
++	uint32_t smem_magic;
++	uint32_t smem_entries;
++	uint32_t smem_rpm_item;
++	uint32_t rpm_ram_rc;
 +	uint32_t stop_at;               /* sagit_tstop=N: panic on entering N */
 +} si2c;
 +
@@ -728,13 +734,12 @@ new file mode 100644
 + * The counts then tell the block how many bytes cross the FIFOs.
 + */
 +static int
-+si2c_read_addr(uint8_t addr, uint16_t reg, uint32_t regbytes,
-+    uint8_t *out, uint32_t len)
++si2c_read_addr(uint8_t addr, uint16_t reg, uint8_t *out, uint32_t len)
 +{
 +	uint32_t op;
 +	uint32_t spins;
 +
-+	if (len == 0 || len > 256 || regbytes == 0 || regbytes > 2) {
++	if (len == 0 || len > 256) {
 +		return EINVAL;
 +	}
 +
@@ -766,9 +771,8 @@ new file mode 100644
 +	si2c.txn = 11;
 +
 +	/*
-+	 * Write phase: START, addr<<1, DATAWR, then regbytes address bytes.
-+	 * RMI4 always uses two address bytes (little endian), a plain I2C
-+	 * register uses one.
++	 * Write phase: START, addr<<1, DATAWR, then the two RMI4 address bytes
++	 * (little endian).
 +	 *
 +	 * Counts follow i2c-qup.c's qup_i2c_conf_count_v2(): in FIFO mode the
 +	 * TX length goes to QUP_MX_WRITE_CNT and the unused OUTPUT_CNT is
@@ -782,9 +786,7 @@ new file mode 100644
 +	wtags[wlen++] = (uint8_t)(addr << 1);
 +	wtags[wlen++] = QUP_TAG_V2_DATAWR;
 +	wtags[wlen++] = (uint8_t)(reg & 0xff);
-+	if (regbytes == 2) {
-+		wtags[wlen++] = (uint8_t)(reg >> 8);
-+	}
++	wtags[wlen++] = (uint8_t)(reg >> 8);
 +
 +	/* First sub-transfer: config_run is 0. */
 +	si2c_wrq(QUP_MX_OUTPUT_CNT, 0);
@@ -881,14 +883,7 @@ new file mode 100644
 +static int
 +si2c_read_rmi4(uint8_t addr, uint16_t reg, uint8_t *out, uint32_t len)
 +{
-+	return si2c_read_addr(addr, reg, 2, out, len);
-+}
-+
-+/* Plain single-byte-register I2C read, kept for later non-RMI4 use. */
-+static int
-+si2c_read(uint8_t addr, uint8_t reg, uint8_t *out, uint32_t len)
-+{
-+	return si2c_read_addr(addr, reg, 1, out, len);
++	return si2c_read_addr(addr, reg, out, len);
 +}
 +
 +/*
@@ -1281,7 +1276,8 @@ new file mode 100644
 +	    "pmic(rc/ver/apid/st)=%d/0x%x/0x%x/0x%x "
 +	    "pmic_rb(en/md)=0x%x/0x%x own=0x%x mdb=0x%x "
 +	    "ldo(rg/sv/ty/st)=0x%x/0x%x/0x%x/0x%x "
-+	    "avdd_on(cfg/io)=0x%x/0x%x",
++	    "avdd_on(cfg/io)=0x%x/0x%x "
++	    "smem(rc/magic/toc/rpm/ram)=%d/0x%x/%u/0x%x/%d",
 +	    what,
 +	    SAGIT_PIN_SCL, scl_cfg, scl_io,
 +	    SAGIT_PIN_SDA, sda_cfg, sda_io,
@@ -1300,7 +1296,12 @@ new file mode 100644
 +	    si2c.pmic_owner, si2c.pmic_md_before,
 +	    si2c.pmic_rg_rb, si2c.pmic_sv_rb,
 +	    si2c.pmic_type_rb, si2c.pmic_subtype_rb,
-+	    si2c.avdd_cfg_after, si2c.avdd_io_after);
++	    si2c.avdd_cfg_after, si2c.avdd_io_after,
++	    (int)si2c.smem_rc, si2c.smem_magic, si2c.smem_entries,
++	    si2c.smem_rpm_item, (int)si2c.rpm_ram_rc);
++	printf("SAGIT SMEM2: rc=%d magic=0x%x toc=%u rpm_item=0x%x ram_rc=%d\n",
++	    (int)si2c.smem_rc, si2c.smem_magic, si2c.smem_entries,
++	    si2c.smem_rpm_item, (int)si2c.rpm_ram_rc);
 +}
 +
 +void
@@ -1313,6 +1314,26 @@ new file mode 100644
 +	int rc;
 +
 +	si2c.txn = 0;
++
++	/*
++	 * Feasibility gate for the RPM path. v89 showed PM8998's LDO6 has no
++	 * SPMI APID at all, so switching that rail on requires talking to the
++	 * RPM over G-Link -- which in turn requires SMEM. Probe it first: if
++	 * SMEM cannot even be mapped and read at bsd_init() time, no amount of
++	 * G-Link code would help, and this one boot answers that question.
++	 */
++	{
++		struct sagit_smem_report sr;
++		uint32_t ram0 = 0;
++
++		si2c.smem_rc = (uint32_t)sagit_smem_probe(&sr);
++		if (si2c.smem_rc == 0) {
++			si2c.smem_magic = sr.magic;
++			si2c.smem_entries = sr.found;
++			si2c.smem_rpm_item = sr.rpm_item_offset;
++			si2c.rpm_ram_rc = (uint32_t)sagit_smem_probe_rpm_ram(&ram0);
++		}
++	}
 +
 +	/*
 +	 * Breadcrumbs, one line per stage.
@@ -2166,15 +2187,235 @@ new file mode 100644
 +int sagit_pmic_ldo6_on(struct sagit_pmic_report *rep);
 +
 +#endif /* _BSD_DEV_SAGIT_PMIC_H_ */
+diff --git a/bsd/dev/sagit_smem.c b/bsd/dev/sagit_smem.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sagit_smem.c
+--- /dev/null
++++ b/bsd/dev/sagit_smem.c
+@@ -0,0 +1,171 @@
++/*
++ * SAGIT: probe whether SMEM is usable from this kernel.
++ *
++ * WHY THIS EXISTS
++ * ---------------
++ * v89 proved that PM8998's LDO6 cannot be reached over SPMI: the APID -> PPID
++ * table contains no entry for PPID 0x45, and upstream agrees -- pm8998's rails
++ * are RPM/SMD resources ({ "l6", QCOM_SMD_RPM_LDOA, 6, ... } in
++ * qcom_smd-regulator.c), while qcom_spmi-regulator.c has no pm8998 table at
++ * all. The PMIC is driven by the RPM firmware, so switching that rail on means
++ * talking to the RPM over G-Link.
++ *
++ * G-Link needs, in this order: SMEM (to find the FIFOs), the RPM message RAM,
++ * the APCS mailbox to knock, and GIC SPI 168 for the reply. Before writing any
++ * of that, this probe answers the only question that matters:
++ *
++ *   can this kernel, at bsd_init() time, map and read SMEM at all?
++ *
++ * If SMEM is not reachable here then the whole RPM path is out of reach too,
++ * and no amount of protocol code would help -- so it is worth one boot to know.
++ *
++ * SMEM layout (drivers/soc/qcom/smem.c, struct smem_header):
++ *
++ *   0x000  smem_proc_comm proc_comm[4]      16 * u32  = 0x40
++ *   0x040  u32 version[32]
++ *   0x0c0  u32 initialized                  == 0x494D4553 ("SMEM")
++ *   0x0c4  u32 free_offset
++ *   0x0c8  u32 available
++ *   0x0cc  u32 reserved
++ *   0x0d0  smem_global_entry toc[512]        { u32 identifier; u32 offset; }
++ *
++ * The offsets above are the driver's: 4 * sizeof(struct smem_proc_comm) = 0x40
++ * and 4 * 32 = 0x80 more to reach `initialized`. (Struct sizes verified against
++ * smem.c's smem_proc_comm: u16 command, u16 status, u32 data[2] = 12 bytes,
++ * but it is padded to 16 by the compiler, so 4 * 16 = 0x40.)
++ */
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <machine/machine_routines.h>
++#include <libkern/libkern.h>
++
++#include "sagit_smem.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++#if defined(SAGIT)
++
++/* /soc/qcom,smem@86000000 in live.dtb */
++#define SAGIT_SMEM_BASE         0x86000000ULL
++#define SAGIT_SMEM_SIZE         0x200000ULL
++/* /soc/rpm-memory@0x778000, compatible qcom,rpm-code-ram */
++#define SAGIT_RPM_MSG_BASE      0x778000ULL
++#define SAGIT_RPM_MSG_SIZE      0x5000ULL
++
++#define SMEM_MAGIC              0x494d4553u     /* "SMEM" */
++#define SMEM_TOC_OFFSET         0xd0u
++#define SMEM_TOC_ENTRIES        512u
++#define SMEM_ENTRY_SMEM         1u              /* SMEM_HEAP_INFO */
++/*
++ * G-Link native transport items. msm8998 uses glink-rpm (the mailbox flavour),
++ * whose FIFOs live in the RPM message RAM at 0x778000 rather than in SMEM, but
++ * these item ids are what a SMEM-based marker/descriptor would be called and
++ * are worth reporting: qcom_glink_smem.c defines exactly these numbers.
++ */
++#define SMEM_ENTRY_RPM_DESC     478u            /* XPRT_DESCRIPTOR */
++#define SMEM_ENTRY_RPM_FIFO0    479u            /* XPRT_FIFO_0 */
++#define SMEM_ENTRY_RPM_FIFO1    480u            /* XPRT_FIFO_1 */
++
++#define SMEM_PROBE_ENTRIES      64u             /* how many TOC slots to report */
++
++/*
++ * Read the SMEM header and a few table entries. Everything it learns goes into
++ * the report so the I2C probe can put it in its panic string; nothing here
++ * pokes the RPM yet.
++ */
++int
++sagit_smem_probe(struct sagit_smem_report *rep)
++{
++	volatile uint32_t *smem;
++	uint32_t hdr_ok;
++	uint32_t found = 0;
++
++	if (rep == NULL) {
++		return EINVAL;
++	}
++	memset(rep, 0, sizeof(*rep));
++
++	smem = (volatile uint32_t *)ml_io_map(SAGIT_SMEM_BASE, SAGIT_SMEM_SIZE);
++	if (smem == NULL) {
++		rep->map_rc = ENOMEM;
++		printf("SAGIT SMEM: ml_io_map(0x%llx) failed\n",
++		    (uint64_t)SAGIT_SMEM_BASE);
++		return ENOMEM;
++	}
++	rep->map_rc = 0;
++
++	/* magic at 0x0c0 */
++	hdr_ok = smem[0x0c0 / 4];
++	rep->magic = hdr_ok;
++	if (hdr_ok != SMEM_MAGIC) {
++		printf("SAGIT SMEM: bad magic 0x%x (want 0x%x)\n",
++		    hdr_ok, SMEM_MAGIC);
++		return EINVAL;
++	}
++
++	rep->free_offset = smem[0x0c4 / 4];
++	rep->available = smem[0x0c8 / 4];
++
++	/*
++	 * Walk the table. An entry is { identifier, offset }; offset is relative
++	 * to the SMEM base. Report the first few so the log shows the table is
++	 * real, and note whether the RPM G-Link item is present at all -- that
++	 * is the item the RPM transport would need.
++	 */
++	for (uint32_t i = 0; i < SMEM_TOC_ENTRIES; i++) {
++		uint32_t id = smem[(SMEM_TOC_OFFSET + i * 8) / 4];
++		uint32_t off = smem[(SMEM_TOC_OFFSET + i * 8 + 4) / 4];
++
++		if (id == 0) {
++			continue;
++		}
++		if (id == SMEM_ENTRY_RPM_DESC) {
++			rep->rpm_item_offset = off;
++		}
++		if (id == SMEM_ENTRY_RPM_FIFO0 || id == SMEM_ENTRY_RPM_FIFO1) {
++			rep->rpm_fifo_seen++;
++		}
++		if (found < SMEM_PROBE_ENTRIES) {
++			rep->entries[found].id = id;
++			rep->entries[found].offset = off;
++			found++;
++		}
++	}
++	rep->found = found;
++
++	printf("SAGIT SMEM: ok magic=0x%x free=0x%x avail=0x%x entries=%u rpm_item=0x%x\n",
++	    rep->magic, rep->free_offset, rep->available, rep->found,
++	    rep->rpm_item_offset);
++	for (uint32_t i = 0; i < found && i < 8; i++) {
++		printf("SAGIT SMEM: toc[%u] id=%u off=0x%x\n",
++		    i, rep->entries[i].id, rep->entries[i].offset);
++	}
++
++	return 0;
++}
++
++/*
++ * Can the RPM message RAM be mapped? This is the second prerequisite; it is
++ * kept separate so a failure clearly points at the RAM rather than at SMEM.
++ */
++int
++sagit_smem_probe_rpm_ram(uint32_t *first_word)
++{
++	volatile uint32_t *ram;
++
++	ram = (volatile uint32_t *)ml_io_map(SAGIT_RPM_MSG_BASE,
++	    SAGIT_RPM_MSG_SIZE);
++	if (ram == NULL) {
++		printf("SAGIT SMEM: ml_io_map(rpm-ram) failed\n");
++		return ENOMEM;
++	}
++	if (first_word != NULL) {
++		*first_word = ram[0];
++	}
++	printf("SAGIT SMEM: rpm-ram ok [0]=0x%x\n", ram[0]);
++	return 0;
++}
++
++#endif /* SAGIT */
+diff --git a/bsd/dev/sagit_smem.h b/bsd/dev/sagit_smem.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sagit_smem.h
+--- /dev/null
++++ b/bsd/dev/sagit_smem.h
+@@ -0,0 +1,34 @@
++/*
++ * SAGIT SMEM: the result of the shared-memory probe.
++ *
++ * Kept separate from sagit_pmic.h so the I2C probe can report either or both
++ * without depending on each other.
++ */
++#ifndef _BSD_DEV_SAGIT_SMEM_H_
++#define _BSD_DEV_SAGIT_SMEM_H_
++
++#include <sys/types.h>
++
++#define SAGIT_SMEM_TOC_MAX      64
++
++struct sagit_smem_toc {
++	uint32_t id;
++	uint32_t offset;
++};
++
++struct sagit_smem_report {
++	int map_rc;             /* 0 = ml_io_map(SMEM) succeeded */
++	uint32_t magic;         /* smem_header.initialized; 0x494d4553 is good */
++	uint32_t free_offset;
++	uint32_t available;
++	uint32_t found;         /* entries copied into `entries` */
++	uint32_t total_entries; /* non-zero TOC entries seen */
++	uint32_t rpm_item_offset; /* offset of the G-Link descriptor item, 0 if absent */
++	uint32_t rpm_fifo_seen;   /* how many of the G-Link FIFO items exist */
++	struct sagit_smem_toc entries[SAGIT_SMEM_TOC_MAX];
++};
++
++int sagit_smem_probe(struct sagit_smem_report *rep);
++int sagit_smem_probe_rpm_ram(uint32_t *first_word);
++
++#endif /* _BSD_DEV_SAGIT_SMEM_H_ */
 diff --git a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -105,6 +105,8 @@
+@@ -105,6 +105,9 @@
  
  bsd/dev/memdev.c			standard
  bsd/dev/sagit_ufs.c			standard
 +bsd/dev/sagit_i2c.c			standard
 +bsd/dev/sagit_pmic.c			standard
++bsd/dev/sagit_smem.c			standard
  bsd/dev/sagit_crypto.c			standard
  bsd/dev/mem.c				standard
  bsd/dev/munge.c 			optional config_requires_u32_munging
