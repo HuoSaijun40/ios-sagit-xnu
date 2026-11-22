@@ -2193,7 +2193,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_smem.c
 --- /dev/null
 +++ b/bsd/dev/sagit_smem.c
-@@ -0,0 +1,191 @@
+@@ -0,0 +1,221 @@
 +/*
 + * SAGIT: probe whether SMEM is usable from this kernel.
 + *
@@ -2240,8 +2240,38 @@ new file mode 100644
 +#include "sagit_smem.h"
 +
 +extern void *phystokv(vm_offset_t pa);
++/* osfmk/arm64/arm_vm_init.c: the physmap window phystokv() accepts. */
++extern vm_offset_t gPhysBase;
++extern vm_size_t real_phys_size;
 +
 +#if defined(SAGIT)
++
++/*
++ * Map a physical RAM address for shared-memory access.
++ *
++ * Two traps, both already hit:
++ *
++ *  - phystokv() PANICS outside its window (v91):
++ *        phystokv: illegal PA: 0x86000000; phys base 0x10000000, size 0xd7e0000
++ *    XNU's physmap here covers ~216 MiB from 0x10000000, and SMEM lives at
++ *    0x86000000.
++ *  - ml_io_map() on DRAM is mapped as Device memory by pmap.c, so reads of
++ *    shared memory come back as 0 (v90).
++ *
++ * So translate only inside the window, and otherwise fall back to ml_io_map --
++ * unusable for coherence, but at least it reports instead of panicking.
++ */
++#define SMEM_PROBE_WINDOW       0x200000u
++
++static void *
++smem_ram_ptr(vm_offset_t pa)
++{
++	if (real_phys_size != 0 && pa >= gPhysBase &&
++	    (pa - gPhysBase) < real_phys_size) {
++		return phystokv(pa);
++	}
++	return (void *)ml_io_map(pa, SMEM_PROBE_WINDOW);
++}
 +
 +/* /soc/qcom,smem@86000000 in live.dtb */
 +#define SAGIT_SMEM_BASE         0x86000000ULL
@@ -2264,7 +2294,7 @@ new file mode 100644
 +#define SMEM_ENTRY_RPM_FIFO0    479u            /* XPRT_FIFO_0 */
 +#define SMEM_ENTRY_RPM_FIFO1    480u            /* XPRT_FIFO_1 */
 +
-+#define SMEM_PROBE_ENTRIES      64u             /* how many TOC slots to report */
++#define SMEM_PROBE_ENTRIES      SAGIT_SMEM_TOC_MAX  /* slots copied to the report */
 +
 +/*
 + * Read the SMEM header and a few table entries. Everything it learns goes into
@@ -2303,7 +2333,7 @@ new file mode 100644
 +	 * phystokv() returns the cached physmap alias, which is what normal RAM
 +	 * (and everything the bootloader wrote there) needs.
 +	 */
-+	smem = (volatile uint32_t *)phystokv(SAGIT_SMEM_BASE);
++	smem = (volatile uint32_t *)smem_ram_ptr(SAGIT_SMEM_BASE);
 +	if (smem == NULL) {
 +		rep->map_rc = ENOMEM;
 +		printf("SAGIT SMEM: phystokv(0x%llx) failed\n",
@@ -2372,7 +2402,7 @@ new file mode 100644
 +	volatile uint32_t *ram;
 +
 +	/* Also ordinary DRAM: physmap, not ml_io_map (see sagit_smem_probe). */
-+	ram = (volatile uint32_t *)phystokv(SAGIT_RPM_MSG_BASE);
++	ram = (volatile uint32_t *)smem_ram_ptr(SAGIT_RPM_MSG_BASE);
 +	if (ram == NULL) {
 +		printf("SAGIT SMEM: phystokv(rpm-ram) failed\n");
 +		return ENOMEM;
@@ -2484,3 +2514,30 @@ diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
  			if (SAGIT_UFS_PROBE == 1) {
  				panic("SAGIT probe 1: about to call sagit_ufs_rootdev");
  			}
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -541,6 +541,23 @@
+ 	sagit_early_mark(19, "serial_init returned");
+ 	kernel_startup_initialize_upto(STARTUP_SUB_KPRINTF);
+ 	kprintf("kprintf initialized\n");
++	/*
++	 * SAGIT DIAG (0081): what boot_args did this kernel really receive?
++	 *
++	 * The payload and the ADT both say phys base 0x100000000, size
++	 * 0xbd7c0000, but phystokv() here reported base 0x10000000 and size
++	 * 0xd7e0000. Either the pointer handed over by start.s is wrong, or the
++	 * struct was rewritten after the shim filled it in. Both the pointer and
++	 * the fields are printed so a single boot separates the two.
++	 */
++	kprintf("SAGIT BOOTARGS: p=%p rev=%u ver=%u virtBase=0x%llx "
++	    "physBase=0x%llx memSize=0x%llx memSizeActual=0x%llx topOfKernelData=0x%llx\n",
++	    (void *)args, args->Revision, args->Version,
++	    (unsigned long long)args->virtBase,
++	    (unsigned long long)args->physBase,
++	    (unsigned long long)args->memSize,
++	    (unsigned long long)args->memSizeActual,
++	    (unsigned long long)args->topOfKernelData);
+ 	sagit_early_mark(20, "kprintf startup complete");
+ 	if (serial_exists) {
+ 		sagit_early_disable();
