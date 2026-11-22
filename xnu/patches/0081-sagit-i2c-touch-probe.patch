@@ -2193,7 +2193,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_smem.c
 --- /dev/null
 +++ b/bsd/dev/sagit_smem.c
-@@ -0,0 +1,171 @@
+@@ -0,0 +1,191 @@
 +/*
 + * SAGIT: probe whether SMEM is usable from this kernel.
 + *
@@ -2239,7 +2239,7 @@ new file mode 100644
 +
 +#include "sagit_smem.h"
 +
-+extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern void *phystokv(vm_offset_t pa);
 +
 +#if defined(SAGIT)
 +
@@ -2283,10 +2283,30 @@ new file mode 100644
 +	}
 +	memset(rep, 0, sizeof(*rep));
 +
-+	smem = (volatile uint32_t *)ml_io_map(SAGIT_SMEM_BASE, SAGIT_SMEM_SIZE);
++	/*
++	 * SMEM lives in ordinary DRAM, so it must be read through the physmap --
++	 * NOT through ml_io_map().
++	 *
++	 * v90 mapped it with ml_io_map and read magic = 0x0 from a region that is
++	 * definitely initialised. osfmk/arm/pmap/pmap.c explains why:
++	 *
++	 *     case VM_WIMG_IO:
++	 *         // Map DRAM addresses with VM_WIMG_IO as Device-GRE instead of
++	 *         // Device-nGnRnE. ...
++	 *         if (is_dram_addr(pa)) {
++	 *             pte = ARM_PTE_ATTRINDX(CACHE_ATTRINDX_POSTED_COMBINED_REORDERED);
++	 *
++	 * i.e. asking for IO attributes on DRAM gives posted/combined Device
++	 * memory, whose reads are not coherent with normal cached memory -- the
++	 * shared-memory table another core wrote is invisible that way.
++	 *
++	 * phystokv() returns the cached physmap alias, which is what normal RAM
++	 * (and everything the bootloader wrote there) needs.
++	 */
++	smem = (volatile uint32_t *)phystokv(SAGIT_SMEM_BASE);
 +	if (smem == NULL) {
 +		rep->map_rc = ENOMEM;
-+		printf("SAGIT SMEM: ml_io_map(0x%llx) failed\n",
++		printf("SAGIT SMEM: phystokv(0x%llx) failed\n",
 +		    (uint64_t)SAGIT_SMEM_BASE);
 +		return ENOMEM;
 +	}
@@ -2351,10 +2371,10 @@ new file mode 100644
 +{
 +	volatile uint32_t *ram;
 +
-+	ram = (volatile uint32_t *)ml_io_map(SAGIT_RPM_MSG_BASE,
-+	    SAGIT_RPM_MSG_SIZE);
++	/* Also ordinary DRAM: physmap, not ml_io_map (see sagit_smem_probe). */
++	ram = (volatile uint32_t *)phystokv(SAGIT_RPM_MSG_BASE);
 +	if (ram == NULL) {
-+		printf("SAGIT SMEM: ml_io_map(rpm-ram) failed\n");
++		printf("SAGIT SMEM: phystokv(rpm-ram) failed\n");
 +		return ENOMEM;
 +	}
 +	if (first_word != NULL) {
