@@ -190,7 +190,7 @@ new file mode 100644
 +#define QUP_IO_PACK_EN          (1u << 15)
 +/*
 + * i2c-qup.c always starts from QUP_REPACK_EN and ORs the block-mode bits in:
-+ *     u32 io_mode = QUP_REPACK_EN;   /* = UNPACK_EN | PACK_EN *\/
++ *     u32 io_mode = QUP_REPACK_EN;   -- = UNPACK_EN | PACK_EN
 + * Without it the FIFO does not pack/unpack 32-bit words the way the tag
 + * protocol expects.
 + */
@@ -558,7 +558,7 @@ new file mode 100644
 +/*
 + * Change the QUP state exactly like qup_i2c_change_state():
 + *
-+ *     if (qup_i2c_poll_state_valid(qup) != 0) return -EIO;   /* VALID set *\/
++ *     if (qup_i2c_poll_state_valid(qup) != 0) return -EIO;   -- VALID set
 + *     writel(state, QUP_STATE);
 + *     if (qup_i2c_poll_state(qup, state) != 0) return -EIO;
 + *
@@ -1584,7 +1584,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_pmic.c
 --- /dev/null
 +++ b/bsd/dev/sagit_pmic.c
-@@ -0,0 +1,608 @@
+@@ -0,0 +1,626 @@
 +/*
 + * SAGIT: minimal SPMI write to power the touch controller's IO rail.
 + *
@@ -1962,9 +1962,6 @@ new file mode 100644
 +	if (pmic.cnfg != NULL) {
 +		uint32_t owner = pmic.cnfg[SPMI_OWNERSHIP_TABLE(apid) / 4];
 +
-+		if (rep != NULL) {
-+			rep->owner = owner;
-+		}
 +		printf("SAGIT PMIC: apid 0x%x owner raw=0x%x ee=%u\n",
 +		    apid, owner, owner & SPMI_EE_MASK);
 +		if ((owner & SPMI_EE_MASK) != SAGIT_SPMI_EE) {
@@ -2123,6 +2120,27 @@ new file mode 100644
 +		return ENOENT;
 +	}
 +	pmic.apid = (uint32_t)apid;
++
++	/*
++	 * Ownership gate, once, before any write. A store into an APID owned by
++	 * another EE raises an access violation and hangs the core; it never
++	 * returns an error, so it cannot be handled inside spmi_write_byte().
++	 */
++	if (pmic.cnfg != NULL) {
++		uint32_t owner = pmic.cnfg[SPMI_OWNERSHIP_TABLE(pmic.apid) / 4];
++
++		if (rep != NULL) {
++			rep->owner = owner;
++		}
++		printf("SAGIT PMIC: apid 0x%x owner raw=0x%x ee=%u\n",
++		    pmic.apid, owner, owner & SPMI_EE_MASK);
++		if ((owner & SPMI_EE_MASK) != SAGIT_SPMI_EE) {
++			printf("SAGIT PMIC: apid 0x%x owned by ee %u, not %u: "
++			    "refusing to write\n",
++			    pmic.apid, owner & SPMI_EE_MASK, SAGIT_SPMI_EE);
++			return EPERM;
++		}
++	}
 +
 +	/*
 +	 * Set the output voltage before enabling. PM8998 LDO6 is a PMOS LDO
