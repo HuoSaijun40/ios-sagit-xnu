@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1670 @@
+@@ -0,0 +1,1679 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -264,6 +264,9 @@ new file mode 100644
 +	uint32_t smem_entries;
 +	uint32_t smem_rpm_item;
 +	uint32_t rpm_ram_rc;
++	uint32_t rpm_toc_magic;         /* RPM msg RAM TOC magic ("grt0" if cached OK) */
++	uint32_t rpm_toc_count;
++	uint32_t rpm_w0, rpm_w1;        /* first words of RPM msg RAM */
 +	uint32_t phys_base;             /* gPhysBase XNU is running with */
 +	uint32_t phys_size;             /* real_phys_size of the same */
 +	uint32_t stop_at;               /* sagit_tstop=N: panic on entering N */
@@ -1280,6 +1283,7 @@ new file mode 100644
 +	    "ldo(rg/sv/ty/st)=0x%x/0x%x/0x%x/0x%x "
 +	    "avdd_on(cfg/io)=0x%x/0x%x "
 +	    "smem(rc/magic/toc/rpm/ram)=%d/0x%x/%u/0x%x/%d "
++	    "rpm(toc/cnt/w0/w1)=0x%x/%u/0x%x/0x%x "
 +	    "physmap(base/size)=0x%x/0x%x",
 +	    what,
 +	    SAGIT_PIN_SCL, scl_cfg, scl_io,
@@ -1302,6 +1306,7 @@ new file mode 100644
 +	    si2c.avdd_cfg_after, si2c.avdd_io_after,
 +	    (int)si2c.smem_rc, si2c.smem_magic, si2c.smem_entries,
 +	    si2c.smem_rpm_item, (int)si2c.rpm_ram_rc,
++	    si2c.rpm_toc_magic, si2c.rpm_toc_count, si2c.rpm_w0, si2c.rpm_w1,
 +	    si2c.phys_base, si2c.phys_size);
 +	printf("SAGIT SMEM2: rc=%d magic=0x%x toc=%u rpm_item=0x%x ram_rc=%d "
 +	    "physmap=0x%x/0x%x\n",
@@ -1330,7 +1335,7 @@ new file mode 100644
 +	 */
 +	{
 +		struct sagit_smem_report sr;
-+		uint32_t ram0 = 0;
++		struct sagit_rpm_ram_report rr;
 +		vm_offset_t pb = 0;
 +		vm_size_t ps = 0;
 +
@@ -1343,7 +1348,11 @@ new file mode 100644
 +			si2c.smem_magic = sr.magic;
 +			si2c.smem_entries = sr.found;
 +			si2c.smem_rpm_item = sr.rpm_item_offset;
-+			si2c.rpm_ram_rc = (uint32_t)sagit_smem_probe_rpm_ram(&ram0);
++			si2c.rpm_ram_rc = (uint32_t)sagit_smem_probe_rpm_ram(&rr);
++			si2c.rpm_toc_magic = rr.toc_magic;
++			si2c.rpm_toc_count = rr.toc_count;
++			si2c.rpm_w0 = rr.w0;
++			si2c.rpm_w1 = rr.w1;
 +		}
 +	}
 +
@@ -2205,7 +2214,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_smem.c
 --- /dev/null
 +++ b/bsd/dev/sagit_smem.c
-@@ -0,0 +1,242 @@
+@@ -0,0 +1,265 @@
 +/*
 + * SAGIT: probe whether SMEM is usable from this kernel.
 + *
@@ -2252,8 +2261,16 @@ new file mode 100644
 +#include "sagit_smem.h"
 +
 +extern void *phystokv(vm_offset_t pa);
-+/* osfmk/arm/machine_routines.h provides this, but it is not exported to BSD. */
++/* osfmk/arm/machine_routines.h provides these, but they are not exported to
++ * BSD: every driver has to declare its own extern (the v92 lesson). */
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size,
++    uint32_t flags);
++/* osfmk/arm/memory_types.h: coherent/normal cache attributes. Using the
++ * default (cacheable) attribute is what lets us read DRAM that the bootloader
++ * wrote: ml_io_map()'s VM_WIMG_IO maps DRAM as Device (pmap.c:5649) and reads
++ * come back as zero. */
++#define SAGIT_WIMG_DEFAULT 0x2u     /* VM_WIMG_DEFAULT = VM_MEM_COHERENT */
 +/* osfmk/arm64/arm_vm_init.c: the physmap window phystokv() accepts. */
 +extern vm_offset_t gPhysBase;
 +extern vm_size_t real_phys_size;
@@ -2272,8 +2289,11 @@ new file mode 100644
 + *  - ml_io_map() on DRAM is mapped as Device memory by pmap.c, so reads of
 + *    shared memory come back as 0 (v90).
 + *
-+ * So translate only inside the window, and otherwise fall back to ml_io_map --
-+ * unusable for coherence, but at least it reports instead of panicking.
++ * So translate only inside the window. Outside it, map with the DEFAULT
++ * (coherent, cacheable) attribute rather than VM_WIMG_IO: pmap.c:5649
++ * downgrades VM_WIMG_IO on DRAM to a Device mapping, which is why v90/v94
++ * read zeros from an initialised SMEM. VM_MEM_COHERENT gives a normal
++ * cached alias and lets the bootloader's writes become visible.
 + */
 +#define SMEM_PROBE_WINDOW       0x200000u
 +
@@ -2284,7 +2304,8 @@ new file mode 100644
 +	    (pa - gPhysBase) < real_phys_size) {
 +		return phystokv(pa);
 +	}
-+	return (void *)ml_io_map(pa, SMEM_PROBE_WINDOW);
++	return (void *)ml_io_map_unmappable(pa, SMEM_PROBE_WINDOW,
++	    SAGIT_WIMG_DEFAULT);
 +}
 +
 +/*
@@ -2311,7 +2332,8 @@ new file mode 100644
 +#define SAGIT_SMEM_SIZE         0x200000ULL
 +/* /soc/rpm-memory@0x778000, compatible qcom,rpm-code-ram */
 +#define SAGIT_RPM_MSG_BASE      0x778000ULL
-+#define SAGIT_RPM_MSG_SIZE      0x5000ULL
++#define SAGIT_RPM_MSG_SIZE      0x7000ULL   /* DT: glink-rpm-native-xprt reg */
++#define RPM_TOC_MAGIC           0x67727430u /* "grt0" */
 +
 +#define SMEM_MAGIC              0x494d4553u     /* "SMEM" */
 +#define SMEM_TOC_OFFSET         0xd0u
@@ -2430,20 +2452,30 @@ new file mode 100644
 + * kept separate so a failure clearly points at the RAM rather than at SMEM.
 + */
 +int
-+sagit_smem_probe_rpm_ram(uint32_t *first_word)
++sagit_smem_probe_rpm_ram(struct sagit_rpm_ram_report *rep)
 +{
 +	volatile uint32_t *ram;
++	volatile uint32_t *toc;
 +
-+	/* Also ordinary DRAM: physmap, not ml_io_map (see sagit_smem_probe). */
++	/* Ordinary DRAM: cached alias via smem_ram_ptr (see sagit_smem_probe). */
 +	ram = (volatile uint32_t *)smem_ram_ptr(SAGIT_RPM_MSG_BASE);
 +	if (ram == NULL) {
-+		printf("SAGIT SMEM: phystokv(rpm-ram) failed\n");
++		printf("SAGIT SMEM: rpm-ram map failed\n");
 +		return ENOMEM;
 +	}
-+	if (first_word != NULL) {
-+		*first_word = ram[0];
++	/* TOC is the last 256 bytes of the RAM (qcom_glink_rpm.c). */
++	toc = ram + (SAGIT_RPM_MSG_SIZE - 0x100) / 4;
++	if (rep != NULL) {
++		__asm__ volatile("dsb sy" ::: "memory");
++		rep->toc_magic = toc[0];
++		rep->toc_count = toc[1];
++		rep->w0 = ram[0];
++		rep->w1 = ram[1];
++		rep->w2 = ram[2];
 +	}
-+	printf("SAGIT SMEM: rpm-ram ok [0]=0x%x\n", ram[0]);
++	printf("SAGIT SMEM: rpm-ram toc=0x%x count=%u w0=0x%x w1=0x%x w2=0x%x\n",
++	    rep ? rep->toc_magic : 0, rep ? rep->toc_count : 0,
++	    rep ? rep->w0 : 0, rep ? rep->w1 : 0, rep ? rep->w2 : 0);
 +	return 0;
 +}
 +
@@ -2454,7 +2486,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_smem.h
 --- /dev/null
 +++ b/bsd/dev/sagit_smem.h
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,44 @@
 +/*
 + * SAGIT SMEM: the result of the shared-memory probe.
 + *
@@ -2486,7 +2518,15 @@ new file mode 100644
 +};
 +
 +int sagit_smem_probe(struct sagit_smem_report *rep);
-+int sagit_smem_probe_rpm_ram(uint32_t *first_word);
++
++/* Raw RPM message RAM words, read through the cached alias, for the panic
++ * string. TOC magic lives at the last 256 bytes of the 0x7000-byte RAM. */
++struct sagit_rpm_ram_report {
++	uint32_t toc_magic;     /* expect 0x67727430 "grt0" when coherent */
++	uint32_t toc_count;
++	uint32_t w0, w1, w2;    /* first words of the RAM */
++};
++int sagit_smem_probe_rpm_ram(struct sagit_rpm_ram_report *rep);
 +/* The physmap window XNU is running with (gPhysBase / real_phys_size). */
 +void sagit_smem_physmap(vm_offset_t *base, vm_size_t *size);
 +
