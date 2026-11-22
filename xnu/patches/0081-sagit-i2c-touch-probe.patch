@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1617 @@
+@@ -0,0 +1,1630 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -1447,35 +1447,48 @@ new file mode 100644
 +	 */
 +	si2c_wait_ms(10);
 +	/*
-+	 * The touch 'vdd' rail is PM8998 LDO6, behind the SPMI bus. v65 proved
-+	 * every other link good (reset finally driven high) yet both addresses
-+	 * still timed out with qerr=0, so this rail is the missing piece.
++	 * PM8998 LDO6 is NOT reachable over SPMI as a peripheral.
++	 *
++	 * v87 proved it: driver pm8998_l6 is declared as
++	 *     { "l6", QCOM_SMD_RPM_LDOA, 6, &pm8998_pldo, "vdd_l6" }
++	 * in qcom_smd-regulator.c -- an RPM/SMD resource -- and
++	 * qcom_spmi-regulator.c contains no pm8998 table at all. So there is no
++	 * APID for PPID 0x45, which is exactly what the probe kept reporting
++	 * (apid=0xffffffff, rc=ENOENT); the earlier apid=0x28 came from the
++	 * high-nibble fallback and pointed at an unrelated peripheral.
++	 *
++	 * Turning LDO6 on therefore needs RPM-SMD, a separate subsystem. Until
++	 * then the touch part is powered by what the bootloader left plus the
++	 * U1100 load switch that gpio 50 enables, and that is enough to find out
++	 * whether the chip answers I2C at all.
++	 *
++	 * sagit_pmic=1 re-enables the old SPMI attempt for experiments.
 +	 */
 +	{
-+		struct sagit_pmic_report pmr;
-+		int prc;
++		int want_pmic = 0;
 +
-+		memset(&pmr, 0, sizeof(pmr));
-+		prc = sagit_pmic_ldo6_on(&pmr);
-+		/*
-+		 * Keep the result in si2c as well: v68/v69 showed no SAGIT PMIC
-+		 * line on screen at all, so the only reliable carrier of this
-+		 * data is the panic string itself.
-+		 */
-+		si2c.pmic_rc = (uint32_t)prc;
-+		si2c.pmic_ver = pmr.version;
-+		si2c.pmic_apid = pmr.apid;
-+		si2c.pmic_st = pmr.enable_status;
-+		si2c.pmic_en_rb = pmr.enable_rb;
-+		si2c.pmic_md_rb = pmr.mode_rb;
-+		si2c.pmic_owner = pmr.owner;
-+		si2c.pmic_md_before = pmr.mode_before;
-+		si2c.pmic_rg_rb = pmr.range_rb;
-+		si2c.pmic_sv_rb = pmr.set_rb;
-+		si2c.pmic_type_rb = pmr.type_rb;
-+		si2c.pmic_subtype_rb = pmr.subtype_rb;
-+		printf("SAGIT PMIC: ldo6 rc=%d ver=0x%x apid=0x%x en_st=0x%x\n",
-+		    prc, pmr.version, pmr.apid, pmr.enable_status);
++		PE_parse_boot_argn("sagit_pmic", &want_pmic, sizeof(want_pmic));
++		if (want_pmic != 0) {
++			struct sagit_pmic_report pmr;
++			int prc;
++
++			memset(&pmr, 0, sizeof(pmr));
++			prc = sagit_pmic_ldo6_on(&pmr);
++			si2c.pmic_rc = (uint32_t)prc;
++			si2c.pmic_ver = pmr.version;
++			si2c.pmic_apid = pmr.apid;
++			si2c.pmic_st = pmr.enable_status;
++			si2c.pmic_en_rb = pmr.enable_rb;
++			si2c.pmic_md_rb = pmr.mode_rb;
++			si2c.pmic_owner = pmr.owner;
++			si2c.pmic_md_before = pmr.mode_before;
++			si2c.pmic_rg_rb = pmr.range_rb;
++			si2c.pmic_sv_rb = pmr.set_rb;
++			si2c.pmic_type_rb = pmr.type_rb;
++			si2c.pmic_subtype_rb = pmr.subtype_rb;
++		} else {
++			si2c.pmic_rc = 0xffff0000u;     /* skipped on purpose */
++		}
 +	}
 +	si2c_stage(5);
 +	printf("SAGIT I2C 5/9 avdd after: cfg=0x%x io=0x%x\n",
