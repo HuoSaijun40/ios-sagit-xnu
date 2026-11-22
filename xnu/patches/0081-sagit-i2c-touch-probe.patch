@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1682 @@
+@@ -0,0 +1,1697 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -48,6 +48,7 @@ new file mode 100644
 +
 +#include "sagit_pmic.h"
 +#include "sagit_smem.h"
++#include "sagit_glink.h"
 +
 +/* osfmk/arm/machine_routines.h, not exported to the BSD layer (same as UFS). */
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -267,6 +268,9 @@ new file mode 100644
 +	uint32_t rpm_toc_magic;         /* RPM msg RAM TOC magic ("grt0" if cached OK) */
 +	uint32_t rpm_toc_count;
 +	uint32_t rpm_w0, rpm_w1;        /* first words of RPM msg RAM */
++	uint32_t glink_rc;              /* sagit_glink_ldo6_on() result: 0=ok */
++	uint32_t glink_state;           /* handshake milestone bitmask */
++	uint32_t glink_ack;             /* last ack msg_id seen */
 +	uint32_t phys_base;             /* gPhysBase XNU is running with */
 +	uint32_t phys_size;             /* real_phys_size of the same */
 +	uint32_t stop_at;               /* sagit_tstop=N: panic on entering N */
@@ -1284,6 +1288,7 @@ new file mode 100644
 +	    "avdd_on(cfg/io)=0x%x/0x%x "
 +	    "smem(rc/magic/toc/rpm/ram)=%d/0x%x/%u/0x%x/%d "
 +	    "rpm(toc/cnt/w0/w1)=0x%x/%u/0x%x/0x%x "
++	    "glink(rc/st/ack)=%d/0x%x/%u "
 +	    "physmap(base/size)=0x%x/0x%x",
 +	    what,
 +	    SAGIT_PIN_SCL, scl_cfg, scl_io,
@@ -1307,6 +1312,7 @@ new file mode 100644
 +	    (int)si2c.smem_rc, si2c.smem_magic, si2c.smem_entries,
 +	    si2c.smem_rpm_item, (int)si2c.rpm_ram_rc,
 +	    si2c.rpm_toc_magic, si2c.rpm_toc_count, si2c.rpm_w0, si2c.rpm_w1,
++	    (int)si2c.glink_rc, si2c.glink_state, si2c.glink_ack,
 +	    si2c.phys_base, si2c.phys_size);
 +	printf("SAGIT SMEM2: rc=%d magic=0x%x toc=%u rpm_item=0x%x ram_rc=%d "
 +	    "physmap=0x%x/0x%x\n",
@@ -1357,6 +1363,15 @@ new file mode 100644
 +		si2c.rpm_toc_count = rr.toc_count;
 +		si2c.rpm_w0 = rr.w0;
 +		si2c.rpm_w1 = rr.w1;
++
++		/* Vote PM8998 LDO6 (touch vdd) on through the RPM over G-Link.
++		 * All access uses the cached alias already proven by the TOC read. */
++		{
++			struct sagit_glink_report gr;
++			si2c.glink_rc = (uint32_t)sagit_glink_ldo6_on(&gr);
++			si2c.glink_state = gr.state;
++			si2c.glink_ack = gr.ack_msg_id;
++		}
 +	}
 +
 +	/*
@@ -2300,8 +2315,8 @@ new file mode 100644
 + */
 +#define SMEM_PROBE_WINDOW       0x200000u
 +
-+static void *
-+smem_ram_ptr(vm_offset_t pa)
++void *
++sagit_smem_ram_ptr(vm_offset_t pa)
 +{
 +	if (real_phys_size != 0 && pa >= gPhysBase &&
 +	    (pa - gPhysBase) < real_phys_size) {
@@ -2393,7 +2408,7 @@ new file mode 100644
 +	 * phystokv() returns the cached physmap alias, which is what normal RAM
 +	 * (and everything the bootloader wrote there) needs.
 +	 */
-+	smem = (volatile uint32_t *)smem_ram_ptr(SAGIT_SMEM_BASE);
++	smem = (volatile uint32_t *)sagit_smem_ram_ptr(SAGIT_SMEM_BASE);
 +	if (smem == NULL) {
 +		rep->map_rc = ENOMEM;
 +		printf("SAGIT SMEM: phystokv(0x%llx) failed\n",
@@ -2462,7 +2477,7 @@ new file mode 100644
 +	volatile uint32_t *toc;
 +
 +	/* Ordinary DRAM: cached alias via smem_ram_ptr (see sagit_smem_probe). */
-+	ram = (volatile uint32_t *)smem_ram_ptr(SAGIT_RPM_MSG_BASE);
++	ram = (volatile uint32_t *)sagit_smem_ram_ptr(SAGIT_RPM_MSG_BASE);
 +	if (ram == NULL) {
 +		printf("SAGIT SMEM: rpm-ram map failed\n");
 +		return ENOMEM;
@@ -2490,7 +2505,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_smem.h
 --- /dev/null
 +++ b/bsd/dev/sagit_smem.h
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,47 @@
 +/*
 + * SAGIT SMEM: the result of the shared-memory probe.
 + *
@@ -2531,20 +2546,500 @@ new file mode 100644
 +	uint32_t w0, w1, w2;    /* first words of the RAM */
 +};
 +int sagit_smem_probe_rpm_ram(struct sagit_rpm_ram_report *rep);
++/* Cached (coherent) alias for an arbitrary physical DRAM address, for
++ * shared-memory access that phystokv() cannot cover. */
++void *sagit_smem_ram_ptr(vm_offset_t pa);
 +/* The physmap window XNU is running with (gPhysBase / real_phys_size). */
 +void sagit_smem_physmap(vm_offset_t *base, vm_size_t *size);
 +
 +#endif /* _BSD_DEV_SAGIT_SMEM_H_ */
+diff --git a/bsd/dev/sagit_glink.c b/bsd/dev/sagit_glink.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sagit_glink.c
+--- /dev/null
++++ b/bsd/dev/sagit_glink.c
+@@ -0,0 +1,428 @@
++/*
++ * SAGIT: minimal G-Link over RPM message RAM, from the XNU BSD layer.
++ *
++ * Port of Linux drivers/soc/qcom/qcom_glink_rpm.c + qcom_glink_native.c and
++ * U-Boot drivers/soc/qcom/smd-rpm.c (Igor Opaniuk 2026). Only what is needed
++ * to vote PM8998 LDO6 ("ldoa":6, the Synaptics S3330 touch vdd rail) on.
++ *
++ * The RPM message RAM at 0x778000 is NOT in XNU's physmap window, so all
++ * access goes through sagit_smem_ram_ptr() -- a VM_MEM_COHERENT cached alias
++ * (v97 proved this works: TOC magic "grt0" was read from the BSD layer).
++ *
++ * Layout (verified against the DT and the v97 panic string):
++ *   msg RAM          0x778000, size 0x7000
++ *   TOC              msg_ram + 0x7000 - 0x100, magic 0x67727430 "grt0"
++ *   TOC entries      { id, offset, size }, id "ap2r"=TX (AP->RPM), "r2ap"=RX
++ *   each FIFO        [tail u32][head u32][data...] at entry offset
++ *   GLINK message    {cmd:u16,param1:u16,param2:u32} (+ data for TX_DATA)
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++
++#include "sagit_smem.h"
++#include "sagit_glink.h"
++
++#if defined(SAGIT)
++
++#define MSG_RAM_BASE     0x778000ULL
++#define MSG_RAM_SIZE     0x7000ULL
++
++#define RPM_TOC_SIZE      0x100ULL
++#define RPM_TOC_MAGIC     0x67727430ULL  /* "grt0" */
++#define RPM_TOC_HDR       0x08ULL
++#define RPM_TOC_ENTRY_SZ  0x0cULL
++#define RPM_TX_FIFO_ID    0x61703272ULL  /* "ap2r" */
++#define RPM_RX_FIFO_ID    0x72326170ULL  /* "r2ap" */
++
++#define GLINK_VERSION_1   1
++#define GCMD_VERSION      0
++#define GCMD_VERSION_ACK  1
++#define GCMD_OPEN         2
++#define GCMD_CLOSE        3
++#define GCMD_OPEN_ACK     4
++#define GCMD_INTENT       5
++#define GCMD_RX_DONE      6
++#define GCMD_RXI_REQ      7
++#define GCMD_RXI_REQ_ACK  8
++#define GCMD_TX_DATA      9
++#define GCMD_CLOSE_ACK    11
++#define GCMD_TX_DATA_CONT 12
++#define GCMD_READ_NOTIF   13
++#define GCMD_RX_DONE_REUSE 14
++#define GCMD_SIGNALS      15
++
++#define CHAN_NAME        "rpm_requests"
++#define CHAN_LCID        1
++
++#define RPM_SVC_REQUEST  0x00716572UL   /* "req\0" */
++#define RPM_KEY_SWEN     0x6e657773UL   /* "swen" */
++#define RPM_KEY_UV       0x00007675UL   /* "uv"   */
++#define RPM_RES_LDOA     0x616f646cUL   /* "ldoa" */
++#define LDO6_ID          6
++#define LDO6_UV          1800000UL
++#define RPM_MSG_TYPE_ID  0x2367736dUL   /* "msg#" */
++
++/* Keep modest: 2e8 spins triggered the SoC watchdog in v95ldo6 (shim).
++ * With the cached alias the RPM replies fast, so 2e6 is ample. */
++#define SPIN_BUDGET      2000000ULL
++
++struct gl_fifo {
++	volatile uint32_t *tail;
++	volatile uint32_t *head;
++	uint8_t *data;
++	uint32_t len;
++};
++
++static struct gl_fifo tx_f, rx_f;
++static uint16_t remote_cid;
++static int remote_open, open_acked, req_acked;
++static uint32_t seen_msg_id;
++static struct sagit_glink_report *g_rep;
++
++/* Cached alias: use dsb to make FIFO index writes observable to the RPM. */
++static inline uint32_t rd32(volatile uint32_t *a)
++{
++	uint32_t v = *a;
++	__asm__ volatile("dsb sy" ::: "memory");
++	return v;
++}
++static inline void wr32(volatile uint32_t *a, uint32_t v)
++{
++	*a = v;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static int str_eq(const char *a, const char *b)
++{
++	while (*a && *b) {
++		if (*a != *b) return 0;
++		a++; b++;
++	}
++	return *a == *b;
++}
++static uint32_t str_len(const char *s)
++{
++	uint32_t n = 0;
++	while (s[n]) n++;
++	return n;
++}
++
++/* Correct ring semantics. head==tail => empty (both directions). */
++static inline uint32_t fifo_data(volatile uint32_t *head, volatile uint32_t *tail, uint32_t len)
++{
++	uint32_t h = rd32(head), t = rd32(tail);
++	return (h + len - t) % len;
++}
++static inline uint32_t fifo_space(volatile uint32_t *head, volatile uint32_t *tail, uint32_t len)
++{
++	return len - 1 - fifo_data(head, tail, len);
++}
++
++/* Parse the RPM TOC and locate the TX/RX FIFOs. Linux qcom_glink_rpm.c:190. */
++static int
++glink_parse_toc(uint8_t *msg, struct sagit_glink_report *rep)
++{
++	volatile uint32_t *toc = (volatile uint32_t *)(msg + MSG_RAM_SIZE - RPM_TOC_SIZE);
++	uint32_t magic = rd32(&toc[0]);
++	uint32_t count = rd32(&toc[1]);
++	uint32_t i;
++
++	rep->toc_magic = magic;
++	if (magic != RPM_TOC_MAGIC)
++		return -1;
++	if (count > (RPM_TOC_SIZE - RPM_TOC_HDR) / RPM_TOC_ENTRY_SZ)
++		return -2;
++	rep->nentries = count;
++
++	for (i = 0; i < count; i++) {
++		volatile uint32_t *e = &toc[2] + i * (RPM_TOC_ENTRY_SZ / 4);
++		uint32_t id = rd32(&e[0]);
++		uint32_t off = rd32(&e[1]);
++		uint32_t sz = rd32(&e[2]);
++		struct gl_fifo *f = NULL;
++
++		if (id == RPM_TX_FIFO_ID) f = &tx_f;
++		else if (id == RPM_RX_FIFO_ID) f = &rx_f;
++		else continue;
++		if (off > MSG_RAM_SIZE || sz < 8 || off + sz > MSG_RAM_SIZE)
++			continue;
++		f->tail = (volatile uint32_t *)(msg + off);
++		f->head = (volatile uint32_t *)(msg + off + 4);
++		f->data = (uint8_t *)(msg + off + 8);
++		f->len = sz - 8;
++	}
++	if (tx_f.data == NULL || rx_f.data == NULL)
++		return -3;
++	rep->tx_len = tx_f.len;
++	rep->rx_len = rx_f.len;
++	return 0;
++}
++
++/* Write hdr+data to the TX FIFO (padded to 8), advance head. */
++static int
++tx_write(const void *hdr, uint32_t hlen, const void *data, uint32_t dlen)
++{
++	uint8_t buf[64];
++	uint32_t len = (hlen + dlen + 7) & ~7u;
++	uint32_t h, i, word;
++	uint64_t spin;
++
++	if (len > sizeof(buf) || len >= tx_f.len)
++		return -1;
++	for (i = 0; i < sizeof(buf); i++) buf[i] = 0;
++	for (i = 0; i < hlen; i++) buf[i] = ((const uint8_t *)hdr)[i];
++	for (i = 0; i < dlen; i++) buf[hlen + i] = ((const uint8_t *)data)[i];
++
++	for (spin = 0; fifo_space(tx_f.head, tx_f.tail, tx_f.len) < len; spin++) {
++		if (spin > SPIN_BUDGET) return -2;
++	}
++	h = rd32(tx_f.head);
++	for (i = 0; i < len; i += 4) {
++		word = (uint32_t)buf[i] | ((uint32_t)buf[i+1] << 8) |
++		       ((uint32_t)buf[i+2] << 16) | ((uint32_t)buf[i+3] << 24);
++		wr32((volatile uint32_t *)(tx_f.data + h), word);
++		h += 4;
++		if (h >= tx_f.len) h = 0;
++	}
++	wr32(tx_f.head, h);   /* head write is the notification (no doorbell) */
++	return 0;
++}
++
++struct glmsg { uint16_t cmd, param1; uint32_t param2; } __attribute__((packed));
++
++static int send_cmd(uint16_t cmd, uint16_t p1, uint32_t p2)
++{
++	struct glmsg m = { cmd, p1, p2 };
++	return tx_write(&m, sizeof(m), NULL, 0);
++}
++
++static void rx_peek(uint32_t off, void *dst, uint32_t n)
++{
++	uint32_t t = rd32(rx_f.tail);
++	uint32_t pos = (t + off) % rx_f.len;
++	uint8_t *b = dst;
++	while (n) {
++		uint32_t w = rd32((volatile uint32_t *)(rx_f.data + pos));
++		uint32_t k = n < 4 ? n : 4;
++		uint32_t i;
++		for (i = 0; i < k; i++) b[i] = (uint8_t)(w >> (8 * i));
++		b += k; n -= k; pos += 4;
++		if (pos >= rx_f.len) pos = 0;
++	}
++}
++
++static void rx_advance(uint32_t n)
++{
++	uint32_t t = rd32(rx_f.tail);
++	wr32(rx_f.tail, (t + n) % rx_f.len);
++}
++
++/* Parse an RPM response payload for a "msg#" ack entry. */
++static void
++parse_rpm_ack(uint8_t *payload, uint32_t ch)
++{
++	uint32_t off;
++	for (off = 8; off + 8 <= ch; ) {
++		uint32_t mt = payload[off] | ((uint32_t)payload[off+1] << 8) |
++		              ((uint32_t)payload[off+2] << 16) | ((uint32_t)payload[off+3] << 24);
++		uint32_t ml = payload[off+4] | ((uint32_t)payload[off+5] << 8) |
++		              ((uint32_t)payload[off+6] << 16) | ((uint32_t)payload[off+7] << 24);
++		if (mt == RPM_MSG_TYPE_ID && ml >= 4 && off + 12 <= ch) {
++			seen_msg_id = payload[off+8] | ((uint32_t)payload[off+9] << 8) |
++			              ((uint32_t)payload[off+10] << 16) | ((uint32_t)payload[off+11] << 24);
++			req_acked = 1;
++		}
++		off += 8 + ((ml + 3) & ~3u);
++	}
++}
++
++/* Drain GLINK control messages from RX. */
++static void
++rx_pump(void)
++{
++	uint32_t guard;
++	for (guard = 0; guard < 256; guard++) {
++		struct glmsg m;
++		uint32_t avail;
++		if (rd32(rx_f.head) == rd32(rx_f.tail)) return;  /* true empty */
++		avail = fifo_data(rx_f.head, rx_f.tail, rx_f.len);
++		if (avail < sizeof(m)) return;
++		rx_peek(0, &m, sizeof(m));
++		switch (m.cmd) {
++		case GCMD_VERSION:
++			rx_advance(sizeof(m));
++			if (m.param1)
++				send_cmd(GCMD_VERSION_ACK, GLINK_VERSION_1, 0);
++			break;
++		case GCMD_VERSION_ACK:
++			rx_advance(sizeof(m));
++			if (g_rep) g_rep->state |= SAGIT_GLINK_ST_VERSION;
++			break;
++		case GCMD_OPEN: {
++			uint32_t extra = m.param2 & 0xffff;
++			uint32_t n = extra < 31 ? extra : 31;
++			char name[32];
++			uint32_t i;
++			for (i = 0; i < sizeof(name); i++) name[i] = 0;
++			extra = (extra + 7) & ~7u;
++			if (avail < sizeof(m) + extra) return;
++			rx_peek(sizeof(m), name, n);
++			rx_advance(sizeof(m) + extra);
++			if (str_eq(name, CHAN_NAME)) {
++				remote_cid = m.param1;
++				remote_open = 1;
++			}
++			break;
++		}
++		case GCMD_OPEN_ACK:
++			rx_advance(sizeof(m));
++			if (m.param1 == CHAN_LCID) open_acked = 1;
++			break;
++		case GCMD_INTENT:
++			rx_advance(sizeof(m) + ((m.param2 * 8 + 7) & ~7u));
++			break;
++		case GCMD_READ_NOTIF:
++			rx_advance(sizeof(m));
++			break;
++		case GCMD_TX_DATA:
++		case GCMD_TX_DATA_CONT: {
++			uint32_t ch, total;
++			uint8_t payload[64];
++			if (avail < 16) return;
++			rx_peek(8, &ch, 4);
++			total = 16 + ((ch + 7) & ~7u);
++			if (avail < total) return;
++			if (ch <= sizeof(payload)) {
++				rx_peek(16, payload, ch);
++				parse_rpm_ack(payload, ch);
++			}
++			rx_advance(total);
++			break;
++		}
++		default:
++			rx_advance(sizeof(m));
++			break;
++		}
++	}
++}
++
++static int wait_until(int (*done)(void))
++{
++	uint64_t spin;
++	for (spin = 0; spin < SPIN_BUDGET; spin++) {
++		rx_pump();
++		if (done()) return 0;
++	}
++	return -1;
++}
++static int is_remote_open(void) { return remote_open; }
++static int is_open_ack(void)    { return open_acked; }
++
++/* Send one RPM resource request and wait for the matching "msg#" ack. */
++static int
++rpm_request(uint32_t msg_id, uint32_t type, uint32_t id, uint32_t key, uint32_t value)
++{
++	uint8_t pkt[48];
++	uint32_t kv[3] = { key, 4, value };
++	uint32_t rlen = 20, dlen = 12, n = 0, w;
++	uint32_t i, j;
++	uint64_t spin;
++
++	w = RPM_SVC_REQUEST;
++	for (i = 0; i < 4; i++) pkt[n++] = (uint8_t)(w >> (8*i));
++	w = rlen + dlen;
++	for (i = 0; i < 4; i++) pkt[n++] = (uint8_t)(w >> (8*i));
++	w = msg_id;
++	for (i = 0; i < 4; i++) pkt[n++] = (uint8_t)(w >> (8*i));
++	w = 0;  /* ACTIVE state */
++	for (i = 0; i < 4; i++) pkt[n++] = (uint8_t)(w >> (8*i));
++	w = type;
++	for (i = 0; i < 4; i++) pkt[n++] = (uint8_t)(w >> (8*i));
++	w = id;
++	for (i = 0; i < 4; i++) pkt[n++] = (uint8_t)(w >> (8*i));
++	w = dlen;
++	for (i = 0; i < 4; i++) pkt[n++] = (uint8_t)(w >> (8*i));
++	for (i = 0; i < 3; i++) {
++		w = kv[i];
++		for (j = 0; j < 4; j++) pkt[n++] = (uint8_t)(w >> (8*j));
++	}
++	{
++		struct { struct glmsg m; uint32_t chunk, left; } gh;
++		gh.m.cmd = GCMD_TX_DATA; gh.m.param1 = CHAN_LCID; gh.m.param2 = 0;
++		gh.chunk = n; gh.left = 0;
++		if (tx_write(&gh, sizeof(gh), pkt, n))
++			return -1;
++	}
++	req_acked = 0;
++	for (spin = 0; spin < SPIN_BUDGET; spin++) {
++		rx_pump();
++		if (req_acked && seen_msg_id == msg_id) return 0;
++	}
++	return -2;
++}
++
++int
++sagit_glink_ldo6_on(struct sagit_glink_report *rep)
++{
++	uint8_t *msg;
++	int rc;
++	struct { struct glmsg m; char name[32]; } open_req;
++	uint32_t nl, i;
++
++	if (rep != NULL) {
++		g_rep = rep;
++		rep->rc = -99;
++		rep->toc_magic = rep->nentries = rep->tx_len = rep->rx_len = 0;
++		rep->remote_cid = 0; rep->state = 0; rep->ack_msg_id = 0;
++	} else {
++		g_rep = NULL;
++	}
++	remote_open = open_acked = req_acked = 0;
++	remote_cid = 0;
++	seen_msg_id = 0;
++	tx_f.data = rx_f.data = NULL;
++
++	msg = (uint8_t *)sagit_smem_ram_ptr(MSG_RAM_BASE);
++	if (msg == NULL)
++		return -100;
++
++	rc = glink_parse_toc(msg, rep);
++	if (rc)
++		return rc;
++	if (rep) rep->state |= SAGIT_GLINK_ST_TOC;
++
++	/* Reset our indices, then start the version handshake. */
++	wr32(tx_f.head, 0);
++	wr32(rx_f.tail, 0);
++	if (send_cmd(GCMD_VERSION, GLINK_VERSION_1, 0))
++		return -4;
++	if (wait_until(is_remote_open))
++		return -5;
++	if (rep) { rep->remote_cid = remote_cid; rep->state |= SAGIT_GLINK_ST_OPEN_REM; }
++
++	/* Acknowledge the RPM's open, and open our end of rpm_requests. */
++	if (send_cmd(GCMD_OPEN_ACK, remote_cid, 0))
++		return -6;
++	for (i = 0; i < sizeof(open_req); i++) ((uint8_t *)&open_req)[i] = 0;
++	nl = str_len(CHAN_NAME) + 1;
++	open_req.m.cmd = GCMD_OPEN;
++	open_req.m.param1 = CHAN_LCID;
++	open_req.m.param2 = nl;
++	for (i = 0; i < nl; i++) open_req.name[i] = CHAN_NAME[i];
++	if (tx_write(&open_req, (nl + 7) & ~7u, NULL, 0))
++		return -7;
++	if (wait_until(is_open_ack))
++		return -8;
++	if (rep) rep->state |= SAGIT_GLINK_ST_OPEN_ACK;
++
++	/* Vote LDO6: set 1.8V then enable. */
++	if (rpm_request(1, RPM_RES_LDOA, LDO6_ID, RPM_KEY_UV, LDO6_UV))
++		return -9;
++	if (rpm_request(2, RPM_RES_LDOA, LDO6_ID, RPM_KEY_SWEN, 1))
++		return -10;
++	if (rep) { rep->state |= SAGIT_GLINK_ST_REQ_ACK; rep->ack_msg_id = seen_msg_id; }
++	return 0;
++}
++
++#endif /* SAGIT */
+diff --git a/bsd/dev/sagit_glink.h b/bsd/dev/sagit_glink.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sagit_glink.h
+--- /dev/null
++++ b/bsd/dev/sagit_glink.h
+@@ -0,0 +1,34 @@
++/*
++ * SAGIT: G-Link over RPM message RAM, used to vote PM8998 LDO6 (touch vdd).
++ *
++ * The Synaptics S3330's vdd rail is RPM resource "ldoa":6. Linux's
++ * synaptics_dsx driver calls regulator_enable(vdd) before its first I2C read.
++ * This XNU port has no RPM driver, so implement the minimal GLINK handshake +
++ * one resource request, reading the RPM message RAM through the cached alias
++ * (sagit_smem.c) -- the physmap window does NOT cover 0x778000.
++ */
++#ifndef _BSD_DEV_SAGIT_GLINK_H_
++#define _BSD_DEV_SAGIT_GLINK_H_
++
++#include <sys/types.h>
++
++/* Result of the LDO6 voting attempt, for the panic string. */
++struct sagit_glink_report {
++	int rc;                 /* 0 = ok, negative = step that failed */
++	uint32_t toc_magic;     /* "grt0" 0x67727430 when RAM is readable */
++	uint32_t nentries;      /* TOC entries */
++	uint32_t tx_len, rx_len;/* FIFO data-region lengths */
++	uint16_t remote_cid;    /* channel id the RPM opened */
++	uint32_t state;         /* bitmask of handshake milestones */
++	uint32_t ack_msg_id;    /* last ack seen */
++};
++
++#define SAGIT_GLINK_ST_TOC      0x01u
++#define SAGIT_GLINK_ST_VERSION  0x02u
++#define SAGIT_GLINK_ST_OPEN_REM 0x04u
++#define SAGIT_GLINK_ST_OPEN_ACK 0x08u
++#define SAGIT_GLINK_ST_REQ_ACK  0x10u
++
++int sagit_glink_ldo6_on(struct sagit_glink_report *rep);
++
++#endif /* _BSD_DEV_SAGIT_GLINK_H_ */
 diff --git a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -105,6 +105,9 @@
+@@ -105,6 +105,10 @@
  
  bsd/dev/memdev.c			standard
  bsd/dev/sagit_ufs.c			standard
 +bsd/dev/sagit_i2c.c			standard
 +bsd/dev/sagit_pmic.c			standard
 +bsd/dev/sagit_smem.c			standard
++bsd/dev/sagit_glink.c			standard
  bsd/dev/sagit_crypto.c			standard
  bsd/dev/mem.c				standard
  bsd/dev/munge.c 			optional config_requires_u32_munging
