@@ -1584,7 +1584,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_pmic.c
 --- /dev/null
 +++ b/bsd/dev/sagit_pmic.c
-@@ -0,0 +1,626 @@
+@@ -0,0 +1,630 @@
 +/*
 + * SAGIT: minimal SPMI write to power the touch controller's IO rail.
 + *
@@ -1689,6 +1689,7 @@ new file mode 100644
 + */
 +#define SAGIT_SPMI_CHNL_STRIDE  0x8000u
 +#define PMIC_ARB_CMD            0x00
++#define PMIC_ARB_CONFIG         0x04
 +#define PMIC_ARB_STATUS         0x08
 +#define PMIC_ARB_WDATA0         0x10
 +#define PMIC_ARB_WDATA1         0x14
@@ -1992,6 +1993,7 @@ new file mode 100644
 +	 * nothing. That is why apid resolved (0x70) and st was 0x1 yet the
 +	 * touch chip still had no power.
 +	 */
++	spmi_wr_chnl(apid, PMIC_ARB_CONFIG, 0u);
 +	spmi_wr_chnl(apid, PMIC_ARB_WDATA0, val & 0xffu);
 +	spmi_wr_chnl(apid, PMIC_ARB_CMD, cmd);
 +
@@ -2043,6 +2045,8 @@ new file mode 100644
 +		return -1;
 +	}
 +
++	/* U-Boot's spmi-msm does the same before every read transfer. */
++	obs[PMIC_ARB_CONFIG / 4] = 0u;
 +	obs[PMIC_ARB_CMD / 4] = cmd;
 +	__asm__ volatile("dmb sy" ::: "memory");
 +
