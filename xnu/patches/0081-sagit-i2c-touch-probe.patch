@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1573 @@
+@@ -0,0 +1,1578 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -250,6 +250,10 @@ new file mode 100644
 +	uint32_t pmic_md_rb;            /* MODE read back from the PMIC */
 +	uint32_t pmic_owner;            /* APID ownership word */
 +	uint32_t pmic_md_before;        /* MODE before the RMW */
++	uint32_t pmic_rg_rb;            /* RANGE read back */
++	uint32_t pmic_sv_rb;            /* VOLTAGE_SET read back */
++	uint32_t pmic_type_rb;          /* LDO TYPE (0x4504): proves SPMI reads work */
++	uint32_t pmic_subtype_rb;       /* LDO SUBTYPE (0x4505) */
 +	uint32_t stop_at;               /* sagit_tstop=N: panic on entering N */
 +} si2c;
 +
@@ -1246,8 +1250,9 @@ new file mode 100644
 +	    "qcfg=0x%x qstate=0x%x qop=0x%x qerr=0x%x i2cst=0x%x "
 +	    "clkctl=0x%x clkctl_back=0x%x iomode=0x%x extra=0x%x txn=%d "
 +	    "rstcfg(start/low/after)=0x%x/0x%x/0x%x rstdrv=%d "
-+	    "pmic(rc/ver/apid/st/unit)=%d/0x%x/0x%x/0x%x/0x%x "
-+	    "pmic_rb(en/md)=0x%x/0x%x own=0x%x mdb=0x%x",
++	    "pmic(rc/ver/apid/st)=%d/0x%x/0x%x/0x%x "
++	    "pmic_rb(en/md)=0x%x/0x%x own=0x%x mdb=0x%x "
++	    "ldo(rg/sv/ty/st)=0x%x/0x%x/0x%x/0x%x",
 +	    what,
 +	    SAGIT_PIN_SCL, scl_cfg, scl_io,
 +	    SAGIT_PIN_SDA, sda_cfg, sda_io,
@@ -1261,9 +1266,11 @@ new file mode 100644
 +	    si2c.rst_cfg_start, si2c.rst_cfg_low, si2c.rst_cfg_after,
 +	    (int)si2c.rst_driven_high,
 +	    (int)si2c.pmic_rc, si2c.pmic_ver, si2c.pmic_apid,
-+	    si2c.pmic_st, si2c.pmic_unit,
++	    si2c.pmic_st,
 +	    si2c.pmic_en_rb, si2c.pmic_md_rb,
-+	    si2c.pmic_owner, si2c.pmic_md_before);
++	    si2c.pmic_owner, si2c.pmic_md_before,
++	    si2c.pmic_rg_rb, si2c.pmic_sv_rb,
++	    si2c.pmic_type_rb, si2c.pmic_subtype_rb);
 +}
 +
 +void
@@ -1420,18 +1427,16 @@ new file mode 100644
 +		si2c.pmic_ver = pmr.version;
 +		si2c.pmic_apid = pmr.apid;
 +		si2c.pmic_st = pmr.enable_status;
-+		si2c.pmic_unit = pmr.chnl_unit;
 +		si2c.pmic_en_rb = pmr.enable_rb;
 +		si2c.pmic_md_rb = pmr.mode_rb;
 +		si2c.pmic_owner = pmr.owner;
 +		si2c.pmic_md_before = pmr.mode_before;
-+		printf("SAGIT PMIC: ldo6 rc=%d ver=0x%x apid=%x map=%x "
-+		    "en_st=0x%x en_rc=%d md_st=0x%x md_rc=%d addr=0x%x unit=%x "
-+		    "rb(en/md)=0x%x/0x%x rb_st=0x%x\n",
-+		    prc, pmr.version, pmr.apid, pmr.map_entry,
-+		    pmr.enable_status, (int)pmr.enable_rc,
-+		    pmr.mode_status, (int)pmr.mode_rc, pmr.addr, pmr.chnl_unit,
-+		    pmr.enable_rb, pmr.mode_rb, pmr.rb_status);
++		si2c.pmic_rg_rb = pmr.range_rb;
++		si2c.pmic_sv_rb = pmr.set_rb;
++		si2c.pmic_type_rb = pmr.type_rb;
++		si2c.pmic_subtype_rb = pmr.subtype_rb;
++		printf("SAGIT PMIC: ldo6 rc=%d ver=0x%x apid=0x%x en_st=0x%x\n",
++		    prc, pmr.version, pmr.apid, pmr.enable_status);
 +	}
 +	si2c_stage(5);
 +	printf("SAGIT I2C 5/9 avdd after: cfg=0x%x io=0x%x\n",
@@ -1584,47 +1589,58 @@ new file mode 100644
 +++ b/bsd/dev/sagit_pmic.c
 --- /dev/null
 +++ b/bsd/dev/sagit_pmic.c
-@@ -0,0 +1,630 @@
+@@ -0,0 +1,463 @@
 +/*
-+ * SAGIT: minimal SPMI write to power the touch controller's IO rail.
++ * SAGIT: minimal SPMI write to bring up the touch controller's power rail.
 + *
-+ * Why this exists
-+ * ---------------
-+ * The touch chip is wired to several rails. The I2C probe (sagit_i2c.c) already
-+ * handles the one that is a TLMM pin; the important one is not:
++ * WHY THIS FILE EXISTS
++ * --------------------
++ * The touch part (Synaptics S3330/S3331/TD4322) needs several rails:
 + *
-+ *   avdd -> disp_vddts_vreg, regulator-fixed on TLMM gpio 50   (done in 0081)
-+ *   vdd  -> pm8998_l6, PM8998 LDO6, behind the SPMI bus         (this file)
++ *   avdd -> disp_vddts_vreg, a regulator-fixed on TLMM gpio 50   (sagit_i2c.c)
++ *   vdd  -> pm8998_l6, PM8998 LDO6, reachable only over SPMI     (here)
 + *
-+ * By v65 the whole software chain was proven: GCC clocks running, QUP in RUN,
-+ * SCL/SDA idle high, and reset finally DRIVEN high (rst io=0x3). Both touch
-+ * addresses still timed out with qerr=0 -- no device on the bus at all, which
-+ * on a working bus means "nothing is powered".
++ * By v65 every other link in the chain was proven good: GCC clocks running,
++ * QUP in RUN, SCL/SDA idle high, reset finally driven high (rst io=0x3).
++ * Both touch I2C addresses still timed out with qerr=0, i.e. nothing on the
++ * bus answered -- the classic signature of an unpowered part. This kernel has
++ * no SPMI driver, so the rail had never been switched on from the OS side.
 + *
-+ * Register layout, taken from drivers/spmi/spmi-pmic-arb.c (v2 arbiter, which
-+ * is what msm8998 has: version >= 0x20010000) and
-+ * drivers/regulator/qcom_spmi-regulator.c:
++ * HARDWARE FACTS
++ * --------------
++ * From live.dtb, /soc/qcom,spmi@800f000 (qcom,spmi-pmic-arb), reg-names:
 + *
-+ *   core window   0x0800f000   version, APID -> PPID map, APID ownership
-+ *   chnls window  0x08400000   per-channel TX registers
-+ *   cnfg window   0x0800a000   APID ownership table
++ *   core    0x0800f000  version, APID -> PPID map
++ *   chnls   0x08400000  TX channel registers
++ *   obsrvr  0x09400000  RX (observer) channel registers
++ *   cnfg    0x0800a000  APID ownership table
 + *
-+ *   APID map        core + 0x800 + 4 * apid      bits 11:0 = PPID
-+ *                   PPID = (sid << 8) | (addr >> 8)
-+ *   TX channel      chnls + 0x200 * apid
-+ *                     +0x00 CMD, +0x04 CONFIG, +0x08 STATUS,
-+ *                     +0x10 WDATA0, +0x14 WDATA1
-+ *   command word    (opc << 27) | ((addr & 0xff) << 4) | (bc & 0x7)
-+ *                   opc 14 = WRITE (length <= 4), 2 = EXT_WRITE
-+ *   status          BIT(0) DONE, BIT(1) FAILURE, BIT(2) DENIED, BIT(3) DROPPED
++ * From drivers/spmi/spmi-pmic-arb.c (this part reports version 0x30000000,
++ * which selects the v3 ops -- and v3 reuses the v2 offset/cmd helpers):
 + *
-+ * PM8998 LDO6 (pm8998_regulators[] in qcom_spmi-regulator.c):
++ *   ppid        = (sid << 8) | ((addr >> 8) & 0xff)
++ *   apid map     core + 0x800 + 4 * n, PPID in bits 19:8, mask 0xfff
++ *   apid owner   cnfg + 0x700 + 4 * apid, low 3 bits = EE allowed to write
++ *   chnl offset  0x1000 * ee + 0x8000 * apid        (both channel types)
++ *   TX regs      chnls  + that offset: +0x00 CMD, +0x04 CONFIG,
++ *                                      +0x08 STATUS, +0x10 WDATA0
++ *   RX regs      obsrvr + that offset: +0x00 CMD, +0x08 STATUS, +0x18 RDATA0
++ *   command      (opc << 27) | ((addr & 0xff) << 4) | (len - 1)
++ *                opc 14 = WRITE, 15 = READ
++ *   data word    payload bytes only, lowest byte first
++ *   status       BIT0 DONE, BIT1 FAILURE, BIT2 DENIED, BIT3 DROPPED
 + *
-+ *   sid 0 (qcom,pm8998@0), base 0x4500
-+ *   0x4546 ENABLE  bit 7 = 0x80
-+ *   0x4545 MODE    bit 7 = HPM
++ * From drivers/regulator/qcom_spmi-regulator.c, pm8998_regulators[]:
 + *
-+ * Everything is polled and bounded: no regulator framework, no interrupts.
++ *   "l6" -> base 0x4500     ENABLE 0x4546 bit7, MODE 0x4545 bit7
++ *                           RANGE  0x4540, VOLTAGE_SET 0x4541
++ *
++ * Writing an APID that belongs to another execution environment is an access
++ * violation that HANGS this SoC rather than returning an error, so ownership
++ * is checked before any store (see pmic_check_owner()).
++ *
++ * Everything here is polled and bounded: no regulator framework, no IRQs, no
++ * sleeps beyond short bounded spins.
 + */
 +
 +#include <sys/param.h>
@@ -1635,210 +1651,99 @@ new file mode 100644
 +
 +#include "sagit_pmic.h"
 +
++/* osfmk/arm/machine_routines.h, not exported to the BSD layer. */
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +
 +#if defined(SAGIT)
 +
-+/* /soc/qcom,spmi@800f000 in live.dtb (reg-names core | chnls | obsrvr | intr | cnfg) */
-+#define SAGIT_SPMI_CORE_BASE    0x800f000ULL
-+/*
-+ * The core window is 0x1000 in the DT, and the APID -> PPID table starts at
-+ * core + 0x800 with 4 bytes per APID. Reading one entry past the end of a
-+ * mapping on this SoC does not fault: it hangs the interconnect, which is what
-+ * v74 did (screen stopped right after "mapping core 0x800f000").
-+ *
-+ * So map the whole 0x1000 declared window and clamp the scan so the last access
-+ * stays strictly inside it: n_max = (0x1000 - 0x800) / 4 - 1 = 511.
-+ */
-+/*
-+ * Map the core window a little wider than the DT says (0x1000): the last APID
-+ * map entry at core + 0xffc is a 4-byte access whose page sits right at the
-+ * boundary, and on this SoC touching one byte past a mapping hangs the
-+ * interconnect instead of faulting. Asking for 0x2000 keeps every access well
-+ * inside, and the extra 4 KiB is cheap.
-+ */
-+#define SAGIT_SPMI_CORE_SIZE    0x2000
-+/* APID -> PPID table occupies core + 0x800 .. core + 0xffc (512 entries). */
-+#define SAGIT_SPMI_APID_MAP_N   512u
-+#define SAGIT_SPMI_CHNLS_BASE   0x8400000ULL
-+#define SAGIT_SPMI_EE           0               /* qcom,ee, apps processor */
++/* ------------------------------------------------------------------ windows */
 +
-+/* core window */
-+#define SPMI_VERSION            0x000
-+#define SPMI_APID_MAP(n)        (0x800 + 4 * (n))
++#define PMIC_ARB_CORE_BASE      0x800f000ULL
 +/*
-+ * Map entry PPID field. spmi-pmic-arb.c, verbatim:
-+ *     #define PMIC_ARB_PPID_MASK  0xFFF        -- PPID is 12 bit
-+ *     id = (regval >> 8) & PMIC_ARB_PPID_MASK;
-+ *
-+ * v79 used exactly this and failed; v80 "fixed" it to 0xff and got apid=0x28,
-+ * which turned out to come from the high-nibble fallback, not a real 0x45
-+ * match. The driver's 12-bit mask was right all along -- the earlier miss was
-+ * caused by this file defining SAGIT_SPMI_APID_MAP_N twice, so the scan bound
-+ * and the entry index disagreed.
++ * core is 0x1000 in the DT. The last APID map entry sits at core+0xffc, and on
++ * this SoC an access one byte past a mapping hangs the interconnect instead of
++ * faulting, so ask for 0x2000 and keep every access well inside.
 + */
-+#define SPMI_MAP_PPID_SHIFT     8
-+#define SPMI_MAP_PPID_MASK      0xfffu
++#define PMIC_ARB_CORE_SIZE      0x2000
++#define PMIC_ARB_CHNLS_BASE     0x8400000ULL
++#define PMIC_ARB_OBSVR_BASE     0x9400000ULL
++#define PMIC_ARB_CNFG_BASE      0x800a000ULL
++/* One 4 KiB page covers a channel (0x20 bytes of registers). v77 mapped 16 KiB
++ * at once and hung right after the store, so stay inside a single page. */
++#define PMIC_ARB_CHANNEL_UNIT   0x1000ULL
++#define PMIC_ARB_CHNL_STRIDE    0x8000u
++#define PMIC_ARB_CNFG_SIZE      0x3000
++#define PMIC_ARB_EE             0               /* qcom,ee = 0 (apps) */
 +
-+/* channel TX registers (relative to chnls + 0x200 * apid) */
-+/*
-+ * Channel stride. spmi-pmic-arb.c pmic_arb_offset_v2() returns
-+ *     0x1000 * ee + 0x8000 * apid
-+ * for BOTH channel types; only the base window differs ("chnls" for writes,
-+ * "obsrvr" for reads). 0x200 * apid is the v1 layout and does not apply here.
-+ */
-+#define SAGIT_SPMI_CHNL_STRIDE  0x8000u
++/* ---------------------------------------------------------------- registers */
++
 +#define PMIC_ARB_CMD            0x00
 +#define PMIC_ARB_CONFIG         0x04
 +#define PMIC_ARB_STATUS         0x08
 +#define PMIC_ARB_WDATA0         0x10
-+#define PMIC_ARB_WDATA1         0x14
 +#define PMIC_ARB_RDATA0         0x18
-+#define PMIC_ARB_RDATA1         0x1c
-+
-+/* observer (read) window, reg-names "obsrvr" in live.dtb */
-+#define SAGIT_SPMI_OBSVR_BASE   0x9400000ULL
-+#define SAGIT_SPMI_OBSVR_UNIT   0x1000ULL
-+/*
-+ * APID ownership table lives in the "cnfg" window at 0x700 + 4 * apid, and the
-+ * low 3 bits are the EE that may write to that APID
-+ * (SPMI_OWNERSHIP_TABLE_REG / SPMI_OWNERSHIP_PERIPH2OWNER in spmi-pmic-arb.c).
-+ *
-+ * Writing an APID owned by another EE is not a bus timeout: the arbiter raises
-+ * an access violation and the core hangs, which is exactly what v77/v78 did --
-+ * the screen stopped on the store into the channel. Check ownership first.
-+ */
-+#define SAGIT_SPMI_CNFG_BASE    0x800a000ULL
-+#define SAGIT_SPMI_CNFG_SIZE    0x3000
-+#define SPMI_OWNERSHIP_TABLE(n) (0x700 + 4 * (n))
-+#define SPMI_EE_MASK            0x7u
 +
 +#define PMIC_ARB_STATUS_DONE    0x1u
 +#define PMIC_ARB_STATUS_FAIL    0x2u
 +#define PMIC_ARB_STATUS_DENIED  0x4u
 +#define PMIC_ARB_STATUS_DROPPED 0x8u
 +
-+/* opcodes for the v2 command word */
++#define PMIC_ARB_VERSION        0x000
++#define PMIC_ARB_APID_MAP(n)    (0x800 + 4 * (n))
++#define PMIC_ARB_APID_MAP_N     512u
++#define PMIC_ARB_PPID_SHIFT     8
++#define PMIC_ARB_PPID_MASK      0xfffu
++#define PMIC_ARB_OWNER(n)       (0x700 + 4 * (n))
++#define PMIC_ARB_EE_MASK        0x7u
++
 +#define SPMI_OP_WRITE           14u
 +#define SPMI_OP_READ            15u
-+#define SPMI_OP_ZERO_WRITE      16u
 +
-+/* PM8998 LDO6 */
++/*
++ * Poll budget: PMIC_ARB_TIMEOUT_US = 100 in the driver, with udelay(1) between
++ * reads. A stalled bus must be abandoned in ~100 us, not spun on for
++ * milliseconds, or the SoC watchdog turns the failure into a silent reset.
++ */
++#define PMIC_ARB_TIMEOUT_US     100u
++#define PMIC_ARB_UDELAY_TICKS   1u
++
++/* -------------------------------------------------------------- PM8998 LDO6 */
++
 +#define PM8998_SID              0
 +#define PM8998_LDO6_BASE        0x4500
-+#define PM8998_LDO6_DIG_REV     (PM8998_LDO6_BASE + 0x01)
 +#define PM8998_LDO6_TYPE        (PM8998_LDO6_BASE + 0x04)
 +#define PM8998_LDO6_SUBTYPE     (PM8998_LDO6_BASE + 0x05)
 +#define PM8998_LDO6_RANGE       (PM8998_LDO6_BASE + 0x40)
 +#define PM8998_LDO6_SET         (PM8998_LDO6_BASE + 0x41)
 +#define PM8998_LDO6_MODE        (PM8998_LDO6_BASE + 0x45)
 +#define PM8998_LDO6_ENABLE      (PM8998_LDO6_BASE + 0x46)
-+#define SPMI_ENABLE_BIT         0x80u
-+#define SPMI_MODE_HPM           0x80u
++/* PMOS LDO: range 3 starts at 1.5 V in 25 mV steps -> 12 = 1.80 V */
++#define PM8998_LDO6_RANGE_VAL   3u
++#define PM8998_LDO6_SET_VAL     12u
++#define SPMI_REG_ENABLE_BIT     0x80u
++#define SPMI_REG_MODE_HPM       0x80u
 +
-+/*
-+ * Poll budget, taken from spmi-pmic-arb.c: PMIC_ARB_TIMEOUT_US = 100, and
-+ * pmic_arb_wait_for_done() turns that into 100 iterations of
-+ *     status = readl(...); if (DONE) return; udelay(1);
-+ * A stalled SPMI bus must be given up on in ~100 us, not spun on for
-+ * milliseconds: v74's hang looked exactly like "watchdog ate a long spin".
-+ */
-+#define SAGIT_SPMI_TIMEOUT_US   100u
-+
-+/* One microsecond, roughly: si2c_settle(1) is a few microseconds. */
-+#define SAGIT_SPMI_UDELAY_TICKS 1u
++/* ------------------------------------------------------------------- state */
 +
 +static struct {
 +	volatile uint32_t *core;
-+	volatile uint32_t *chnls;       /* one 4 KiB page of the chnls window */
-+	volatile uint32_t *cnfg;        /* APID ownership window */
-+	uint32_t chnls_unit;            /* index of that unit, or -1 */
++	volatile uint32_t *cnfg;
++	volatile uint32_t *chnls;       /* one 4 KiB page, remapped per channel */
++	uint32_t chnls_unit;
 +	uint32_t apid;
-+	uint32_t version;
-+	uint32_t map_entry;
 +	int mapped;
 +} pmic = {
 +	.chnls_unit = 0xffffffffu,
 +};
 +
 +static inline uint32_t
-+spmi_rd_core(uint32_t off)
++pmic_rd_core(uint32_t off)
 +{
 +	return pmic.core[off / 4];
 +}
 +
-+/*
-+ * Map the chnls unit holding `apid`, if it is not already mapped.
-+ *
-+ * This is the rule v72/v73 got wrong. spmi-pmic-arb.c, v2/v3:
-+ *
-+ *   static int pmic_arb_offset_v2(...)
-+ *       return 0x1000 * pmic_arb->ee + 0x8000 * apid;
-+ *
-+ *   @wr_base:  on v1 "core", on v2 "chnls"
-+ *
-+ * So the TX channel of APID 0x70 lives at chnls + 0x1000*0 + 0x8000*0x70 =
-+ * chnls + 0x380000, and the observer channel at obsrvr + 0x1000*ee + 0x8000*
-+ * apid. v72/v73 used 0x200 * apid (which is the v1 layout) and therefore wrote
-+ * and read completely unrelated memory -- which is why the read-back came back
-+ * as a changing counter value (0xd5, then 0xd6) instead of 0x80.
-+ */
-+#define SAGIT_SPMI_CHNL_STRIDE  0x8000u
-+
-+/*
-+ * Channel TX registers live at chnls + 0x1000*ee + 0x8000*apid. The whole
-+ * touched span for one channel is 0x20 bytes (CMD/CONFIG/STATUS/WDATA/RDATA),
-+ * so a single 4 KiB page per channel is enough and keeps every access inside
-+ * one page -- v77 mapped 16 KiB and hung immediately after the store, which is
-+ * what an access to an unimplemented part of the window looks like on this SoC.
-+ */
-+#define SAGIT_SPMI_CHNLS_UNIT   0x1000ULL
-+#define SAGIT_SPMI_CHNL_STRIDE  0x8000u
-+
-+static int
-+spmi_map_chnl(uint32_t apid)
-+{
-+	uint32_t off = SAGIT_SPMI_CHNL_STRIDE * apid + 0x1000u * SAGIT_SPMI_EE;
-+	uint32_t unit = off / (uint32_t)SAGIT_SPMI_CHNLS_UNIT;
-+
-+	if (unit == pmic.chnls_unit) {
-+		return 0;
-+	}
-+	pmic.chnls = (volatile uint32_t *)ml_io_map(
-+	    SAGIT_SPMI_CHNLS_BASE + unit * SAGIT_SPMI_CHNLS_UNIT,
-+	    SAGIT_SPMI_CHNLS_UNIT);
-+	if (pmic.chnls == NULL) {
-+		pmic.chnls_unit = 0xffffffffu;
-+		return ENOMEM;
-+	}
-+	pmic.chnls_unit = unit;
-+	printf("SAGIT PMIC: chnls unit 0x%x mapped at 0x%llx\n",
-+	    unit, (uint64_t)(SAGIT_SPMI_CHNLS_BASE + unit * SAGIT_SPMI_CHNLS_UNIT));
-+	return 0;
-+}
-+
-+static inline uint32_t
-+spmi_chnl_off(uint32_t apid, uint32_t reg)
-+{
-+	return SAGIT_SPMI_CHNL_STRIDE * apid + 0x1000u * SAGIT_SPMI_EE + reg -
-+	    pmic.chnls_unit * (uint32_t)SAGIT_SPMI_CHNLS_UNIT;
-+}
-+
-+static inline uint32_t
-+spmi_rd_chnl(uint32_t apid, uint32_t reg)
-+{
-+	return pmic.chnls[spmi_chnl_off(apid, reg) / 4];
-+}
-+
-+static inline void
-+spmi_wr_chnl(uint32_t apid, uint32_t reg, uint32_t v)
-+{
-+	pmic.chnls[spmi_chnl_off(apid, reg) / 4] = v;
-+	__asm__ volatile("dmb sy" ::: "memory");
-+}
-+
 +static void
-+spmi_settle(uint32_t ticks)
++pmic_settle(uint32_t ticks)
 +{
 +	for (uint32_t t = 0; t < ticks; t++) {
 +		for (volatile uint32_t i = 0; i < 2000; i++) {
@@ -1847,369 +1752,302 @@ new file mode 100644
 +	}
 +}
 +
++/* ----------------------------------------------------------- channel access */
++
++static uint32_t
++pmic_chnl_offset(uint32_t apid)
++{
++	return PMIC_ARB_CHNL_STRIDE * apid + 0x1000u * PMIC_ARB_EE;
++}
++
 +/*
-+ * Resolve (sid, addr) to the arbiter's APID by walking the APID -> PPID map.
-+ *
-+ * spmi-pmic-arb.c: pmic_arb_find_apid() decodes each map entry as
-+ *     id = (regval >> 8) & PMIC_ARB_PPID_MASK     (PPID sits in bits 19:8)
-+ * and pmic_arb_offset_v2() builds the key as
-+ *     ppid = (sid << 8) | (addr >> 8)
-+ *
-+ * v70 read the PPID from bits 11:0, which is not where the hardware puts it,
-+ * so the lookup always failed (apid=0xffff, rc=ENOENT). v3 (what this SoC
-+ * reports: 0x30000000) uses the same offset/fmt_cmd/apid_map helpers as v2,
-+ * so this decoding is the right one here.
++ * Map the page holding `apid`'s TX channel. Returns 0, or ENOMEM if the map
++ * failed.
 + */
 +static int
-+spmi_lookup_apid(uint32_t sid, uint32_t addr, uint32_t *map_entry)
++pmic_map_channel(uint32_t apid)
 +{
-+	/*
-+	 * spmi-pmic-arb.c:
-+	 *     ppid = sid << 8 | ((addr >> 8) & 0xFF);
-+	 *
-+	 * The AND is 0xFF, not 0xF: LDO6 ENABLE 0x4546 belongs to PPID 0x45, and
-+	 * masking with 0xF truncated it to 0x5, so the scan matched a completely
-+	 * different peripheral (the screen said "hit n=112 ppid=0x5"). Writing
-+	 * that APID then hit the ownership check and hung the core.
-+	 */
-+	uint32_t ppid = ((sid & 0xfu) << 8) | ((addr >> 8) & 0xffu);
-+	uint32_t last = 0;
-+	uint32_t scanned = 0;
-+	uint32_t near_entry = 0;
-+	uint32_t near_ppid = 0;
-+	int near = -1;
++	uint32_t off = pmic_chnl_offset(apid);
++	uint32_t unit = off / (uint32_t)PMIC_ARB_CHANNEL_UNIT;
 +
-+	/*
-+	 * Exact match only.
-+	 *
-+	 * The high-nibble fallback added in v80 was a mistake: it accepted a PPID
-+	 * in 0x40..0x4f as "close enough" for 0x45, and the resulting channel
-+	 * happily reported DONE while the byte landed in a different peripheral.
-+	 * That is why v80/v81 read back en=0x80 from a register that was not
-+	 * LDO6's, with the rail still dead. A near-match is now reported and
-+	 * then rejected.
-+	 */
-+	for (uint32_t n = 0; n < SAGIT_SPMI_APID_MAP_N; n++) {
-+		uint32_t v = spmi_rd_core(SPMI_APID_MAP(n));
++	if (unit == pmic.chnls_unit) {
++		return 0;
++	}
++	pmic.chnls = (volatile uint32_t *)ml_io_map(
++	    PMIC_ARB_CHNLS_BASE + unit * PMIC_ARB_CHANNEL_UNIT,
++	    PMIC_ARB_CHANNEL_UNIT);
++	if (pmic.chnls == NULL) {
++		pmic.chnls_unit = 0xffffffffu;
++		return ENOMEM;
++	}
++	pmic.chnls_unit = unit;
++	return 0;
++}
 +
-+		if (n < 4 || (n & 0x1f) == 0) {
-+			printf("SAGIT PMIC: apid_map[%u]=0x%x\n", n, v);
-+		}
-+		scanned = n;
++static inline uint32_t
++pmic_chnl_reg(uint32_t apid, uint32_t reg)
++{
++	uint32_t base = pmic_chnl_offset(apid) -
++	    pmic.chnls_unit * (uint32_t)PMIC_ARB_CHANNEL_UNIT;
++
++	return pmic.chnls[(base + reg) / 4];
++}
++
++static inline void
++pmic_chnl_set(uint32_t apid, uint32_t reg, uint32_t v)
++{
++	uint32_t base = pmic_chnl_offset(apid) -
++	    pmic.chnls_unit * (uint32_t)PMIC_ARB_CHANNEL_UNIT;
++
++	pmic.chnls[(base + reg) / 4] = v;
++	__asm__ volatile("dmb sy" ::: "memory");
++}
++
++/* --------------------------------------------------------------- APID lookup */
++
++/*
++ * Walk core + 0x800 .. core + 0xffc for the APID carrying `ppid`.
++ * Returns the APID, or -1. A PPID that only matches on the high nibble is
++ * reported and rejected: acting on it wrote another peripheral's register while
++ * looking successful (v80/v81).
++ */
++static int
++pmic_find_apid(uint32_t ppid, uint32_t *entry)
++{
++	uint32_t n;
++
++	for (n = 0; n < PMIC_ARB_APID_MAP_N; n++) {
++		uint32_t v = pmic_rd_core(PMIC_ARB_APID_MAP(n));
++		uint32_t got;
++
 +		if (v == 0) {
 +			continue;
 +		}
-+		{
-+			uint32_t got = (v >> SPMI_MAP_PPID_SHIFT) & SPMI_MAP_PPID_MASK;
-+
-+			if (got == ppid || got == (ppid | 0x100u) ||
-+			    got == (ppid | 0x200u) || got == (ppid | 0x300u)) {
-+				if (map_entry != NULL) {
-+					*map_entry = v;
-+				}
-+				printf("SAGIT PMIC: apid_map hit n=%u ppid=0x%x entry=0x%x\n",
-+				    n, got, v);
-+				return (int)n;
++		got = (v >> PMIC_ARB_PPID_SHIFT) & PMIC_ARB_PPID_MASK;
++		if (got == ppid) {
++			if (entry != NULL) {
++				*entry = v;
 +			}
-+			if (near < 0 && ((got >> 4) & 0xfu) == ((ppid >> 4) & 0xfu)) {
-+				near = (int)n;
-+				near_entry = v;
-+				printf("SAGIT PMIC: near ppid=0x%x n=%u (rejected)\n",
-+				    got, n);
-+			}
++			printf("SAGIT PMIC: apid_map hit n=%u ppid=0x%x entry=0x%x\n",
++			    n, got, v);
++			return (int)n;
 +		}
-+		last = v;
++		if (((got >> 4) & 0xfu) == ((ppid >> 4) & 0xfu)) {
++			printf("SAGIT PMIC: near ppid=0x%x n=%u (rejected)\n",
++			    got, n);
++		}
 +	}
-+	(void)near_entry;
-+	(void)near_ppid;
-+	if (map_entry != NULL) {
-+		*map_entry = last;
-+	}
-+	printf("SAGIT PMIC: apid_map miss ppid=0x%x, scanned=%u, last=0x%x\n",
-+	    ppid, scanned + 1, last);
 +	return -1;
 +}
 +
 +/*
-+ * One SPMI register write, 1 byte of payload.
-+ *
-+ * Returns 0 on success; *status always carries the final STATUS register.
++ * Confirm the APID may be written by our EE. Returns 0 when it may, EPERM when
++ * it belongs to another EE (writing it would hang the core), or 0 when the cnfg
++ * window is unavailable (nothing to check with).
 + */
 +static int
-+spmi_write_byte(uint32_t apid, uint32_t reg, uint32_t val, uint32_t *status)
++pmic_check_owner(uint32_t apid, uint32_t *owner_out)
 +{
-+	/*
-+	 * bc is "number of bytes minus one" (spmi-pmic-arb.c: u8 bc = len - 1),
-+	 * so a one-byte register write is bc = 0, not 1. Sending bc=1 declared a
-+	 * two-byte transfer.
-+	 */
++	uint32_t owner;
++
++	if (pmic.cnfg == NULL) {
++		return 0;
++	}
++	owner = pmic.cnfg[PMIC_ARB_OWNER(apid) / 4];
++	if (owner_out != NULL) {
++		*owner_out = owner;
++	}
++	printf("SAGIT PMIC: apid 0x%x owner raw=0x%x ee=%u\n",
++	    apid, owner, owner & PMIC_ARB_EE_MASK);
++	if ((owner & PMIC_ARB_EE_MASK) != PMIC_ARB_EE) {
++		return EPERM;
++	}
++	return 0;
++}
++
++/* ------------------------------------------------------------ one transfer */
++
++/*
++ * One SPMI register write of one byte.
++ *
++ * The sequence mirrors u-boot's spmi-msm and pmic_arb_write_cmd():
++ *   CONFIG = 0 (leave IRQ mode), WDATA0 = payload, CMD = command, poll STATUS.
++ * v86 tested this without clearing CONFIG and the line never took effect.
++ */
++static int
++pmic_write_byte(uint32_t apid, uint32_t reg, uint32_t val, uint32_t *status)
++{
 +	uint32_t cmd = (SPMI_OP_WRITE << 27) | ((reg & 0xffu) << 4) | 0u;
-+	uint32_t st;
++	uint32_t st = 0xffffffffu;
 +	int rc;
 +
-+	rc = spmi_map_chnl(apid);
++	rc = pmic_map_channel(apid);
 +	if (rc != 0) {
-+		printf("SAGIT PMIC: map_chnl(apid=0x%x) rc=%d\n", apid, rc);
 +		return rc;
 +	}
-+	printf("SAGIT PMIC: wr apid=0x%x reg=0x%x val=0x%x unit=0x%x\n",
-+	    apid, reg, val, pmic.chnls_unit);
 +
-+	/*
-+	 * Ownership gate. A store into an APID owned by another EE hangs the
-+	 * core (access violation), it does not return an error, so this check
-+	 * has to happen before anything is written.
-+	 */
-+	if (pmic.cnfg != NULL) {
-+		uint32_t owner = pmic.cnfg[SPMI_OWNERSHIP_TABLE(apid) / 4];
++	pmic_chnl_set(apid, PMIC_ARB_CONFIG, 0u);
++	pmic_chnl_set(apid, PMIC_ARB_WDATA0, val & 0xffu);
++	pmic_chnl_set(apid, PMIC_ARB_CMD, cmd);
 +
-+		printf("SAGIT PMIC: apid 0x%x owner raw=0x%x ee=%u\n",
-+		    apid, owner, owner & SPMI_EE_MASK);
-+		if ((owner & SPMI_EE_MASK) != SAGIT_SPMI_EE) {
-+			printf("SAGIT PMIC: apid 0x%x not owned by ee %u, "
-+			    "skipping write\n", apid, SAGIT_SPMI_EE);
-+			return EPERM;
++	for (uint32_t i = 0; i < PMIC_ARB_TIMEOUT_US; i++) {
++		st = pmic_chnl_reg(apid, PMIC_ARB_STATUS);
++		if (st & PMIC_ARB_STATUS_DONE) {
++			break;
 +		}
-+	}
-+
-+	/*
-+	 * v77 proved the store itself is where the core stops. Read STATUS
-+	 * first: if the mapped page is not actually implemented, this read is
-+	 * the one that hangs, and we want that separated from a hanging store.
-+	 */
-+	st = spmi_rd_chnl(apid, PMIC_ARB_STATUS);
-+	printf("SAGIT PMIC: chnls rd st=0x%x\n", st);
-+
-+	/*
-+	 * WDATA0 carries ONLY the payload bytes, lowest byte first:
-+	 *
-+	 *   spmi-pmic-arb.c: pmic_arb_write_data()
-+	 *       memcpy(&data, buf, (bc & 3) + 1);
-+	 *       __raw_writel(data, wr_base + PMIC_ARB_WDATA0);
-+	 *
-+	 * The register address is already in the command word (bits 11:4), so
-+	 * v71 packing "(reg << 8) | val" here sent the PMIC a payload of
-+	 * 0x4680 instead of 0x80 -- the write reported DONE and changed
-+	 * nothing. That is why apid resolved (0x70) and st was 0x1 yet the
-+	 * touch chip still had no power.
-+	 */
-+	spmi_wr_chnl(apid, PMIC_ARB_CONFIG, 0u);
-+	spmi_wr_chnl(apid, PMIC_ARB_WDATA0, val & 0xffu);
-+	spmi_wr_chnl(apid, PMIC_ARB_CMD, cmd);
-+
-+	/*
-+	 * Bounded poll, shaped like pmic_arb_wait_for_done(): a stale DONE from
-+	 * an earlier transfer must not be mistaken for this one's completion,
-+	 * so read once, and only accept DONE together with a clean status.
-+	 */
-+	for (uint32_t i = 0; i < SAGIT_SPMI_TIMEOUT_US; i++) {
-+		st = spmi_rd_chnl(apid, PMIC_ARB_STATUS);
-+		if (!(st & PMIC_ARB_STATUS_DONE)) {
-+			spmi_settle(SAGIT_SPMI_UDELAY_TICKS);
-+			continue;
-+		}
-+		if (status != NULL) {
-+			*status = st;
-+		}
-+		return (st & (PMIC_ARB_STATUS_FAIL |
-+		    PMIC_ARB_STATUS_DENIED |
-+		    PMIC_ARB_STATUS_DROPPED)) ? EIO : 0;
++		pmic_settle(PMIC_ARB_UDELAY_TICKS);
 +	}
 +	if (status != NULL) {
 +		*status = st;
 +	}
-+	printf("SAGIT PMIC: wr timeout apid=0x%x st=0x%x\n", apid, st);
-+	return ETIMEDOUT;
++	if (!(st & PMIC_ARB_STATUS_DONE)) {
++		return ETIMEDOUT;
++	}
++	if (st & (PMIC_ARB_STATUS_FAIL | PMIC_ARB_STATUS_DENIED |
++	    PMIC_ARB_STATUS_DROPPED)) {
++		return EIO;
++	}
++	return 0;
 +}
 +
 +/*
-+ * One SPMI register read through the observer channel.
-+ *
-+ * The same pmic_arb_offset_v2 rule applies to every channel type --
-+ * 0x1000 * ee + 0x8000 * apid -- only the base window differs: writes use
-+ * "chnls", reads use "obsrvr" (rd_base = obsrvr for v2/v3). The 0x40000*ee +
-+ * 0x20*apid formula belongs to a different driver revision's observer layout
-+ * and was wrong here. Returns the byte, or -1 on failure.
++ * One SPMI register read of one byte through the observer window. Returns the
++ * byte, or -1 on failure.
 + */
 +static int
-+spmi_read_byte(uint32_t apid, uint32_t reg, uint32_t *status)
++pmic_read_byte(uint32_t apid, uint32_t reg)
 +{
 +	volatile uint32_t *obs;
-+	uint32_t off = 0x1000u * SAGIT_SPMI_EE + SAGIT_SPMI_CHNL_STRIDE * apid;
++	uint32_t off = pmic_chnl_offset(apid);
 +	uint32_t cmd = (SPMI_OP_READ << 27) | ((reg & 0xffu) << 4) | 0u;
-+	uint32_t st;
++	uint32_t st = 0xffffffffu;
 +
-+	obs = (volatile uint32_t *)ml_io_map(SAGIT_SPMI_OBSVR_BASE + off,
-+	    SAGIT_SPMI_OBSVR_UNIT);
++	obs = (volatile uint32_t *)ml_io_map(PMIC_ARB_OBSVR_BASE + off,
++	    PMIC_ARB_CHANNEL_UNIT);
 +	if (obs == NULL) {
 +		return -1;
 +	}
-+
-+	/* U-Boot's spmi-msm does the same before every read transfer. */
 +	obs[PMIC_ARB_CONFIG / 4] = 0u;
 +	obs[PMIC_ARB_CMD / 4] = cmd;
 +	__asm__ volatile("dmb sy" ::: "memory");
 +
-+	for (uint32_t i = 0; i < SAGIT_SPMI_TIMEOUT_US; i++) {
++	for (uint32_t i = 0; i < PMIC_ARB_TIMEOUT_US; i++) {
 +		st = obs[PMIC_ARB_STATUS / 4];
-+		if (!(st & PMIC_ARB_STATUS_DONE)) {
-+			spmi_settle(SAGIT_SPMI_UDELAY_TICKS);
-+			continue;
++		if (st & PMIC_ARB_STATUS_DONE) {
++			break;
 +		}
-+		if (status != NULL) {
-+			*status = st;
-+		}
-+		if (st & (PMIC_ARB_STATUS_FAIL |
-+		    PMIC_ARB_STATUS_DENIED |
-+		    PMIC_ARB_STATUS_DROPPED)) {
-+			return -1;
-+		}
-+		return (int)(obs[PMIC_ARB_RDATA0 / 4] & 0xffu);
++		pmic_settle(PMIC_ARB_UDELAY_TICKS);
 +	}
-+	if (status != NULL) {
-+		*status = st;
++	if (!(st & PMIC_ARB_STATUS_DONE)) {
++		return -1;
 +	}
-+	return -1;
++	if (st & (PMIC_ARB_STATUS_FAIL | PMIC_ARB_STATUS_DENIED |
++	    PMIC_ARB_STATUS_DROPPED)) {
++		return -1;
++	}
++	return (int)(obs[PMIC_ARB_RDATA0 / 4] & 0xffu);
 +}
 +
-+/*
-+ * Turn PM8998 LDO6 on. Reports what it found so one screenshot is conclusive:
-+ * version, APID, map entry, STATUS of the enable write, and the pointers used.
-+ */
++/* ------------------------------------------------------------- entry point */
++
 +int
 +sagit_pmic_ldo6_on(struct sagit_pmic_report *rep)
 +{
-+	int apid;
 +	uint32_t st = 0;
 +	uint32_t entry = 0;
++	uint32_t ppid;
++	int apid;
 +	int rc;
++	int v;
 +
 +	if (pmic.mapped == 0) {
-+		/*
-+		 * Report before mapping: v68 produced no SAGIT PMIC line at all,
-+		 * so we could not tell "map failed" from "line scrolled off".
-+		 * Print first, then map.
-+		 */
-+		printf("SAGIT PMIC: enter, mapping core 0x%llx\n",
-+		    (uint64_t)SAGIT_SPMI_CORE_BASE);
-+		pmic.core = (volatile uint32_t *)ml_io_map(SAGIT_SPMI_CORE_BASE,
-+		    SAGIT_SPMI_CORE_SIZE);
++		pmic.core = (volatile uint32_t *)ml_io_map(PMIC_ARB_CORE_BASE,
++		    PMIC_ARB_CORE_SIZE);
 +		if (pmic.core == NULL) {
-+			printf("SAGIT PMIC: ml_io_map(core) returned NULL\n");
++			printf("SAGIT PMIC: ml_io_map(core) failed\n");
 +			return ENOMEM;
 +		}
++		pmic.cnfg = (volatile uint32_t *)ml_io_map(PMIC_ARB_CNFG_BASE,
++		    PMIC_ARB_CNFG_SIZE);
 +		pmic.mapped = 1;
-+		printf("SAGIT PMIC: core mapped, reading version\n");
-+		pmic.cnfg = (volatile uint32_t *)ml_io_map(SAGIT_SPMI_CNFG_BASE,
-+		    SAGIT_SPMI_CNFG_SIZE);
-+		printf("SAGIT PMIC: cnfg %s\n",
-+		    pmic.cnfg != NULL ? "mapped" : "NULL (no ownership check)");
 +	}
 +
-+	pmic.version = spmi_rd_core(SPMI_VERSION);
-+	printf("SAGIT PMIC: version=0x%x, scanning apid table\n", pmic.version);
 +	if (rep != NULL) {
-+		rep->version = pmic.version;
++		rep->version = pmic_rd_core(PMIC_ARB_VERSION);
 +	}
-+	if (pmic.version == 0xffffffffu || pmic.version == 0) {
++	if (rep != NULL && (rep->version == 0 || rep->version == 0xffffffffu)) {
++		printf("SAGIT PMIC: arbiter version 0x%x, giving up\n",
++		    rep->version);
 +		return ENODEV;
 +	}
++	printf("SAGIT PMIC: version=0x%x, looking up ppid\n",
++	    rep != NULL ? rep->version : 0u);
 +
-+	apid = spmi_lookup_apid(PM8998_SID, PM8998_LDO6_ENABLE, &entry);
++	/* LDO6 ENABLE is sid 0, address 0x4546 -> PPID 0x45. */
++	ppid = ((PM8998_SID & 0xfu) << 8) | ((PM8998_LDO6_ENABLE >> 8) & 0xffu);
++	apid = pmic_find_apid(ppid, &entry);
 +	if (rep != NULL) {
-+		rep->apid = (uint32_t)apid;
++		rep->apid = (apid < 0) ? 0xffffffffu : (uint32_t)apid;
 +		rep->map_entry = entry;
 +	}
 +	if (apid < 0) {
++		printf("SAGIT PMIC: no apid for ppid=0x%x\n", ppid);
 +		return ENOENT;
 +	}
 +	pmic.apid = (uint32_t)apid;
 +
-+	/*
-+	 * Ownership gate, once, before any write. A store into an APID owned by
-+	 * another EE raises an access violation and hangs the core; it never
-+	 * returns an error, so it cannot be handled inside spmi_write_byte().
-+	 */
-+	if (pmic.cnfg != NULL) {
-+		uint32_t owner = pmic.cnfg[SPMI_OWNERSHIP_TABLE(pmic.apid) / 4];
-+
-+		if (rep != NULL) {
-+			rep->owner = owner;
-+		}
-+		printf("SAGIT PMIC: apid 0x%x owner raw=0x%x ee=%u\n",
-+		    pmic.apid, owner, owner & SPMI_EE_MASK);
-+		if ((owner & SPMI_EE_MASK) != SAGIT_SPMI_EE) {
-+			printf("SAGIT PMIC: apid 0x%x owned by ee %u, not %u: "
-+			    "refusing to write\n",
-+			    pmic.apid, owner & SPMI_EE_MASK, SAGIT_SPMI_EE);
-+			return EPERM;
-+		}
++	rc = pmic_check_owner(pmic.apid, rep != NULL ? &rep->owner : NULL);
++	if (rc != 0) {
++		printf("SAGIT PMIC: apid 0x%x not ours, refusing to write\n",
++		    pmic.apid);
++		return rc;
 +	}
 +
-+	/*
-+	 * Set the output voltage before enabling. PM8998 LDO6 is a PMOS LDO
-+	 * (pm8998_pldo: 1.664 V + 8 mV steps, range 2/3/4). v80 got ENABLE=0x80
-+	 * written but the rail still could not feed the touch part, and MODE read
-+	 * back 0x0 -- the regulator was enabled with whatever set point the
-+	 * bootloader left, which may be outside the band this panel wants.
-+	 *
-+	 * RANGE = 3 (1.5 V base, 25 mV/step), SET = 12 -> 1.5 + 12*0.025 = 1.8 V.
-+	 */
-+	(void)spmi_write_byte(pmic.apid, PM8998_LDO6_RANGE, 3u, NULL);
-+	(void)spmi_write_byte(pmic.apid, PM8998_LDO6_SET, 12u, NULL);
-+	spmi_settle(3);
++	/* Program the set point first, then enable. */
++	(void)pmic_write_byte(pmic.apid, PM8998_LDO6_RANGE,
++	    PM8998_LDO6_RANGE_VAL, NULL);
++	(void)pmic_write_byte(pmic.apid, PM8998_LDO6_SET,
++	    PM8998_LDO6_SET_VAL, NULL);
++	pmic_settle(2);
 +
-+	/* ENABLE = 0x80 */
-+	rc = spmi_write_byte(pmic.apid, PM8998_LDO6_ENABLE, SPMI_ENABLE_BIT, &st);
++	rc = pmic_write_byte(pmic.apid, PM8998_LDO6_ENABLE, SPMI_REG_ENABLE_BIT,
++	    &st);
 +	if (rep != NULL) {
 +		rep->enable_status = st;
 +		rep->enable_rc = (uint32_t)rc;
 +	}
-+	if (rc != 0) {
-+		return rc;
-+	}
-+	spmi_settle(3);
 +
-+	/* MODE: read-modify-write so the pin-ctrl follow bits are preserved */
-+	{
-+		uint32_t mod_st = 0;
-+		int mv = spmi_read_byte(pmic.apid, PM8998_LDO6_MODE, &mod_st);
-+
-+		if (rep != NULL) {
-+			rep->mode_before =
-+			    (mv < 0) ? 0xffffffffu : (uint32_t)mv;
-+		}
-+		printf("SAGIT PMIC: mode before=0x%x st=0x%x\n", mv, mod_st);
-+		rc = spmi_write_byte(pmic.apid, PM8998_LDO6_MODE,
-+		    (mv < 0) ? SPMI_MODE_HPM : (uint32_t)mv | SPMI_MODE_HPM, &st);
-+		if (rep != NULL) {
-+			rep->mode_status = st;
-+			rep->mode_rc = (uint32_t)rc;
-+		}
++	/* MODE: read-modify-write so the pin-ctrl follow bits survive. */
++	v = pmic_read_byte(pmic.apid, PM8998_LDO6_MODE);
++	if (rep != NULL) {
++		rep->mode_before = (v < 0) ? PMIC_RB_FAILED : (uint32_t)v;
 +	}
-+	spmi_settle(3);
++	(void)pmic_write_byte(pmic.apid, PM8998_LDO6_MODE,
++	    (v < 0) ? SPMI_REG_MODE_HPM : ((uint32_t)v | SPMI_REG_MODE_HPM),
++	    &st);
++	if (rep != NULL) {
++		rep->mode_status = st;
++	}
++	pmic_settle(3);
 +
 +	/*
-+	 * Read back: a DONE status with no FAIL bit only says the arbiter
-+	 * completed the bus cycle. Whether the PMIC accepted the byte is what
-+	 * the read-back shows, and v71's payload bug hid exactly there.
++	 * Read everything back. A DONE status only says the arbiter finished a
++	 * bus cycle; only the register contents show whether the PMIC took it.
++	 * TYPE/SUBTYPE identify the peripheral itself.
 +	 */
-+	{
-+		uint32_t rbst = 0;
-+		int en = spmi_read_byte(pmic.apid, PM8998_LDO6_ENABLE, &rbst);
-+		int md = spmi_read_byte(pmic.apid, PM8998_LDO6_MODE, NULL);
-+
-+		if (rep != NULL) {
-+			rep->enable_rb = (en < 0) ? 0xffffffffu : (uint32_t)en;
-+			rep->mode_rb = (md < 0) ? 0xffffffffu : (uint32_t)md;
-+			rep->rb_status = rbst;
-+		}
-+	}
-+	spmi_settle(3);
-+
 +	if (rep != NULL) {
-+		rep->addr = PM8998_LDO6_ENABLE;
-+		rep->chnl_unit = pmic.chnls_unit;
++		v = pmic_read_byte(pmic.apid, PM8998_LDO6_TYPE);
++		rep->type_rb = (v < 0) ? PMIC_RB_FAILED : (uint32_t)v;
++		v = pmic_read_byte(pmic.apid, PM8998_LDO6_SUBTYPE);
++		rep->subtype_rb = (v < 0) ? PMIC_RB_FAILED : (uint32_t)v;
++		v = pmic_read_byte(pmic.apid, PM8998_LDO6_RANGE);
++		rep->range_rb = (v < 0) ? PMIC_RB_FAILED : (uint32_t)v;
++		v = pmic_read_byte(pmic.apid, PM8998_LDO6_SET);
++		rep->set_rb = (v < 0) ? PMIC_RB_FAILED : (uint32_t)v;
++		v = pmic_read_byte(pmic.apid, PM8998_LDO6_ENABLE);
++		rep->enable_rb = (v < 0) ? PMIC_RB_FAILED : (uint32_t)v;
++		v = pmic_read_byte(pmic.apid, PM8998_LDO6_MODE);
++		rep->mode_rb = (v < 0) ? PMIC_RB_FAILED : (uint32_t)v;
 +	}
 +	return 0;
 +}
@@ -2221,35 +2059,44 @@ new file mode 100644
 +++ b/bsd/dev/sagit_pmic.h
 --- /dev/null
 +++ b/bsd/dev/sagit_pmic.h
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,42 @@
 +/*
-+ * SAGIT PMIC: what the touch probe needs to know about the SPMI write.
++ * SAGIT PMIC: the result of the SPMI write that brings up the touch rail.
 + *
-+ * Kept in its own header so sagit_i2c.c can report the outcome without
-+ * pulling in any SPMI detail.
++ * Kept in its own header so sagit_i2c.c can report the outcome in its panic
++ * string without pulling in any SPMI detail.
 + */
 +#ifndef _BSD_DEV_SAGIT_PMIC_H_
 +#define _BSD_DEV_SAGIT_PMIC_H_
 +
 +#include <sys/types.h>
 +
++/* Value used when a register read failed. */
++#define PMIC_RB_FAILED  0xffffffffu
++
 +struct sagit_pmic_report {
 +	uint32_t version;       /* arbiter version word (core + 0x000) */
-+	uint32_t apid;          /* apid resolved from PPID, or 0xffffffff */
++	uint32_t apid;          /* APID for LDO6, or PMIC_RB_FAILED */
 +	uint32_t map_entry;     /* raw APID map word that matched */
-+	uint32_t addr;          /* enable register address */
++	uint32_t owner;         /* APID ownership table word */
 +	uint32_t enable_status; /* STATUS after the ENABLE write */
 +	uint32_t mode_status;   /* STATUS after the MODE write */
-+	uint32_t enable_rc;     /* 0 = done */
-+	uint32_t mode_rc;
-+	uint32_t chnl_unit;     /* chnls window unit mapped (0x4000 bytes each) */
-+	uint32_t enable_rb;     /* ENABLE read back, 0xffffffff on read failure */
-+	uint32_t mode_rb;       /* MODE read back */
-+	uint32_t rb_status;     /* STATUS of the read-back transfer */
-+	uint32_t owner;         /* APID ownership table word */
-+	uint32_t range_rb;      /* RANGE read back */
-+	uint32_t set_rb;        /* VOLTAGE_SET read back */
++	uint32_t enable_rc;     /* 0 = the ENABLE transfer completed */
 +	uint32_t mode_before;   /* MODE before the read-modify-write */
++	/* read-backs (PMIC_RB_FAILED when the read itself failed) */
++	uint32_t enable_rb;
++	uint32_t mode_rb;
++	uint32_t range_rb;
++	uint32_t set_rb;
++	uint32_t type_rb;
++	uint32_t subtype_rb;
++
++	/* Legacy fields still reported by the I2C probe's panic string. */
++	uint32_t addr;
++	uint32_t enable_rc_dup;
++	uint32_t mode_rc;
++	uint32_t rb_status;
++	uint32_t chnl_unit;
 +};
 +
 +int sagit_pmic_ldo6_on(struct sagit_pmic_report *rep);
