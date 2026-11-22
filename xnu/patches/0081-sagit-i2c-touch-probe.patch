@@ -2193,7 +2193,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_smem.c
 --- /dev/null
 +++ b/bsd/dev/sagit_smem.c
-@@ -0,0 +1,221 @@
+@@ -0,0 +1,223 @@
 +/*
 + * SAGIT: probe whether SMEM is usable from this kernel.
 + *
@@ -2240,6 +2240,8 @@ new file mode 100644
 +#include "sagit_smem.h"
 +
 +extern void *phystokv(vm_offset_t pa);
++/* osfmk/arm/machine_routines.h provides this, but it is not exported to BSD. */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +/* osfmk/arm64/arm_vm_init.c: the physmap window phystokv() accepts. */
 +extern vm_offset_t gPhysBase;
 +extern vm_size_t real_phys_size;
