@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1658 @@
+@@ -0,0 +1,1670 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -264,6 +264,8 @@ new file mode 100644
 +	uint32_t smem_entries;
 +	uint32_t smem_rpm_item;
 +	uint32_t rpm_ram_rc;
++	uint32_t phys_base;             /* gPhysBase XNU is running with */
++	uint32_t phys_size;             /* real_phys_size of the same */
 +	uint32_t stop_at;               /* sagit_tstop=N: panic on entering N */
 +} si2c;
 +
@@ -1277,7 +1279,8 @@ new file mode 100644
 +	    "pmic_rb(en/md)=0x%x/0x%x own=0x%x mdb=0x%x "
 +	    "ldo(rg/sv/ty/st)=0x%x/0x%x/0x%x/0x%x "
 +	    "avdd_on(cfg/io)=0x%x/0x%x "
-+	    "smem(rc/magic/toc/rpm/ram)=%d/0x%x/%u/0x%x/%d",
++	    "smem(rc/magic/toc/rpm/ram)=%d/0x%x/%u/0x%x/%d "
++	    "physmap(base/size)=0x%x/0x%x",
 +	    what,
 +	    SAGIT_PIN_SCL, scl_cfg, scl_io,
 +	    SAGIT_PIN_SDA, sda_cfg, sda_io,
@@ -1298,10 +1301,13 @@ new file mode 100644
 +	    si2c.pmic_type_rb, si2c.pmic_subtype_rb,
 +	    si2c.avdd_cfg_after, si2c.avdd_io_after,
 +	    (int)si2c.smem_rc, si2c.smem_magic, si2c.smem_entries,
-+	    si2c.smem_rpm_item, (int)si2c.rpm_ram_rc);
-+	printf("SAGIT SMEM2: rc=%d magic=0x%x toc=%u rpm_item=0x%x ram_rc=%d\n",
++	    si2c.smem_rpm_item, (int)si2c.rpm_ram_rc,
++	    si2c.phys_base, si2c.phys_size);
++	printf("SAGIT SMEM2: rc=%d magic=0x%x toc=%u rpm_item=0x%x ram_rc=%d "
++	    "physmap=0x%x/0x%x\n",
 +	    (int)si2c.smem_rc, si2c.smem_magic, si2c.smem_entries,
-+	    si2c.smem_rpm_item, (int)si2c.rpm_ram_rc);
++	    si2c.smem_rpm_item, (int)si2c.rpm_ram_rc,
++	    si2c.phys_base, si2c.phys_size);
 +}
 +
 +void
@@ -1325,6 +1331,12 @@ new file mode 100644
 +	{
 +		struct sagit_smem_report sr;
 +		uint32_t ram0 = 0;
++		vm_offset_t pb = 0;
++		vm_size_t ps = 0;
++
++		sagit_smem_physmap(&pb, &ps);
++		si2c.phys_base = (uint32_t)pb;
++		si2c.phys_size = (uint32_t)ps;
 +
 +		si2c.smem_rc = (uint32_t)sagit_smem_probe(&sr);
 +		if (si2c.smem_rc == 0) {
@@ -2193,7 +2205,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_smem.c
 --- /dev/null
 +++ b/bsd/dev/sagit_smem.c
-@@ -0,0 +1,223 @@
+@@ -0,0 +1,242 @@
 +/*
 + * SAGIT: probe whether SMEM is usable from this kernel.
 + *
@@ -2273,6 +2285,25 @@ new file mode 100644
 +		return phystokv(pa);
 +	}
 +	return (void *)ml_io_map(pa, SMEM_PROBE_WINDOW);
++}
++
++/*
++ * The physmap window XNU ended up with.
++ *
++ * This is the interesting number: v91 reported "phys base 0x10000000, size
++ * 0xd7e0000" while the payload and ADT both carry 0x100000000 / 0xbd7c0000.
++ * A SAGIT BOOTARGS line printed in arm_init scrolls off the frame buffer, so
++ * the values are exported here and carried in the probe's panic string instead.
++ */
++void
++sagit_smem_physmap(vm_offset_t *base, vm_size_t *size)
++{
++	if (base != NULL) {
++		*base = gPhysBase;
++	}
++	if (size != NULL) {
++		*size = real_phys_size;
++	}
 +}
 +
 +/* /soc/qcom,smem@86000000 in live.dtb */
@@ -2423,7 +2454,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_smem.h
 --- /dev/null
 +++ b/bsd/dev/sagit_smem.h
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,36 @@
 +/*
 + * SAGIT SMEM: the result of the shared-memory probe.
 + *
@@ -2456,6 +2487,8 @@ new file mode 100644
 +
 +int sagit_smem_probe(struct sagit_smem_report *rep);
 +int sagit_smem_probe_rpm_ram(uint32_t *first_word);
++/* The physmap window XNU is running with (gPhysBase / real_phys_size). */
++void sagit_smem_physmap(vm_offset_t *base, vm_size_t *size);
 +
 +#endif /* _BSD_DEV_SAGIT_SMEM_H_ */
 diff --git a/bsd/conf/files b/bsd/conf/files
