@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1697 @@
+@@ -0,0 +1,1706 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -271,6 +271,8 @@ new file mode 100644
 +	uint32_t glink_rc;              /* sagit_glink_ldo6_on() result: 0=ok */
 +	uint32_t glink_state;           /* handshake milestone bitmask */
 +	uint32_t glink_ack;             /* last ack msg_id seen */
++	uint32_t glink_tx_off, glink_tx_sz, glink_tx_h, glink_tx_t;
++	uint32_t glink_rx_off, glink_rx_sz, glink_rx_h, glink_rx_t;
 +	uint32_t phys_base;             /* gPhysBase XNU is running with */
 +	uint32_t phys_size;             /* real_phys_size of the same */
 +	uint32_t stop_at;               /* sagit_tstop=N: panic on entering N */
@@ -1289,6 +1291,7 @@ new file mode 100644
 +	    "smem(rc/magic/toc/rpm/ram)=%d/0x%x/%u/0x%x/%d "
 +	    "rpm(toc/cnt/w0/w1)=0x%x/%u/0x%x/0x%x "
 +	    "glink(rc/st/ack)=%d/0x%x/%u "
++	    "gtx(o/s/h/t)=0x%x/0x%x/0x%x/0x%x grx(o/s/h/t)=0x%x/0x%x/0x%x/0x%x "
 +	    "physmap(base/size)=0x%x/0x%x",
 +	    what,
 +	    SAGIT_PIN_SCL, scl_cfg, scl_io,
@@ -1313,6 +1316,8 @@ new file mode 100644
 +	    si2c.smem_rpm_item, (int)si2c.rpm_ram_rc,
 +	    si2c.rpm_toc_magic, si2c.rpm_toc_count, si2c.rpm_w0, si2c.rpm_w1,
 +	    (int)si2c.glink_rc, si2c.glink_state, si2c.glink_ack,
++	    si2c.glink_tx_off, si2c.glink_tx_sz, si2c.glink_tx_h, si2c.glink_tx_t,
++	    si2c.glink_rx_off, si2c.glink_rx_sz, si2c.glink_rx_h, si2c.glink_rx_t,
 +	    si2c.phys_base, si2c.phys_size);
 +	printf("SAGIT SMEM2: rc=%d magic=0x%x toc=%u rpm_item=0x%x ram_rc=%d "
 +	    "physmap=0x%x/0x%x\n",
@@ -1371,6 +1376,10 @@ new file mode 100644
 +			si2c.glink_rc = (uint32_t)sagit_glink_ldo6_on(&gr);
 +			si2c.glink_state = gr.state;
 +			si2c.glink_ack = gr.ack_msg_id;
++			si2c.glink_tx_off = gr.tx_off; si2c.glink_tx_sz = gr.tx_sz;
++			si2c.glink_rx_off = gr.rx_off; si2c.glink_rx_sz = gr.rx_sz;
++			si2c.glink_tx_h = gr.tx_head0; si2c.glink_tx_t = gr.tx_tail0;
++			si2c.glink_rx_h = gr.rx_head0; si2c.glink_rx_t = gr.rx_tail0;
 +		}
 +	}
 +
@@ -2559,7 +2568,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_glink.c
 --- /dev/null
 +++ b/bsd/dev/sagit_glink.c
-@@ -0,0 +1,428 @@
+@@ -0,0 +1,503 @@
 +/*
 + * SAGIT: minimal G-Link over RPM message RAM, from the XNU BSD layer.
 + *
@@ -2580,6 +2589,7 @@ new file mode 100644
 + */
 +#include <sys/param.h>
 +#include <sys/systm.h>
++#include <stddef.h>
 +#include <machine/machine_routines.h>
 +
 +#include "sagit_smem.h"
@@ -2627,7 +2637,13 @@ new file mode 100644
 +
 +/* Keep modest: 2e8 spins triggered the SoC watchdog in v95ldo6 (shim).
 + * With the cached alias the RPM replies fast, so 2e6 is ample. */
-+#define SPIN_BUDGET      2000000ULL
++/*
++ * Each rx_pump() now also does a "dc civac" + "dsb sy", so a spin is far more
++ * expensive than a bare load. 500k spins is ~50-100ms of wall time -- plenty
++ * for the RPM (an MCU answering in tens of microseconds) yet safely under the
++ * boot watchdog. v95 used 200M and tripped a reset.
++ */
++#define SPIN_BUDGET      500000ULL
 +
 +struct gl_fifo {
 +	volatile uint32_t *tail;
@@ -2642,7 +2658,44 @@ new file mode 100644
 +static uint32_t seen_msg_id;
 +static struct sagit_glink_report *g_rep;
 +
-+/* Cached alias: use dsb to make FIFO index writes observable to the RPM. */
++/*
++ * physmap (phystokv) is a *write-back cached* normal-memory mapping. A plain
++ * store plus "dsb sy" does NOT make the data visible in DDR: the store may sit
++ * dirty in L1/L2, and the RPM (a separate Cortex-M3 that reads DDR directly,
++ * outside the CPU's coherency domain) would never see it. That is exactly why
++ * v98 sent VERSION and got no reply.
++ *
++ * So every access to the shared FIFO has to be wrapped in explicit cache
++ * maintenance: clean (dc cvac) after we produce, invalidate (dc civac) before
++ * we consume. Lines are 64 bytes; ranges are rounded outwards.
++ */
++#define GLINK_CACHELINE  64ULL
++
++static inline void
++glink_cache_clean(uintptr_t start, size_t len)
++{
++	uintptr_t a = start & ~(GLINK_CACHELINE - 1);
++	uintptr_t e = (start + len + GLINK_CACHELINE - 1) & ~(GLINK_CACHELINE - 1);
++
++	for (; a < e; a += GLINK_CACHELINE) {
++		__asm__ volatile("dc cvac, %0" :: "r"(a) : "memory");
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static inline void
++glink_cache_inval(uintptr_t start, size_t len)
++{
++	uintptr_t a = start & ~(GLINK_CACHELINE - 1);
++	uintptr_t e = (start + len + GLINK_CACHELINE - 1) & ~(GLINK_CACHELINE - 1);
++
++	for (; a < e; a += GLINK_CACHELINE) {
++		__asm__ volatile("dc civac, %0" :: "r"(a) : "memory");
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++/* Cached alias: raw access; callers pair it with glink_cache_* maintenance. */
 +static inline uint32_t rd32(volatile uint32_t *a)
 +{
 +	uint32_t v = *a;
@@ -2713,6 +2766,10 @@ new file mode 100644
 +		f->head = (volatile uint32_t *)(msg + off + 4);
 +		f->data = (uint8_t *)(msg + off + 8);
 +		f->len = sz - 8;
++		if (rep != NULL) {
++			if (f == &tx_f) { rep->tx_off = off; rep->tx_sz = sz; }
++			else            { rep->rx_off = off; rep->rx_sz = sz; }
++		}
 +	}
 +	if (tx_f.data == NULL || rx_f.data == NULL)
 +		return -3;
@@ -2736,7 +2793,10 @@ new file mode 100644
 +	for (i = 0; i < hlen; i++) buf[i] = ((const uint8_t *)hdr)[i];
 +	for (i = 0; i < dlen; i++) buf[hlen + i] = ((const uint8_t *)data)[i];
 +
-+	for (spin = 0; fifo_space(tx_f.head, tx_f.tail, tx_f.len) < len; spin++) {
++	for (spin = 0; ; spin++) {
++		/* Re-read the RPM-owned tail out of DDR before deciding space. */
++		glink_cache_inval((uintptr_t)tx_f.tail, 4);
++		if (fifo_space(tx_f.head, tx_f.tail, tx_f.len) >= len) break;
 +		if (spin > SPIN_BUDGET) return -2;
 +	}
 +	h = rd32(tx_f.head);
@@ -2747,7 +2807,10 @@ new file mode 100644
 +		h += 4;
 +		if (h >= tx_f.len) h = 0;
 +	}
-+	wr32(tx_f.head, h);   /* head write is the notification (no doorbell) */
++	/* Push the payload to DDR, then publish head (the notification). */
++	glink_cache_clean((uintptr_t)tx_f.data, tx_f.len);
++	wr32(tx_f.head, h);
++	glink_cache_clean((uintptr_t)tx_f.head, 4);
 +	return 0;
 +}
 +
@@ -2778,6 +2841,8 @@ new file mode 100644
 +{
 +	uint32_t t = rd32(rx_f.tail);
 +	wr32(rx_f.tail, (t + n) % rx_f.len);
++	/* Let the RPM see that we consumed, so it can refill. */
++	glink_cache_clean((uintptr_t)rx_f.tail, 4);
 +}
 +
 +/* Parse an RPM response payload for a "msg#" ack entry. */
@@ -2807,9 +2872,14 @@ new file mode 100644
 +	for (guard = 0; guard < 256; guard++) {
 +		struct glmsg m;
 +		uint32_t avail;
++
++		/* RPM owns rx head: pull its line out of DDR before testing. */
++		glink_cache_inval((uintptr_t)rx_f.head, 4);
 +		if (rd32(rx_f.head) == rd32(rx_f.tail)) return;  /* true empty */
 +		avail = fifo_data(rx_f.head, rx_f.tail, rx_f.len);
 +		if (avail < sizeof(m)) return;
++		/* Payload may be stale in cache: refresh the whole data region. */
++		glink_cache_inval((uintptr_t)rx_f.data, rx_f.len);
 +		rx_peek(0, &m, sizeof(m));
 +		switch (m.cmd) {
 +		case GCMD_VERSION:
@@ -2936,6 +3006,8 @@ new file mode 100644
 +		g_rep = rep;
 +		rep->rc = -99;
 +		rep->toc_magic = rep->nentries = rep->tx_len = rep->rx_len = 0;
++		rep->tx_off = rep->tx_sz = rep->rx_off = rep->rx_sz = 0;
++		rep->tx_head0 = rep->tx_tail0 = rep->rx_head0 = rep->rx_tail0 = 0;
 +		rep->remote_cid = 0; rep->state = 0; rep->ack_msg_id = 0;
 +	} else {
 +		g_rep = NULL;
@@ -2954,9 +3026,21 @@ new file mode 100644
 +		return rc;
 +	if (rep) rep->state |= SAGIT_GLINK_ST_TOC;
 +
-+	/* Reset our indices, then start the version handshake. */
-+	wr32(tx_f.head, 0);
-+	wr32(rx_f.tail, 0);
++	/*
++	 * Do NOT reset our indices. Linux never rewrites head/tail at startup:
++	 * the RPM owns tx.tail and rx.head, and forcing our side to 0 breaks the
++	 * ring invariant (head==tail == empty). v98 did reset and the RPM went
++	 * silent. Just record what the RPM left behind.
++	 */
++	glink_cache_inval((uintptr_t)tx_f.tail, 8);
++	glink_cache_inval((uintptr_t)rx_f.tail, 8);
++	if (rep != NULL) {
++		rep->tx_head0 = rd32(tx_f.head);
++		rep->tx_tail0 = rd32(tx_f.tail);
++		rep->rx_head0 = rd32(rx_f.head);
++		rep->rx_tail0 = rd32(rx_f.tail);
++	}
++
 +	if (send_cmd(GCMD_VERSION, GLINK_VERSION_1, 0))
 +		return -4;
 +	if (wait_until(is_remote_open))
@@ -2994,7 +3078,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_glink.h
 --- /dev/null
 +++ b/bsd/dev/sagit_glink.h
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,38 @@
 +/*
 + * SAGIT: G-Link over RPM message RAM, used to vote PM8998 LDO6 (touch vdd).
 + *
@@ -3015,6 +3099,10 @@ new file mode 100644
 +	uint32_t toc_magic;     /* "grt0" 0x67727430 when RAM is readable */
 +	uint32_t nentries;      /* TOC entries */
 +	uint32_t tx_len, rx_len;/* FIFO data-region lengths */
++	uint32_t tx_off, tx_sz; /* TX FIFO TOC entry: offset / size */
++	uint32_t rx_off, rx_sz; /* RX FIFO TOC entry: offset / size */
++	uint32_t tx_head0, tx_tail0; /* TX head/tail as read before any write */
++	uint32_t rx_head0, rx_tail0; /* RX head/tail as read before any read */
 +	uint16_t remote_cid;    /* channel id the RPM opened */
 +	uint32_t state;         /* bitmask of handshake milestones */
 +	uint32_t ack_msg_id;    /* last ack seen */
