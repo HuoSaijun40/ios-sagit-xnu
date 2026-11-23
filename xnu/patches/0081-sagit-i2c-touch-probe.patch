@@ -2549,7 +2549,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_glink.c
 --- /dev/null
 +++ b/bsd/dev/sagit_glink.c
-@@ -0,0 +1,615 @@
+@@ -0,0 +1,655 @@
 +/*
 + * SAGIT: minimal G-Link over RPM message RAM, from the XNU BSD layer.
 + *
@@ -2636,17 +2636,14 @@ new file mode 100644
 +#define RPM_MSG_TYPE_ID  0x2367736dUL   /* "msg#" */
 +#define RPM_MSG_TYPE_ERR 0x00727265UL   /* "err\0" */
 +
-+/* Keep modest: 2e8 spins triggered the SoC watchdog in v95ldo6 (shim).
-+ * With the cached alias the RPM replies fast, so 2e6 is ample. */
 +/*
-+ * v100 hung after the SMEM line and the watchdog reset the phone: the polling
-+ * loop was far too expensive. rx_pump() invalidated the whole 1.7 KB data
-+ * region (18 cache lines) on *every* iteration of its 256-pass guard loop, and
-+ * wait_until() ran that up to SPIN_BUDGET times -- worst case ~2.3 billion
-+ * "dc civac". The budget is now small and the region is refreshed once per
-+ * pump, not per message. v95 used 200M plain spins and also tripped a reset.
++ * Polling budget. rx_pump() now refreshes only the queued bytes (typically one
++ * or two cache lines) instead of the whole ring, and it resyncs instead of
++ * re-scanning forever, so a spin is cheap again. 20k spins is ~4-40 ms of wall
++ * time -- plenty for the RPM (an MCU answering in tens of microseconds) yet
++ * safely under the boot watchdog.
 + */
-+#define SPIN_BUDGET      30000ULL
++#define SPIN_BUDGET      20000ULL
 +
 +struct gl_fifo {
 +	volatile uint32_t *tail;
@@ -2932,18 +2929,41 @@ new file mode 100644
 +static void
 +rx_pump(void)
 +{
-+	uint32_t guard;
++	uint32_t guard, h, t;
 +
 +	/* RPM owns rx head: refresh its line and bail if nothing arrived. */
-+	glink_cache_inval((uintptr_t)rx_f.head, 4);
-+	if (rd32(rx_f.head) == rd32(rx_f.tail)) return;  /* true empty */
++	glink_cache_inval((uintptr_t)rx_f.head, 8);
++	h = rd32(rx_f.head);
++	t = rd32(rx_f.tail);
 +
 +	/*
-+	 * Something is queued. Refresh the data region ONCE, then drain without
-+	 * re-invalidating per message -- doing it inside the loop is what made
-+	 * v100 spin for tens of seconds and hang.
++	 * A head outside the ring means the FIFO state is corrupt (or never
++	 * initialised): with a garbage head, "head != tail" is always true and
++	 * the drain loop below can never reach the head, so every poll re-scans
++	 * the whole ring. Reset both indices; the handshake has already
++	 * completed by the time this can matter.
 +	 */
-+	glink_cache_inval((uintptr_t)rx_f.data, rx_f.len);
++	if (h >= rx_f.len || t >= rx_f.len) {
++		wr32(rx_f.head, 0);
++		wr32(rx_f.tail, 0);
++		glink_cache_clean((uintptr_t)rx_f.tail, 8);
++		return;
++	}
++	if (h == t) return;                     /* true empty */
++
++	/* Refresh only what is queued, not the whole 1.7 KB ring. */
++	{
++		uint32_t need = h > t ? h - t : rx_f.len - t + h;
++		uint32_t part1 = rx_f.len - t;
++
++		if (need > rx_f.len) need = rx_f.len;
++		if (need <= part1) {
++			glink_cache_inval((uintptr_t)rx_f.data + t, need);
++		} else {
++			glink_cache_inval((uintptr_t)rx_f.data + t, part1);
++			glink_cache_inval((uintptr_t)rx_f.data, need - part1);
++		}
++	}
 +
 +	for (guard = 0; guard < 24; guard++) {
 +		struct glmsg m;
@@ -3015,6 +3035,21 @@ new file mode 100644
 +			break;
 +		}
 +	}
++
++	/*
++	 * 24 messages without emptying the ring means tail and head disagree: the
++	 * messages were mis-framed (tail drifted off a boundary) or the ring is
++	 * being filled faster than we drain. Snap tail to head and drop the rest,
++	 * otherwise the next poll re-reads the same bytes forever. Everything we
++	 * need from the handshake has already been parsed at this point.
++	 */
++	{
++		uint32_t h2 = rd32(rx_f.head);
++		if (h2 < rx_f.len) {
++			wr32(rx_f.tail, h2);
++			glink_cache_clean((uintptr_t)rx_f.tail, 4);
++		}
++	}
 +}
 +
 +static int wait_until(int (*done)(void))
@@ -3061,14 +3096,19 @@ new file mode 100644
 +		struct { struct glmsg m; uint32_t chunk, left; } gh;
 +		gh.m.cmd = GCMD_TX_DATA; gh.m.param1 = CHAN_LCID; gh.m.param2 = 0;
 +		gh.chunk = n; gh.left = 0;
-+		if (tx_write(&gh, sizeof(gh), pkt, n))
++		if (tx_write(&gh, sizeof(gh), pkt, n)) {
++			printf("SAGIT GLINK: req%u tx failed\n", msg_id);
 +			return -1;
++		}
 +	}
++	printf("SAGIT GLINK: req%u tx ok\n", msg_id);
 +	req_acked = 0;
 +	for (spin = 0; spin < SPIN_BUDGET; spin++) {
 +		rx_pump();
 +		if (req_acked && seen_msg_id == msg_id) return 0;
 +	}
++	printf("SAGIT GLINK: req%u no ack seen=%u kind=%u\n",
++	    msg_id, seen_msg_id, g_rep ? g_rep->ack_kind : 0);
 +	return -2;
 +}
 +
