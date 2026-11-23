@@ -2543,7 +2543,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_glink.c
 --- /dev/null
 +++ b/bsd/dev/sagit_glink.c
-@@ -0,0 +1,550 @@
+@@ -0,0 +1,593 @@
 +/*
 + * SAGIT: minimal G-Link over RPM message RAM, from the XNU BSD layer.
 + *
@@ -2632,12 +2632,14 @@ new file mode 100644
 +/* Keep modest: 2e8 spins triggered the SoC watchdog in v95ldo6 (shim).
 + * With the cached alias the RPM replies fast, so 2e6 is ample. */
 +/*
-+ * Each rx_pump() now also does a "dc civac" + "dsb sy", so a spin is far more
-+ * expensive than a bare load. 500k spins is ~50-100ms of wall time -- plenty
-+ * for the RPM (an MCU answering in tens of microseconds) yet safely under the
-+ * boot watchdog. v95 used 200M and tripped a reset.
++ * v100 hung after the SMEM line and the watchdog reset the phone: the polling
++ * loop was far too expensive. rx_pump() invalidated the whole 1.7 KB data
++ * region (18 cache lines) on *every* iteration of its 256-pass guard loop, and
++ * wait_until() ran that up to SPIN_BUDGET times -- worst case ~2.3 billion
++ * "dc civac". The budget is now small and the region is refreshed once per
++ * pump, not per message. v95 used 200M plain spins and also tripped a reset.
 + */
-+#define SPIN_BUDGET      500000ULL
++#define SPIN_BUDGET      30000ULL
 +
 +struct gl_fifo {
 +	volatile uint32_t *tail;
@@ -2706,19 +2708,35 @@ new file mode 100644
 + * Ring the RPM. 0x17911008 is the APCS IPC command register for the RPM cell;
 + * write BIT(0). Mapped lazily once through the device window.
 + */
++/*
++ * Ring the RPM. 0x17911008 is the APCS IPC command register for the RPM cell;
++ * write BIT(0). Mapped once through the device window.
++ */
++static volatile uint32_t *apcs_ipc;
++
++static int
++glink_doorbell_init(void)
++{
++	vm_offset_t va;
++
++	if (apcs_ipc != NULL) {
++		return 1;
++	}
++	va = ml_io_map(APCS_IPC_BASE, APCS_IPC_SIZE);
++	if (va == 0) {
++		return 0;
++	}
++	apcs_ipc = (volatile uint32_t *)va;
++	return 1;
++}
++
 +static int
 +glink_doorbell(void)
 +{
-+	static volatile uint32_t *apcs;
-+
-+	if (apcs == NULL) {
-+		vm_offset_t va = ml_io_map(APCS_IPC_BASE, APCS_IPC_SIZE);
-+		if (va == 0) {
-+			return 0;
-+		}
-+		apcs = (volatile uint32_t *)va;
++	if (!glink_doorbell_init()) {
++		return 0;
 +	}
-+	apcs[APCS_IPC_OFF / 4] = (1u << APCS_IPC_RPM_BIT);
++	apcs_ipc[APCS_IPC_OFF / 4] = (1u << APCS_IPC_RPM_BIT);
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	return 1;
 +}
@@ -2888,17 +2906,24 @@ new file mode 100644
 +rx_pump(void)
 +{
 +	uint32_t guard;
-+	for (guard = 0; guard < 256; guard++) {
++
++	/* RPM owns rx head: refresh its line and bail if nothing arrived. */
++	glink_cache_inval((uintptr_t)rx_f.head, 4);
++	if (rd32(rx_f.head) == rd32(rx_f.tail)) return;  /* true empty */
++
++	/*
++	 * Something is queued. Refresh the data region ONCE, then drain without
++	 * re-invalidating per message -- doing it inside the loop is what made
++	 * v100 spin for tens of seconds and hang.
++	 */
++	glink_cache_inval((uintptr_t)rx_f.data, rx_f.len);
++
++	for (guard = 0; guard < 24; guard++) {
 +		struct glmsg m;
 +		uint32_t avail;
 +
-+		/* RPM owns rx head: pull its line out of DDR before testing. */
-+		glink_cache_inval((uintptr_t)rx_f.head, 4);
-+		if (rd32(rx_f.head) == rd32(rx_f.tail)) return;  /* true empty */
 +		avail = fifo_data(rx_f.head, rx_f.tail, rx_f.len);
 +		if (avail < sizeof(m)) return;
-+		/* Payload may be stale in cache: refresh the whole data region. */
-+		glink_cache_inval((uintptr_t)rx_f.data, rx_f.len);
 +		rx_peek(0, &m, sizeof(m));
 +		switch (m.cmd) {
 +		case GCMD_VERSION:
@@ -2915,9 +2940,10 @@ new file mode 100644
 +			uint32_t n = extra < 31 ? extra : 31;
 +			char name[32];
 +			uint32_t i;
-+			for (i = 0; i < sizeof(name); i++) name[i] = 0;
++
 +			extra = (extra + 7) & ~7u;
-+			if (avail < sizeof(m) + extra) return;
++			if (extra > rx_f.len || avail < sizeof(m) + extra) return;
++			for (i = 0; i < sizeof(name); i++) name[i] = 0;
 +			rx_peek(sizeof(m), name, n);
 +			rx_advance(sizeof(m) + extra);
 +			if (str_eq(name, CHAN_NAME)) {
@@ -2931,7 +2957,12 @@ new file mode 100644
 +			if (m.param1 == CHAN_LCID) open_acked = 1;
 +			break;
 +		case GCMD_INTENT:
-+			rx_advance(sizeof(m) + ((m.param2 * 8 + 7) & ~7u));
++			/* param2 is a pair count; reject absurd values outright. */
++			if (m.param2 > rx_f.len / 8) {
++				rx_advance(sizeof(m));
++				break;
++			}
++			rx_advance(sizeof(m) + m.param2 * 8);
 +			break;
 +		case GCMD_READ_NOTIF:
 +			rx_advance(sizeof(m));
@@ -2940,10 +2971,11 @@ new file mode 100644
 +		case GCMD_TX_DATA_CONT: {
 +			uint32_t ch, total;
 +			uint8_t payload[64];
++
 +			if (avail < 16) return;
 +			rx_peek(8, &ch, 4);
 +			total = 16 + ((ch + 7) & ~7u);
-+			if (avail < total) return;
++			if (ch > rx_f.len || avail < total) return;
 +			if (ch <= sizeof(payload)) {
 +				rx_peek(16, payload, ch);
 +				parse_rpm_ack(payload, ch);
@@ -3044,6 +3076,7 @@ new file mode 100644
 +	if (rc)
 +		return rc;
 +	if (rep) rep->state |= SAGIT_GLINK_ST_TOC;
++	printf("SAGIT GLINK: apcs map=%d\n", glink_doorbell_init());
 +
 +	/*
 +	 * Record what the RPM left behind, then reset our own indices to 0 --
@@ -3062,11 +3095,18 @@ new file mode 100644
 +	wr32(tx_f.head, 0);
 +	wr32(rx_f.tail, 0);
 +	glink_cache_clean((uintptr_t)tx_f.tail, 8);
++	/* Breadcrumb: if the phone hangs, this is the last stage that ran. */
++	printf("SAGIT GLINK: toc tx/rx=%u/%u had h=%u/%u\n",
++	    tx_f.len, rx_f.len,
++	    rep ? rep->tx_head0 : 0, rep ? rep->rx_head0 : 0);
 +
 +	if (send_cmd(GCMD_VERSION, GLINK_VERSION_1, 0))
 +		return -4;
++	printf("SAGIT GLINK: ver sent db=%d\n",
++	    (rep && (rep->state & SAGIT_GLINK_ST_DOORBELL)) ? 1 : 0);
 +	if (wait_until(is_remote_open))
 +		return -5;
++	printf("SAGIT GLINK: remote open cid=%u\n", remote_cid);
 +	if (rep) { rep->remote_cid = remote_cid; rep->state |= SAGIT_GLINK_ST_OPEN_REM; }
 +
 +	/* Acknowledge the RPM's open, and open our end of rpm_requests. */
@@ -3082,13 +3122,16 @@ new file mode 100644
 +		return -7;
 +	if (wait_until(is_open_ack))
 +		return -8;
++	printf("SAGIT GLINK: open_ack ok\n");
 +	if (rep) rep->state |= SAGIT_GLINK_ST_OPEN_ACK;
 +
 +	/* Vote LDO6: set 1.8V then enable. */
 +	if (rpm_request(1, RPM_RES_LDOA, LDO6_ID, RPM_KEY_UV, LDO6_UV))
 +		return -9;
++	printf("SAGIT GLINK: ldo6 uv acked\n");
 +	if (rpm_request(2, RPM_RES_LDOA, LDO6_ID, RPM_KEY_SWEN, 1))
 +		return -10;
++	printf("SAGIT GLINK: ldo6 swen acked\n");
 +	if (rep) { rep->state |= SAGIT_GLINK_ST_REQ_ACK; rep->ack_msg_id = seen_msg_id; }
 +	return 0;
 +}
