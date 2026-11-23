@@ -2549,7 +2549,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_glink.c
 --- /dev/null
 +++ b/bsd/dev/sagit_glink.c
-@@ -0,0 +1,655 @@
+@@ -0,0 +1,681 @@
 +/*
 + * SAGIT: minimal G-Link over RPM message RAM, from the XNU BSD layer.
 + *
@@ -2695,17 +2695,19 @@ new file mode 100644
 +	__asm__ volatile("dsb sy" ::: "memory");
 +}
 +
-+/* Cached alias: raw access; callers pair it with glink_cache_* maintenance. */
++/*
++ * Cached alias: raw access. The caller has already done the cache maintenance
++ * (glink_cache_inval/clean), which ends in "dsb sy", so a barrier on every
++ * single 32-bit touch is pure overhead -- rx_peek() would otherwise insert a
++ * dozen dsb's per payload and each poll became microseconds long.
++ */
 +static inline uint32_t rd32(volatile uint32_t *a)
 +{
-+	uint32_t v = *a;
-+	__asm__ volatile("dsb sy" ::: "memory");
-+	return v;
++	return *a;
 +}
 +static inline void wr32(volatile uint32_t *a, uint32_t v)
 +{
 +	*a = v;
-+	__asm__ volatile("dsb sy" ::: "memory");
 +}
 +
 +/*
@@ -2821,7 +2823,7 @@ new file mode 100644
 +{
 +	uint8_t buf[64];
 +	uint32_t len = (hlen + dlen + 7) & ~7u;
-+	uint32_t h, i, word;
++	uint32_t h, h0, i, word;
 +	uint64_t spin;
 +
 +	if (len > sizeof(buf) || len >= tx_f.len)
@@ -2830,13 +2832,24 @@ new file mode 100644
 +	for (i = 0; i < hlen; i++) buf[i] = ((const uint8_t *)hdr)[i];
 +	for (i = 0; i < dlen; i++) buf[hlen + i] = ((const uint8_t *)data)[i];
 +
++	/* One-line FIFO snapshot: if the next line never appears, we are stuck
++	 * waiting for space and these three numbers say why. */
++	glink_cache_inval((uintptr_t)tx_f.tail, 8);
++	printf("SAGIT GLINK: txw len=%u h=%u t=%u ring=%u\n",
++	    len, rd32(tx_f.head), rd32(tx_f.tail), tx_f.len);
++
 +	for (spin = 0; ; spin++) {
 +		/* Re-read the RPM-owned tail out of DDR before deciding space. */
 +		glink_cache_inval((uintptr_t)tx_f.tail, 4);
 +		if (fifo_space(tx_f.head, tx_f.tail, tx_f.len) >= len) break;
-+		if (spin > SPIN_BUDGET) return -2;
++		if (spin > SPIN_BUDGET) {
++			printf("SAGIT GLINK: txw full h=%u t=%u\n",
++			    rd32(tx_f.head), rd32(tx_f.tail));
++			return -2;
++		}
 +	}
 +	h = rd32(tx_f.head);
++	h0 = h;
 +	for (i = 0; i < len; i += 4) {
 +		word = (uint32_t)buf[i] | ((uint32_t)buf[i+1] << 8) |
 +		       ((uint32_t)buf[i+2] << 16) | ((uint32_t)buf[i+3] << 24);
@@ -2844,8 +2857,21 @@ new file mode 100644
 +		h += 4;
 +		if (h >= tx_f.len) h = 0;
 +	}
-+	/* Push the payload to DDR, then publish head (the notification). */
-+	glink_cache_clean((uintptr_t)tx_f.data, tx_f.len);
++	/*
++	 * Push only the bytes just written to DDR. Cleaning the whole ring was
++	 * both wasteful and dangerous: if tx_f.len were ever wrong this loop
++	 * would run for a very long time.
++	 */
++	{
++		uint32_t part1 = tx_f.len - h0;
++
++		if (len <= part1) {
++			glink_cache_clean((uintptr_t)tx_f.data + h0, len);
++		} else {
++			glink_cache_clean((uintptr_t)tx_f.data + h0, part1);
++			glink_cache_clean((uintptr_t)tx_f.data, len - part1);
++		}
++	}
 +	wr32(tx_f.head, h);
 +	glink_cache_clean((uintptr_t)tx_f.head, 4);
 +	/* ...and interrupt the RPM, so it actually looks at the FIFO. */
@@ -3164,7 +3190,7 @@ new file mode 100644
 +	wr32(rx_f.tail, 0);
 +	glink_cache_clean((uintptr_t)tx_f.tail, 8);
 +	/* Breadcrumb: if the phone hangs, this is the last stage that ran. */
-+	printf("SAGIT GLINK: toc tx/rx=%u/%u had h=%u/%u\n",
++	printf("SAGIT GLINK: v104 toc tx/rx=%u/%u had h=%u/%u\n",
 +	    tx_f.len, rx_f.len,
 +	    rep ? rep->tx_head0 : 0, rep ? rep->rx_head0 : 0);
 +
