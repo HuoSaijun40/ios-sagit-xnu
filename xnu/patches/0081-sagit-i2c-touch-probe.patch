@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1681 @@
+@@ -0,0 +1,1687 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -271,6 +271,8 @@ new file mode 100644
 +	uint32_t glink_rc;              /* sagit_glink_ldo6_on() result: 0=ok */
 +	uint32_t glink_state;           /* handshake milestone bitmask */
 +	uint32_t glink_ack;             /* last ack msg_id seen */
++	uint32_t glink_ack_kind;        /* 0=none 1=msg# 2=err */
++	uint32_t glink_ack_err;         /* first 4 bytes of an err string */
 +	uint32_t glink_tx_off, glink_tx_sz, glink_tx_h, glink_tx_t;
 +	uint32_t glink_rx_off, glink_rx_sz, glink_rx_h, glink_rx_t;
 +	uint32_t phys_base;             /* gPhysBase XNU is running with */
@@ -1280,7 +1282,8 @@ new file mode 100644
 +	uint32_t rst_io = si2c_tlmm_rd(SAGIT_PIN_RESET, TLMM_GPIO_IN_OUT);
 +
 +	panic("SAGIT touch: %s (rc=%d)\n"
-+	    " glink rc=%d st=0x%x ack=%u | tx o/s/h/t=0x%x/0x%x/0x%x/0x%x "
++	    " glink rc=%d st=0x%x ack(id/kind/err)=%u/%u/0x%x "
++	    "| tx o/s/h/t=0x%x/0x%x/0x%x/0x%x "
 +	    "| rx o/s/h/t=0x%x/0x%x/0x%x/0x%x\n"
 +	    " rpm toc/cnt=0x%x/%u | smem rc/magic=%d/0x%x | phys=0x%x/0x%x\n"
 +	    " i2c st=0x%x err=0x%x ist=0x%x txn=%d | rst 0x%x/0x%x drv=%d "
@@ -1288,6 +1291,7 @@ new file mode 100644
 +	    " pmic(rc/ver/apid/st)=%d/0x%x/0x%x/0x%x",
 +	    what, (int)extra,
 +	    (int)si2c.glink_rc, si2c.glink_state, si2c.glink_ack,
++	    si2c.glink_ack_kind, si2c.glink_ack_err,
 +	    si2c.glink_tx_off, si2c.glink_tx_sz, si2c.glink_tx_h, si2c.glink_tx_t,
 +	    si2c.glink_rx_off, si2c.glink_rx_sz, si2c.glink_rx_h, si2c.glink_rx_t,
 +	    si2c.rpm_toc_magic, si2c.rpm_toc_count,
@@ -1351,6 +1355,8 @@ new file mode 100644
 +			si2c.glink_rc = (uint32_t)sagit_glink_ldo6_on(&gr);
 +			si2c.glink_state = gr.state;
 +			si2c.glink_ack = gr.ack_msg_id;
++			si2c.glink_ack_kind = gr.ack_kind;
++			si2c.glink_ack_err = gr.ack_err;
 +			si2c.glink_tx_off = gr.tx_off; si2c.glink_tx_sz = gr.tx_sz;
 +			si2c.glink_rx_off = gr.rx_off; si2c.glink_rx_sz = gr.rx_sz;
 +			si2c.glink_tx_h = gr.tx_head0; si2c.glink_tx_t = gr.tx_tail0;
@@ -2543,7 +2549,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_glink.c
 --- /dev/null
 +++ b/bsd/dev/sagit_glink.c
-@@ -0,0 +1,593 @@
+@@ -0,0 +1,615 @@
 +/*
 + * SAGIT: minimal G-Link over RPM message RAM, from the XNU BSD layer.
 + *
@@ -2628,6 +2634,7 @@ new file mode 100644
 +#define LDO6_ID          6
 +#define LDO6_UV          1800000UL
 +#define RPM_MSG_TYPE_ID  0x2367736dUL   /* "msg#" */
++#define RPM_MSG_TYPE_ERR 0x00727265UL   /* "err\0" */
 +
 +/* Keep modest: 2e8 spins triggered the SoC watchdog in v95ldo6 (shim).
 + * With the cached alias the RPM replies fast, so 2e6 is ample. */
@@ -2882,20 +2889,40 @@ new file mode 100644
 +	glink_cache_clean((uintptr_t)rx_f.tail, 4);
 +}
 +
-+/* Parse an RPM response payload for a "msg#" ack entry. */
++/*
++ * Walk the key/value-style entries of an RPM response.
++ *
++ * v101 hung here: "off += 8 + ((ml + 3) & ~3u)" wraps around when the length
++ * field is garbage (ml = 0xFFFFFFF8 makes the add 0x100000000, which is 0 in
++ * 32 bits), so off never advances and this loops forever. Any entry that does
++ * not fit inside the payload is now treated as the end of the response.
++ */
 +static void
 +parse_rpm_ack(uint8_t *payload, uint32_t ch)
 +{
 +	uint32_t off;
++
 +	for (off = 8; off + 8 <= ch; ) {
 +		uint32_t mt = payload[off] | ((uint32_t)payload[off+1] << 8) |
 +		              ((uint32_t)payload[off+2] << 16) | ((uint32_t)payload[off+3] << 24);
 +		uint32_t ml = payload[off+4] | ((uint32_t)payload[off+5] << 8) |
 +		              ((uint32_t)payload[off+6] << 16) | ((uint32_t)payload[off+7] << 24);
-+		if (mt == RPM_MSG_TYPE_ID && ml >= 4 && off + 12 <= ch) {
++
++		if (ml > ch - off - 8) {
++			break;      /* truncated or garbage length: stop, do not wrap */
++		}
++		if (mt == RPM_MSG_TYPE_ID && ml >= 4) {
 +			seen_msg_id = payload[off+8] | ((uint32_t)payload[off+9] << 8) |
 +			              ((uint32_t)payload[off+10] << 16) | ((uint32_t)payload[off+11] << 24);
 +			req_acked = 1;
++			if (g_rep) g_rep->ack_kind = 1;
++		} else if (mt == RPM_MSG_TYPE_ERR) {
++			if (g_rep) {
++				g_rep->ack_kind = 2;
++				g_rep->ack_err = ml >= 4 ?
++				    (payload[off+8] | ((uint32_t)payload[off+9] << 8) |
++				     ((uint32_t)payload[off+10] << 16) | ((uint32_t)payload[off+11] << 24)) : 0;
++			}
 +		}
 +		off += 8 + ((ml + 3) & ~3u);
 +	}
@@ -3060,6 +3087,7 @@ new file mode 100644
 +		rep->tx_off = rep->tx_sz = rep->rx_off = rep->rx_sz = 0;
 +		rep->tx_head0 = rep->tx_tail0 = rep->rx_head0 = rep->rx_tail0 = 0;
 +		rep->remote_cid = 0; rep->state = 0; rep->ack_msg_id = 0;
++		rep->ack_kind = rep->ack_err = 0;
 +	} else {
 +		g_rep = NULL;
 +	}
@@ -3143,7 +3171,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_glink.h
 --- /dev/null
 +++ b/bsd/dev/sagit_glink.h
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,41 @@
 +/*
 + * SAGIT: G-Link over RPM message RAM, used to vote PM8998 LDO6 (touch vdd).
 + *
@@ -3171,6 +3199,8 @@ new file mode 100644
 +	uint16_t remote_cid;    /* channel id the RPM opened */
 +	uint32_t state;         /* bitmask of handshake milestones */
 +	uint32_t ack_msg_id;    /* last ack seen */
++	uint32_t ack_kind;      /* 0=none, 1="msg#" ack, 2="err" */
++	uint32_t ack_err;       /* first 4 bytes of an "err" string */
 +};
 +
 +#define SAGIT_GLINK_ST_TOC      0x01u
