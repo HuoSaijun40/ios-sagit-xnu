@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1689 @@
+@@ -0,0 +1,1703 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -1196,16 +1196,24 @@ new file mode 100644
 + *   ts_reset_active  : gpio89, drive-strength <16>, bias-pull-up
 + *   ts_reset_suspend1: gpio89, drive-strength <2>,  bias-pull-down
 + *
-+ * There is no output-high / input-enable anywhere for gpio89, and
-+ * "reset-on-state = 0" means the normal (running) level of the line is 0. So
-+ * this is an active-HIGH reset whose idle level is low: the host must drive it
-+ * HIGH to release, and the pull-up alone can never do that (a pull-up with the
-+ * driver off is *not* the same thing as a driven high, which is why rst io
-+ * stayed 0 for v59-v64).
++ * Polarity, settled against the vendor driver itself
++ * (synaptics_dsx_core.c, synaptics_rmi4_set_gpio):
 + *
-+ * New sequence:
-+ *   1. drive LOW  (reset asserted)       and wait reset-active-ms  (5 ms)
-+ *   2. drive HIGH (reset deasserted)     and wait reset-delay-ms   (200 ms)
++ *     gpio_set_value(reset_gpio,  reset_on_state);  msleep(reset_active_ms);
++ *     gpio_set_value(reset_gpio, !reset_on_state);  msleep(reset_delay_ms);
++ *
++ * "reset_on_state" is the ASSERT level, and reset-on-state = 0 in this panel's
++ * DT, so the part is held in reset while the line is LOW and released when it
++ * goes HIGH. (An earlier comment here called this "active-HIGH", which was
++ * just wrong wording -- the sequence below has always been low-assert.)
++ *
++ * ts_reset_active carrying bias-pull-up is not evidence against this: with the
++ * driver off a pull-up cannot drive the line, which is why rst io stayed 0 for
++ * v59-v64 until this function started enabling the output driver.
++ *
++ * Sequence:
++ *   1. drive LOW  (reset asserted)   and wait reset-active-ms  (>= 5 ms)
++ *   2. drive HIGH (reset released)   and wait reset-delay-ms   (200 ms)
 + * The line is left DRIVEN HIGH, so the part never loses its release.
 + */
 +static void
@@ -1236,7 +1244,13 @@ new file mode 100644
 +	si2c_tlmm_io_wr(SAGIT_PIN_RESET, 0);
 +	si2c_tlmm_wr(SAGIT_PIN_RESET, TLMM_GPIO_CFG, cfg);
 +	si2c.rst_cfg_low = si2c_tlmm_rd(SAGIT_PIN_RESET, TLMM_GPIO_CFG);
-+	si2c_wait_ms(5);                        /* reset-active-ms */
++	/*
++	 * The vendor DT asks for reset-active-ms = 5, but mainline rmi4 defaults
++	 * to 20 ms and a longer low pulse is strictly safer: the part latches
++	 * its reset only while the line is actually low, and 5 ms of *spin*
++	 * (si2c_wait_ms is a calibrated busy-wait, not a timer) can land short.
++	 */
++	si2c_wait_ms(20);                       /* reset-active-ms (>=5) */
 +
 +	/* 2. deassert: drive high and LEAVE IT DRIVEN. */
 +	si2c_tlmm_io_wr(SAGIT_PIN_RESET, 1);
@@ -1287,7 +1301,7 @@ new file mode 100644
 +	    "| rx o/s/h/t=0x%x/0x%x/0x%x/0x%x\n"
 +	    " rpm toc/cnt=0x%x/%u | smem rc/magic=%d/0x%x | phys=0x%x/0x%x\n"
 +	    " i2c st=0x%x err=0x%x ist=0x%x txn=%d clk=0x%x/0x%x "
-+	    "| rst 0x%x/0x%x drv=%d "
++	    "| rst lo/hi=0x%x/0x%x io=0x%x drv=%d "
 +	    "| avdd=0x%x/0x%x | scl=0x%x/0x%x sda=0x%x/0x%x\n"
 +	    " pmic(rc/ver/apid/st)=%d/0x%x/0x%x/0x%x",
 +	    what, (int)extra,
@@ -1301,7 +1315,7 @@ new file mode 100644
 +	    si2c_rdq(QUP_STATE), si2c_rdq(QUP_ERROR_FLAGS), si2c_rdq(QUP_I2C_STATUS),
 +	    (int)si2c.txn,
 +	    SAGIT_QUP_CLK_CTL_400K, si2c.clk_ctl_readback,
-+	    rst_cfg, rst_io, (int)si2c.rst_driven_high,
++	    si2c.rst_cfg_low, rst_cfg, rst_io, (int)si2c.rst_driven_high,
 +	    si2c.avdd_cfg_after, si2c.avdd_io_after,
 +	    scl_cfg, scl_io, sda_cfg, sda_io,
 +	    (int)si2c.pmic_rc, si2c.pmic_ver, si2c.pmic_apid, si2c.pmic_st);
