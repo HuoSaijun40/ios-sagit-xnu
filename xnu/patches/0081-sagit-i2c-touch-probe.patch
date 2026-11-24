@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1687 @@
+@@ -0,0 +1,1689 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -1286,7 +1286,8 @@ new file mode 100644
 +	    "| tx o/s/h/t=0x%x/0x%x/0x%x/0x%x "
 +	    "| rx o/s/h/t=0x%x/0x%x/0x%x/0x%x\n"
 +	    " rpm toc/cnt=0x%x/%u | smem rc/magic=%d/0x%x | phys=0x%x/0x%x\n"
-+	    " i2c st=0x%x err=0x%x ist=0x%x txn=%d | rst 0x%x/0x%x drv=%d "
++	    " i2c st=0x%x err=0x%x ist=0x%x txn=%d clk=0x%x/0x%x "
++	    "| rst 0x%x/0x%x drv=%d "
 +	    "| avdd=0x%x/0x%x | scl=0x%x/0x%x sda=0x%x/0x%x\n"
 +	    " pmic(rc/ver/apid/st)=%d/0x%x/0x%x/0x%x",
 +	    what, (int)extra,
@@ -1299,6 +1300,7 @@ new file mode 100644
 +	    si2c.phys_base, si2c.phys_size,
 +	    si2c_rdq(QUP_STATE), si2c_rdq(QUP_ERROR_FLAGS), si2c_rdq(QUP_I2C_STATUS),
 +	    (int)si2c.txn,
++	    SAGIT_QUP_CLK_CTL_400K, si2c.clk_ctl_readback,
 +	    rst_cfg, rst_io, (int)si2c.rst_driven_high,
 +	    si2c.avdd_cfg_after, si2c.avdd_io_after,
 +	    scl_cfg, scl_io, sda_cfg, sda_io,
@@ -2549,7 +2551,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_glink.c
 --- /dev/null
 +++ b/bsd/dev/sagit_glink.c
-@@ -0,0 +1,690 @@
+@@ -0,0 +1,703 @@
 +/*
 + * SAGIT: minimal G-Link over RPM message RAM, from the XNU BSD layer.
 + *
@@ -2632,6 +2634,7 @@ new file mode 100644
 +#define RPM_KEY_UV       0x00007675UL   /* "uv"   */
 +#define RPM_RES_LDOA     0x616f646cUL   /* "ldoa" */
 +#define LDO6_ID          6
++#define LDO14_ID         14             /* disp-supply of the incell panel */
 +#define LDO6_UV          1800000UL
 +#define RPM_MSG_TYPE_ID  0x2367736dUL   /* "msg#" */
 +#define RPM_MSG_TYPE_ERR 0x00727265UL   /* "err\0" */
@@ -3236,6 +3239,18 @@ new file mode 100644
 +		return -10;
 +	printf("SAGIT GLINK: ldo6 swen acked\n");
 +	if (rep) { rep->state |= SAGIT_GLINK_ST_REQ_ACK; rep->ack_msg_id = seen_msg_id; }
++
++	/*
++	 * The panel is incell (synaptics,panel-is-incell): the touch sensor sits
++	 * in the display glass, and the DT gives the node disp-supply =
++	 * pm8998_l14. Vote LDO14 too, best effort -- LDO6 alone got the chip no
++	 * further than "no I2C ACK".
++	 */
++	printf("SAGIT GLINK: voting ldo14\n");
++	(void)rpm_request(3, RPM_RES_LDOA, LDO14_ID, RPM_KEY_UV, LDO6_UV);
++	(void)rpm_request(4, RPM_RES_LDOA, LDO14_ID, RPM_KEY_SWEN, 1);
++	if (rep) rep->ack_msg_id = seen_msg_id;
++	printf("SAGIT GLINK: ldo14 done seen=%u\n", seen_msg_id);
 +	return 0;
 +}
 +
