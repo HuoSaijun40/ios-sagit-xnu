@@ -2551,7 +2551,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_glink.c
 --- /dev/null
 +++ b/bsd/dev/sagit_glink.c
-@@ -0,0 +1,703 @@
+@@ -0,0 +1,711 @@
 +/*
 + * SAGIT: minimal G-Link over RPM message RAM, from the XNU BSD layer.
 + *
@@ -2635,6 +2635,8 @@ new file mode 100644
 +#define RPM_RES_LDOA     0x616f646cUL   /* "ldoa" */
 +#define LDO6_ID          6
 +#define LDO14_ID         14             /* disp-supply of the incell panel */
++#define RPM_STATE_ACTIVE 0
++#define RPM_STATE_SLEEP  1
 +#define LDO6_UV          1800000UL
 +#define RPM_MSG_TYPE_ID  0x2367736dUL   /* "msg#" */
 +#define RPM_MSG_TYPE_ERR 0x00727265UL   /* "err\0" */
@@ -3095,7 +3097,8 @@ new file mode 100644
 +
 +/* Send one RPM resource request and wait for the matching "msg#" ack. */
 +static int
-+rpm_request(uint32_t msg_id, uint32_t type, uint32_t id, uint32_t key, uint32_t value)
++rpm_request(uint32_t msg_id, uint32_t state, uint32_t type, uint32_t id,
++    uint32_t key, uint32_t value)
 +{
 +	uint8_t pkt[48];
 +	uint32_t kv[3] = { key, 4, value };
@@ -3111,7 +3114,7 @@ new file mode 100644
 +	for (i = 0; i < 4; i++) pkt[n++] = (uint8_t)(w >> (8*i));
 +	w = msg_id;
 +	for (i = 0; i < 4; i++) pkt[n++] = (uint8_t)(w >> (8*i));
-+	w = 0;  /* ACTIVE state */
++	w = state;  /* 0 = ACTIVE, 1 = SLEEP */
 +	for (i = 0; i < 4; i++) pkt[n++] = (uint8_t)(w >> (8*i));
 +	w = type;
 +	for (i = 0; i < 4; i++) pkt[n++] = (uint8_t)(w >> (8*i));
@@ -3230,25 +3233,30 @@ new file mode 100644
 +	printf("SAGIT GLINK: open_ack ok\n");
 +	if (rep) rep->state |= SAGIT_GLINK_ST_OPEN_ACK;
 +
-+	/* Vote LDO6: set 1.8V then enable. */
++	/*
++	 * The DT declares qcom,set = <0x3> on both pm8998_l6 and pm8998_l14:
++	 * that bitmask is { ACTIVE, SLEEP }, i.e. the RPM keeps a separate
++	 * voltage/enable per power state and expects BOTH to be set. v106 only
++	 * voted ACTIVE and the rails never came up, which is why the chip kept
++	 * NACKing on I2C.
++	 */
 +	printf("SAGIT GLINK: voting ldo6\n");
-+	if (rpm_request(1, RPM_RES_LDOA, LDO6_ID, RPM_KEY_UV, LDO6_UV))
++	if (rpm_request(1, RPM_STATE_ACTIVE, RPM_RES_LDOA, LDO6_ID, RPM_KEY_UV, LDO6_UV))
 +		return -9;
-+	printf("SAGIT GLINK: ldo6 uv acked\n");
-+	if (rpm_request(2, RPM_RES_LDOA, LDO6_ID, RPM_KEY_SWEN, 1))
++	if (rpm_request(2, RPM_STATE_ACTIVE, RPM_RES_LDOA, LDO6_ID, RPM_KEY_SWEN, 1))
 +		return -10;
-+	printf("SAGIT GLINK: ldo6 swen acked\n");
++	printf("SAGIT GLINK: ldo6 active acked\n");
++	(void)rpm_request(3, RPM_STATE_SLEEP, RPM_RES_LDOA, LDO6_ID, RPM_KEY_UV, LDO6_UV);
++	(void)rpm_request(4, RPM_STATE_SLEEP, RPM_RES_LDOA, LDO6_ID, RPM_KEY_SWEN, 1);
++	printf("SAGIT GLINK: ldo6 sleep done seen=%u\n", seen_msg_id);
 +	if (rep) { rep->state |= SAGIT_GLINK_ST_REQ_ACK; rep->ack_msg_id = seen_msg_id; }
 +
-+	/*
-+	 * The panel is incell (synaptics,panel-is-incell): the touch sensor sits
-+	 * in the display glass, and the DT gives the node disp-supply =
-+	 * pm8998_l14. Vote LDO14 too, best effort -- LDO6 alone got the chip no
-+	 * further than "no I2C ACK".
-+	 */
++	/* disp-supply of the incell panel (pm8998_l14), same both-state rule. */
 +	printf("SAGIT GLINK: voting ldo14\n");
-+	(void)rpm_request(3, RPM_RES_LDOA, LDO14_ID, RPM_KEY_UV, LDO6_UV);
-+	(void)rpm_request(4, RPM_RES_LDOA, LDO14_ID, RPM_KEY_SWEN, 1);
++	(void)rpm_request(5, RPM_STATE_ACTIVE, RPM_RES_LDOA, LDO14_ID, RPM_KEY_UV, LDO6_UV);
++	(void)rpm_request(6, RPM_STATE_ACTIVE, RPM_RES_LDOA, LDO14_ID, RPM_KEY_SWEN, 1);
++	(void)rpm_request(7, RPM_STATE_SLEEP, RPM_RES_LDOA, LDO14_ID, RPM_KEY_UV, LDO6_UV);
++	(void)rpm_request(8, RPM_STATE_SLEEP, RPM_RES_LDOA, LDO14_ID, RPM_KEY_SWEN, 1);
 +	if (rep) rep->ack_msg_id = seen_msg_id;
 +	printf("SAGIT GLINK: ldo14 done seen=%u\n", seen_msg_id);
 +	return 0;
