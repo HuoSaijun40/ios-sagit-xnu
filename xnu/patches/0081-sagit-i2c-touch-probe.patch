@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1956 @@
+@@ -0,0 +1,1961 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -795,10 +795,14 @@ new file mode 100644
 +	 * Write phase: START, addr<<1, DATAWR, then the two RMI4 address bytes
 +	 * (little endian).
 +	 *
-+	 * Counts follow i2c-qup.c's qup_i2c_conf_count_v2(): in FIFO mode the
-+	 * TX length goes to QUP_MX_WRITE_CNT and the unused OUTPUT_CNT is
-+	 * zeroed, the RX side is zeroed, and because total_rx_len == 0 this
-+	 * sub-transfer also sets QUP_NO_INPUT in QUP_CONFIG.
++	 * Counts follow i2c-qup.c's qup_i2c_conf_v2(): QUP_MX_OUTPUT_CNT is the
++	 * register the engine actually reads as "how many bytes to push out",
++	 * and QUP_MX_WRITE_CNT is only the secondary count used when a read
++	 * phase follows. Every version before v110 had these swapped (wlen went
++	 * to WRITE_CNT while OUTPUT_CNT was zeroed), so QUP believed it had
++	 * nothing to send: no START ever reached the bus, MAX_OUTPUT_DONE never
++	 * fired, and the transaction died at step 12 -- while a hand bit-bang of
++	 * the same pins read the chip fine.
 +	 */
 +	uint8_t wtags[5];
 +	uint32_t wlen = 0;
@@ -809,11 +813,11 @@ new file mode 100644
 +	wtags[wlen++] = (uint8_t)(reg & 0xff);
 +	wtags[wlen++] = (uint8_t)(reg >> 8);
 +
-+	/* First sub-transfer: config_run is 0. */
-+	si2c_wrq(QUP_MX_OUTPUT_CNT, 0);
++	/* First sub-transfer: config_run is 0, no RX. */
 +	si2c_wrq(QUP_MX_INPUT_CNT, 0);
 +	si2c_wrq(QUP_MX_READ_CNT, 0);
-+	si2c_wrq(QUP_MX_WRITE_CNT, wlen);
++	si2c_wrq(QUP_MX_WRITE_CNT, 0);
++	si2c_wrq(QUP_MX_OUTPUT_CNT, wlen);
 +	si2c_wrq(QUP_CONFIG,
 +	    QUP_I2C_MINI_CORE | QUP_I2C_N_VAL_V2 | QUP_NO_INPUT);
 +
@@ -849,15 +853,16 @@ new file mode 100644
 +		QUP_TAG_V2_DATARD_STOP, (uint8_t)(len == 256 ? 0 : len),
 +	};
 +	/*
-+	 * Second sub-transfer: config_run = QUP_I2C_MX_CONFIG_DURING_RUN, the
-+	 * TX length is the tag bytes, and this one does read, so NO_INPUT is
-+	 * clear. QUP_MX_WRITE_CNT gets the run bit too, since the write phase
-+	 * already consumed its count.
++	 * Second sub-transfer: this one reads, so NO_INPUT is clear and the RX
++	 * counts are armed. As in qup_i2c_conf_v2(), the number of bytes to
++	 * receive must be written to BOTH QUP_MX_READ_CNT and QUP_MX_INPUT_CNT;
++	 * leaving READ_CNT at zero (as every version before v110 did) means the
++	 * engine clocks out nothing on the read side either.
 +	 */
 +	si2c_wrq(QUP_MX_OUTPUT_CNT, 0);
-+	si2c_wrq(QUP_MX_WRITE_CNT, 4 | QUP_I2C_MX_CONFIG_DURING_RUN);
-+	si2c_wrq(QUP_MX_READ_CNT, 0);
 +	si2c_wrq(QUP_MX_INPUT_CNT, len | QUP_I2C_MX_CONFIG_DURING_RUN);
++	si2c_wrq(QUP_MX_READ_CNT, len | QUP_I2C_MX_CONFIG_DURING_RUN);
++	si2c_wrq(QUP_MX_WRITE_CNT, 4 | QUP_I2C_MX_CONFIG_DURING_RUN);
 +	si2c_wrq(QUP_CONFIG, QUP_I2C_MINI_CORE | QUP_I2C_N_VAL_V2);
 +
 +	si2c_wrq(QUP_OPERATIONAL, QUP_OPERATIONAL_RESET);
