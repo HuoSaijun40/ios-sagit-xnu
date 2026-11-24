@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1703 @@
+@@ -0,0 +1,1759 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -243,6 +243,9 @@ new file mode 100644
 +	uint32_t rst_cfg_low;           /* gpio89 ctl after driving low */
 +	uint32_t rst_cfg_after;         /* gpio89 ctl after release */
 +	uint32_t rst_driven_high;       /* gpio89 io out_bit after driving high */
++	uint32_t dsi_cfg_before;        /* gpio8 (mdss dsi reset) ctl, as found */
++	uint32_t dsi_io_before;         /* gpio8 io, as found */
++	uint32_t dsi_action;            /* 0 = already released, 1 = drove high */
 +	uint32_t pmic_rc;               /* sagit_pmic_ldo6_on() result */
 +	uint32_t pmic_ver;              /* SPMI arbiter version word */
 +	uint32_t pmic_apid;             /* resolved APID, 0xffffffff if none */
@@ -973,6 +976,14 @@ new file mode 100644
 +#define SAGIT_PIN_RESET         89
 +#define SAGIT_PIN_TOUCH_IRQ     125
 +/*
++ * synaptics,mdss-dsi-reset = <&tlmm 0x8 0>. This panel is incell -- the touch
++ * sensor is in the display glass -- so while DSI is held in reset the whole
++ * panel module may stay unpowered and the touch controller never answers I2C.
++ * GPIO 8 is in the EAST tile (PINGROUP(8, EAST, ...) in pinctrl-msm8998), so
++ * it is reachable through the window this driver already maps.
++ */
++#define SAGIT_PIN_DSI_RST       8
++/*
 + * disp_vddts_vreg: the touch "vdd" rail in the mainline Mi 6 DTS is a
 + * regulator-fixed on TLMM gpio 50, enable-active-high, regulator-boot-on.
 + * (The Android DT calls the same rail "avdd"; the mainline tree calls it vdd,
@@ -1154,6 +1165,48 @@ new file mode 100644
 +}
 +
 +/*
++ * Release the MDSS DSI reset (gpio 8) if it is still asserted.
++ *
++ * synaptics,mdss-dsi-reset = <&tlmm 0x8 0> names this line, and the panel is
++ * incell: the touch sensor sits in the display glass. If DSI is held in reset
++ * the whole module can stay unpowered, and the touch controller then NACKs on
++ * I2C no matter what VDD/VDDIO do. flags = 0 is GPIO_ACTIVE_HIGH, so high
++ * means released.
++ *
++ * GPIO 8 is EAST tile, i.e. inside the window already mapped for 87/88/89.
++ */
++static void
++si2c_dsi_reset_release(void)
++{
++	uint32_t cfg;
++	uint32_t io;
++
++	cfg = si2c_tlmm_rd(SAGIT_PIN_DSI_RST, TLMM_GPIO_CFG);
++	io = si2c_tlmm_rd(SAGIT_PIN_DSI_RST, TLMM_GPIO_IN_OUT);
++	si2c.dsi_cfg_before = cfg;
++	si2c.dsi_io_before = io;
++
++	/* Already driven high (bootloader or display bring-up did it): leave it. */
++	if ((io & 1u) != 0 && (cfg & (1u << TLMM_CTL_OE_BIT)) != 0) {
++		si2c.dsi_action = 0;
++		return;
++	}
++
++	cfg &= ~(TLMM_CTL_MUX_MASK | TLMM_CTL_PULL_MASK | TLMM_CTL_OE_BIT |
++	    TLMM_CTL_DRV_MASK);
++	cfg |= (TLMM_PULL_UP << TLMM_CTL_PULL_BIT);
++	cfg |= (TLMM_DRV_16 << TLMM_CTL_DRV_BIT);
++	cfg |= (1u << TLMM_CTL_OE_BIT);
++
++	si2c_tlmm_io_wr(SAGIT_PIN_DSI_RST, 1);
++	si2c_tlmm_wr(SAGIT_PIN_DSI_RST, TLMM_GPIO_CFG, cfg);
++	si2c.dsi_action = 1;
++
++	/* Let the module come out of reset before the touch pulse starts. */
++	si2c_wait_ms(20);
++}
++
++/*
 + * Mux SCL/SDA onto BLSP I2C and enable pull-ups.
 + *
 + * The I2C lines are open drain: the controller only ever pulls them low, and
@@ -1302,6 +1355,7 @@ new file mode 100644
 +	    " rpm toc/cnt=0x%x/%u | smem rc/magic=%d/0x%x | phys=0x%x/0x%x\n"
 +	    " i2c st=0x%x err=0x%x ist=0x%x txn=%d clk=0x%x/0x%x "
 +	    "| rst lo/hi=0x%x/0x%x io=0x%x drv=%d "
++	    "| dsi 0x%x/0x%x act=%d "
 +	    "| avdd=0x%x/0x%x | scl=0x%x/0x%x sda=0x%x/0x%x\n"
 +	    " pmic(rc/ver/apid/st)=%d/0x%x/0x%x/0x%x",
 +	    what, (int)extra,
@@ -1316,6 +1370,7 @@ new file mode 100644
 +	    (int)si2c.txn,
 +	    SAGIT_QUP_CLK_CTL_400K, si2c.clk_ctl_readback,
 +	    si2c.rst_cfg_low, rst_cfg, rst_io, (int)si2c.rst_driven_high,
++	    si2c.dsi_cfg_before, si2c.dsi_io_before, (int)si2c.dsi_action,
 +	    si2c.avdd_cfg_after, si2c.avdd_io_after,
 +	    scl_cfg, scl_io, sda_cfg, sda_io,
 +	    (int)si2c.pmic_rc, si2c.pmic_ver, si2c.pmic_apid, si2c.pmic_st);
@@ -1598,6 +1653,7 @@ new file mode 100644
 +	    si2c_tlmm_rd(SAGIT_PIN_SCL, TLMM_GPIO_IN_OUT),
 +	    si2c_tlmm_rd(SAGIT_PIN_SDA, TLMM_GPIO_CFG),
 +	    si2c_tlmm_rd(SAGIT_PIN_SDA, TLMM_GPIO_IN_OUT));
++	si2c_dsi_reset_release();
 +	si2c_reset_release();
 +	si2c_irq_pin_input();
 +	si2c_stage(7);
