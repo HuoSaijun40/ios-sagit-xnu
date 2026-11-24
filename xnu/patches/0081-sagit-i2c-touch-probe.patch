@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,1759 @@
+@@ -0,0 +1,1956 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -242,7 +242,12 @@ new file mode 100644
 +	uint32_t rst_cfg_start;         /* gpio89 ctl before the pulse */
 +	uint32_t rst_cfg_low;           /* gpio89 ctl after driving low */
 +	uint32_t rst_cfg_after;         /* gpio89 ctl after release */
-+	uint32_t rst_driven_high;       /* gpio89 io out_bit after driving high */
++	uint32_t rst_io_low;            /* gpio89 IN_OUT while asserted (bit1=out) */
++	uint32_t rst_io_high;           /* gpio89 IN_OUT after release */
++	uint32_t rst_driven_high;       /* gpio89 io in_bit (live level) after high */
++	uint32_t bb_rc;                 /* bit-bang probe result */
++	uint32_t bb_id;                 /* first byte read by bit-bang, 0xffff=none */
++	uint32_t bb_ack;                /* bit0..7 = ack seen at each step */
 +	uint32_t dsi_cfg_before;        /* gpio8 (mdss dsi reset) ctl, as found */
 +	uint32_t dsi_io_before;         /* gpio8 io, as found */
 +	uint32_t dsi_action;            /* 0 = already released, 1 = drove high */
@@ -1298,6 +1303,12 @@ new file mode 100644
 +	si2c_tlmm_wr(SAGIT_PIN_RESET, TLMM_GPIO_CFG, cfg);
 +	si2c.rst_cfg_low = si2c_tlmm_rd(SAGIT_PIN_RESET, TLMM_GPIO_CFG);
 +	/*
++	 * The live level is in GPIO_IN_OUT bit 0 (in_bit), NOT in GPIO_CFG --
++	 * CFG bits 0-1 are the pull selector on msm8998. Recording CFG here was
++	 * useless: it reads back identical whether or not the line moved.
++	 */
++	si2c.rst_io_low = si2c_tlmm_rd(SAGIT_PIN_RESET, TLMM_GPIO_IN_OUT);
++	/*
 +	 * The vendor DT asks for reset-active-ms = 5, but mainline rmi4 defaults
 +	 * to 20 ms and a longer low pulse is strictly safer: the part latches
 +	 * its reset only while the line is actually low, and 5 ms of *spin*
@@ -1309,11 +1320,178 @@ new file mode 100644
 +	si2c_tlmm_io_wr(SAGIT_PIN_RESET, 1);
 +	si2c.rst_cfg_after = si2c_tlmm_rd(SAGIT_PIN_RESET, TLMM_GPIO_CFG);
 +	io = si2c_tlmm_rd(SAGIT_PIN_RESET, TLMM_GPIO_IN_OUT);
++	si2c.rst_io_high = io;
 +	/*
-+	 * If the pad still reads 0 with the driver on and the latch high, we
-+	 * are being fought by the chip -- record it rather than guess later.
++	 * in_bit (0) is the live pad level; out_bit (1) would only read back what
++	 * we just wrote. If the pad reads 0 while we drive high, the chip is
++	 * fighting the line -- record that rather than guess.
 +	 */
-+	si2c.rst_driven_high = (io >> 1) & 1u;
++	si2c.rst_driven_high = io & 1u;
++}
++
++/*
++ * Bit-bang I2C probe: the decisive test when QUP transactions time out.
++ *
++ * Pins are switched to plain GPIO and clocked by hand. An ACK here means QUP
++ * is misconfigured; no ACK here means the chip is not answering at the wire
++ * level at all (power / reset / address), and no amount of QUP tuning helps.
++ *
++ * Open-drain emulation: "release" = input (external pull-up wins), "low" =
++ * output 0. The driver is never used to drive a line high.
++ */
++static void
++bb_pin_mode(uint32_t pin, int output)
++{
++	uint32_t cfg = si2c_tlmm_rd(pin, TLMM_GPIO_CFG);
++
++	cfg &= ~(TLMM_CTL_MUX_MASK | TLMM_CTL_PULL_MASK | TLMM_CTL_OE_BIT |
++	    TLMM_CTL_DRV_MASK);
++	cfg |= (TLMM_PULL_UP << TLMM_CTL_PULL_BIT);
++	cfg |= (TLMM_DRV_16 << TLMM_CTL_DRV_BIT);
++	if (output) {
++		cfg |= (1u << TLMM_CTL_OE_BIT);
++	}
++	si2c_tlmm_wr(pin, TLMM_GPIO_CFG, cfg);
++}
++
++static void
++bb_release(uint32_t pin)
++{
++	bb_pin_mode(pin, 0);
++}
++
++static void
++bb_low(uint32_t pin)
++{
++	si2c_tlmm_io_wr(pin, 0);
++	bb_pin_mode(pin, 1);
++}
++
++static int
++bb_level(uint32_t pin)
++{
++	return (int)(si2c_tlmm_rd(pin, TLMM_GPIO_IN_OUT) & 1u);
++}
++
++static int
++si2c_bb_read(uint8_t addr, uint8_t reg, uint8_t *out)
++{
++	const uint32_t scl = SAGIT_PIN_SCL;
++	const uint32_t sda = SAGIT_PIN_SDA;
++	uint8_t acks = 0;
++	uint8_t b;
++	uint32_t i;
++	int nack = 0;
++
++	bb_release(sda);
++	bb_release(scl);
++	si2c_settle(2);
++
++	/* START: SDA falls while SCL is high. */
++	bb_low(sda);
++	si2c_settle(2);
++	bb_low(scl);
++	si2c_settle(2);
++
++	/* Address + write bit. */
++	b = (uint8_t)(addr << 1);
++	for (i = 0; i < 8; i++) {
++		if (b & 0x80) bb_release(sda); else bb_low(sda);
++		si2c_settle(2);
++		bb_release(scl);
++		si2c_settle(2);
++		bb_low(scl);
++		si2c_settle(2);
++		b = (uint8_t)(b << 1);
++	}
++	bb_release(sda);
++	si2c_settle(2);
++	bb_release(scl);
++	si2c_settle(2);
++	nack = bb_level(sda);
++	if (!nack) acks |= 1u;
++	bb_low(scl);
++	si2c_settle(2);
++
++	if (nack) goto stop;            /* nobody home at this address */
++
++	/* Register byte. */
++	b = reg;
++	for (i = 0; i < 8; i++) {
++		if (b & 0x80) bb_release(sda); else bb_low(sda);
++		si2c_settle(2);
++		bb_release(scl);
++		si2c_settle(2);
++		bb_low(scl);
++		si2c_settle(2);
++		b = (uint8_t)(b << 1);
++	}
++	bb_release(sda);
++	si2c_settle(2);
++	bb_release(scl);
++	si2c_settle(2);
++	if (!bb_level(sda)) acks |= 2u;
++	bb_low(scl);
++	si2c_settle(2);
++
++	/* Repeated START, then address + read bit. */
++	bb_release(sda);
++	si2c_settle(2);
++	bb_release(scl);
++	si2c_settle(2);
++	bb_low(sda);
++	si2c_settle(2);
++	bb_low(scl);
++	si2c_settle(2);
++
++	b = (uint8_t)((addr << 1) | 1u);
++	for (i = 0; i < 8; i++) {
++		if (b & 0x80) bb_release(sda); else bb_low(sda);
++		si2c_settle(2);
++		bb_release(scl);
++		si2c_settle(2);
++		bb_low(scl);
++		si2c_settle(2);
++		b = (uint8_t)(b << 1);
++	}
++	bb_release(sda);
++	si2c_settle(2);
++	bb_release(scl);
++	si2c_settle(2);
++	if (!bb_level(sda)) acks |= 4u;
++	bb_low(scl);
++	si2c_settle(2);
++
++	/* Clock in 8 data bits. */
++	b = 0;
++	for (i = 0; i < 8; i++) {
++		bb_release(sda);
++		si2c_settle(2);
++		bb_release(scl);
++		si2c_settle(2);
++		b = (uint8_t)((b << 1) | (bb_level(sda) ? 1u : 0u));
++		bb_low(scl);
++		si2c_settle(2);
++	}
++	/* Master NACKs the last byte, then STOP. */
++	bb_release(sda);
++	si2c_settle(2);
++	bb_release(scl);
++	si2c_settle(2);
++	bb_low(scl);
++	si2c_settle(2);
++	*out = b;
++
++stop:
++	bb_low(sda);
++	si2c_settle(2);
++	bb_release(scl);
++	si2c_settle(2);
++	bb_release(sda);
++	si2c_settle(2);
++
++	si2c.bb_ack = acks;
++	return (acks == 7u) ? 0 : EIO;
 +}
 +
 +/*
@@ -1354,8 +1532,9 @@ new file mode 100644
 +	    "| rx o/s/h/t=0x%x/0x%x/0x%x/0x%x\n"
 +	    " rpm toc/cnt=0x%x/%u | smem rc/magic=%d/0x%x | phys=0x%x/0x%x\n"
 +	    " i2c st=0x%x err=0x%x ist=0x%x txn=%d clk=0x%x/0x%x "
-+	    "| rst lo/hi=0x%x/0x%x io=0x%x drv=%d "
++	    "| rst iolo/hi=0x%x/0x%x cur=0x%x/0x%x drv=%d "
 +	    "| dsi 0x%x/0x%x act=%d "
++	    "| bb %d/0x%x/0x%x "
 +	    "| avdd=0x%x/0x%x | scl=0x%x/0x%x sda=0x%x/0x%x\n"
 +	    " pmic(rc/ver/apid/st)=%d/0x%x/0x%x/0x%x",
 +	    what, (int)extra,
@@ -1369,8 +1548,10 @@ new file mode 100644
 +	    si2c_rdq(QUP_STATE), si2c_rdq(QUP_ERROR_FLAGS), si2c_rdq(QUP_I2C_STATUS),
 +	    (int)si2c.txn,
 +	    SAGIT_QUP_CLK_CTL_400K, si2c.clk_ctl_readback,
-+	    si2c.rst_cfg_low, rst_cfg, rst_io, (int)si2c.rst_driven_high,
++	    si2c.rst_io_low, si2c.rst_io_high, rst_cfg, rst_io,
++	    (int)si2c.rst_driven_high,
 +	    si2c.dsi_cfg_before, si2c.dsi_io_before, (int)si2c.dsi_action,
++	    (int)si2c.bb_rc, si2c.bb_id, si2c.bb_ack,
 +	    si2c.avdd_cfg_after, si2c.avdd_io_after,
 +	    scl_cfg, scl_io, sda_cfg, sda_io,
 +	    (int)si2c.pmic_rc, si2c.pmic_ver, si2c.pmic_apid, si2c.pmic_st);
@@ -1756,6 +1937,22 @@ new file mode 100644
 +		    idbuf[4], idbuf[5], si2c_rdq(QUP_OPERATIONAL),
 +		    si2c_tlmm_rd(SAGIT_PIN_SCL, TLMM_GPIO_IN_OUT),
 +		    si2c_tlmm_rd(SAGIT_PIN_SDA, TLMM_GPIO_IN_OUT));
++	}
++
++	/*
++	 * Neither QUP address answered. Ask the same question at the wire level:
++	 * bit-bang a read of page 0. An ACK here would prove QUP is the problem;
++	 * no ACK proves the chip is not responding at all.
++	 */
++	si2c_stage(12);
++	{
++		uint8_t bid = 0;
++		int brc = si2c_bb_read(SAGIT_TOUCH_ADDR, 0x00, &bid);
++
++		si2c.bb_rc = (uint32_t)brc;
++		si2c.bb_id = brc ? 0xffffu : (uint32_t)bid;
++		printf("SAGIT I2C bitbang: rc=%d id=0x%x acks=0x%x\n",
++		    brc, (unsigned)si2c.bb_id, (unsigned)si2c.bb_ack);
 +	}
 +
 +	/* Neither address answered: report the full state, as before. */
