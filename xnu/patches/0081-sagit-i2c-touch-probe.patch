@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,2021 @@
+@@ -0,0 +1,2048 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -256,6 +256,8 @@ new file mode 100644
 +	uint32_t bb_id;                 /* first byte read by bit-bang, 0xffff=none */
 +	uint32_t bb_ack;                /* bit0..7 = ack seen at each step */
 +	uint32_t bb_page;               /* page0[0..3] packed big-endian */
++	uint32_t bb_ub;                 /* first byte read at the 0x2c bootloader addr */
++	uint32_t bb_ub_ack;             /* ack bits for the 0x2c attempt */
 +	uint32_t qop_timeout;           /* QUP_OPERATIONAL when the write phase timed out */
 +	uint32_t nack_seen;             /* set when QUP reported an address NACK */
 +	uint32_t dsi_cfg_before;        /* gpio8 (mdss dsi reset) ctl, as found */
@@ -1579,7 +1581,7 @@ new file mode 100644
 +	    " i2c st=0x%x err=0x%x ist=0x%x txn=%d nack=%d clk=0x%x/0x%x "
 +	    "| rst iolo/hi=0x%x/0x%x cur=0x%x/0x%x drv=%d "
 +	    "| dsi 0x%x/0x%x act=%d "
-+	    "| bb %d/0x%x/0x%x p0=0x%x qop=0x%x "
++	    "| bb %d/0x%x/0x%x p0=0x%x qop=0x%x ub=0x%x/%x "
 +	    "| avdd=0x%x/0x%x | scl=0x%x/0x%x sda=0x%x/0x%x\n"
 +	    " pmic(rc/ver/apid/st)=%d/0x%x/0x%x/0x%x",
 +	    what, (int)extra,
@@ -1597,7 +1599,7 @@ new file mode 100644
 +	    (int)si2c.rst_driven_high,
 +	    si2c.dsi_cfg_before, si2c.dsi_io_before, (int)si2c.dsi_action,
 +	    (int)si2c.bb_rc, si2c.bb_id, si2c.bb_ack,
-+	    si2c.bb_page, si2c.qop_timeout,
++	    si2c.bb_page, si2c.qop_timeout, si2c.bb_ub, si2c.bb_ub_ack,
 +	    si2c.avdd_cfg_after, si2c.avdd_io_after,
 +	    scl_cfg, scl_io, sda_cfg, sda_io,
 +	    (int)si2c.pmic_rc, si2c.pmic_ver, si2c.pmic_apid, si2c.pmic_st);
@@ -1993,6 +1995,7 @@ new file mode 100644
 +	si2c_stage(12);
 +	{
 +		uint8_t page[6];
++		uint8_t dd = 0;
 +		uint32_t bi;
 +		int brc = 0;
 +
@@ -2005,14 +2008,38 @@ new file mode 100644
 +		}
 +		si2c.bb_rc = (uint32_t)brc;
 +		if (brc == 0) {
++			/*
++			 * 0xDD is the page-descriptor-present byte in RMI4: a live
++			 * part answers with a non-zero value there even if page 0
++			 * looks empty. It separates "chip returns zeros" from
++			 * "our read framing is wrong".
++			 */
++			(void)si2c_bb_read(SAGIT_TOUCH_ADDR, 0xdd, &dd);
 +			si2c.bb_id = page[0];
 +			si2c.bb_page = ((uint32_t)page[0] << 24) |
 +			    ((uint32_t)page[1] << 16) |
 +			    ((uint32_t)page[2] << 8) | (uint32_t)page[3];
 +			printf("SAGIT I2C bitbang OK: page0 = %02x %02x %02x "
-+			    "%02x %02x %02x acks=0x%x\n",
++			    "%02x %02x %02x dd=%02x acks=0x%x\n",
 +			    page[0], page[1], page[2], page[3], page[4],
-+			    page[5], (unsigned)si2c.bb_ack);
++			    page[5], dd, (unsigned)si2c.bb_ack);
++			/*
++			 * Also poke the ROM bootloader address. A part that
++			 * acks but returns zeros at 0x20 is often sitting in
++			 * its boot ROM at 0x2c, which still answers reads.
++			 */
++			{
++				uint8_t ub = 0;
++				int urc = si2c_bb_read(SAGIT_TOUCH_UB_ADDR,
++				    0x00, &ub);
++
++				si2c.bb_ub_ack = si2c.bb_ack;
++				si2c.bb_ub = urc ? 0xffffu : (uint32_t)ub;
++				printf("SAGIT I2C bitbang ub(0x%02x): rc=%d "
++				    "b0=%02x acks=0x%x\n",
++				    SAGIT_TOUCH_UB_ADDR, urc, ub,
++				    (unsigned)si2c.bb_ub_ack);
++			}
 +		} else {
 +			si2c.bb_id = 0xffffu;
 +			printf("SAGIT I2C bitbang: rc=%d acks=0x%x\n",
