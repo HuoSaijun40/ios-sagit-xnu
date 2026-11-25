@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,2055 @@
+@@ -0,0 +1,2063 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -845,11 +845,19 @@ new file mode 100644
 +	wtags[wlen++] = (uint8_t)(reg & 0xff);
 +	wtags[wlen++] = (uint8_t)(reg >> 8);
 +
-+	/* First sub-transfer: config_run is 0, no RX. */
++	/*
++	 * First sub-transfer: config_run is 0, no RX.
++	 *
++	 * qup_i2c_conf_count_v2() picks the register by MODE, not by direction:
++	 *     is_tx_blk_mode ? QUP_MX_OUTPUT_CNT : QUP_MX_WRITE_CNT
++	 * A 6-byte transfer is far below "out_fifo_sz - 4", so this is FIFO mode
++	 * and the length belongs in QUP_MX_WRITE_CNT with OUTPUT_CNT zeroed.
++	 * v110 had it the other way round and the counters never agreed.
++	 */
 +	si2c_wrq(QUP_MX_INPUT_CNT, 0);
 +	si2c_wrq(QUP_MX_READ_CNT, 0);
-+	si2c_wrq(QUP_MX_WRITE_CNT, 0);
-+	si2c_wrq(QUP_MX_OUTPUT_CNT, wlen);
++	si2c_wrq(QUP_MX_OUTPUT_CNT, 0);
++	si2c_wrq(QUP_MX_WRITE_CNT, wlen);
 +	si2c_wrq(QUP_CONFIG,
 +	    QUP_I2C_MINI_CORE | QUP_I2C_N_VAL_V2 | QUP_NO_INPUT);
 +
@@ -897,13 +905,13 @@ new file mode 100644
 +		QUP_TAG_V2_DATARD_STOP, (uint8_t)(len == 256 ? 0 : len),
 +	};
 +	/*
-+	 * Second sub-transfer: this one reads, so NO_INPUT is clear and the RX
-+	 * counts are armed. i2c-qup.c sets total_rx_len = rx_tag_len(2) +
-+	 * data_len: the engine clocks in two extra tag bytes ahead of the
-+	 * payload, which the driver then throws away.
++	 * Second sub-transfer: this one reads, so NO_INPUT is clear. Same
++	 * mode rule again -- FIFO mode puts the RX byte count in QUP_MX_READ_CNT
++	 * (INPUT_CNT stays zero) and the TX tag count in QUP_MX_WRITE_CNT.
++	 * total_rx_len = 2 tag bytes + payload, as in i2c-qup.c.
 +	 */
 +	si2c_wrq(QUP_MX_OUTPUT_CNT, 0);
-+	si2c_wrq(QUP_MX_INPUT_CNT, (len + 2) | QUP_I2C_MX_CONFIG_DURING_RUN);
++	si2c_wrq(QUP_MX_INPUT_CNT, 0);
 +	si2c_wrq(QUP_MX_READ_CNT, (len + 2) | QUP_I2C_MX_CONFIG_DURING_RUN);
 +	si2c_wrq(QUP_MX_WRITE_CNT, 4 | QUP_I2C_MX_CONFIG_DURING_RUN);
 +	si2c_wrq(QUP_CONFIG, QUP_I2C_MINI_CORE | QUP_I2C_N_VAL_V2);
