@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,2081 @@
+@@ -0,0 +1,2094 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -723,8 +723,21 @@ new file mode 100644
 +	 * v54 forced block mode on both directions, which changes how the tags
 +	 * are consumed (block mode wants OUT_BLOCK_WRITE_REQ handshaking that
 +	 * this probe does not implement).
++	 *
++	 * READ-MODIFY-WRITE, not a flat write. The register also carries the
++	 * BLOCK_SIZE (bits 1:0 / 3:2) and FIFO_SIZE fields that the hardware
++	 * reports; writing QUP_REPACK_EN alone zeroed them. With FIFO_SIZE = 0
++	 * the TX FIFO has no depth at all, so the first word written sets
++	 * OUT_FULL and the engine can never drain it -- exactly the "q1 == qop
++	 * == 0xc0, never changes" pattern. Keep whatever the block reports and
++	 * only add the pack/unpack bits.
 +	 */
-+	si2c_wrq(QUP_IO_MODE, QUP_REPACK_EN);
++	{
++		uint32_t iom = si2c_rdq(QUP_IO_MODE);
++
++		iom |= QUP_REPACK_EN;
++		si2c_wrq(QUP_IO_MODE, iom);
++	}
 +
 +	/*
 +	 * Zero the count register of the direction not in use, the way
@@ -808,30 +821,6 @@ new file mode 100644
 +
 +	si2c.txn = 10;
 +
-+	/*
-+	 * Program the bus clock where i2c-qup.c does it: inside the first
-+	 * sub-transfer, between RUN and PAUSE.
-+	 *
-+	 *     if (is_first) {
-+	 *         qup_i2c_change_state(qup, QUP_RUN_STATE);
-+	 *         writel(qup->clk_ctl, qup->base + QUP_I2C_CLK_CTL);
-+	 *         qup_i2c_change_state(qup, QUP_PAUSE_STATE);
-+	 *     }
-+	 *
-+	 * Without a bus clock the QUP cannot leave RESET, which is exactly the
-+	 * qstate=0x1c (reset value) seen since v53.
-+	 */
-+	if (si2c_change_state(QUP_STATE_RUN) != 0) {
-+		return ENXIO;
-+	}
-+	si2c_wrq(QUP_I2C_CLK_CTL, SAGIT_QUP_CLK_CTL_50K);
-+	si2c.clk_ctl_readback = si2c_rdq(QUP_I2C_CLK_CTL);
-+
-+	/* Pause the block so the counters and FIFO can be programmed. */
-+	if (si2c_change_state(QUP_STATE_PAUSE) != 0) {
-+		return ETIMEDOUT;
-+	}
-+	si2c.txn = 11;
 +
 +	/*
 +	 * Write phase tags. i2c-qup.c's qup_i2c_set_tags() emits, per block:
@@ -869,6 +858,30 @@ new file mode 100644
 +	si2c_wrq(QUP_MX_WRITE_CNT, wlen);
 +	si2c_wrq(QUP_CONFIG,
 +	    QUP_I2C_MINI_CORE | QUP_I2C_N_VAL_V2 | QUP_NO_INPUT);
++
++	/*
++	 * Clock latch, in the order qup_i2c_conf_xfer_v2() uses: after the
++	 * counts/CONFIG and before the FIFO is filled.
++	 *
++	 *     qup_i2c_conf_count_v2(qup);
++	 *     qup_i2c_change_state(qup, QUP_RUN_STATE);
++	 *     writel(qup->clk_ctl, qup->base + QUP_I2C_CLK_CTL);
++	 *     qup_i2c_change_state(qup, QUP_PAUSE_STATE);
++	 *
++	 * Writing CONFIG while the block sits in PAUSE (as v117 did) leaves the
++	 * N value and the counters latched a state too late: the engine then
++	 * accepts the FIFO bytes but never drains them -- OUT_FULL stays set and
++	 * MX_OUTPUT_DONE never arrives.
++	 */
++	if (si2c_change_state(QUP_STATE_RUN) != 0) {
++		return ENXIO;
++	}
++	si2c_wrq(QUP_I2C_CLK_CTL, SAGIT_QUP_CLK_CTL_50K);
++	si2c.clk_ctl_readback = si2c_rdq(QUP_I2C_CLK_CTL);
++	if (si2c_change_state(QUP_STATE_PAUSE) != 0) {
++		return ETIMEDOUT;
++	}
++	si2c.txn = 11;
 +
 +	/* Clear stale operational flags before running. */
 +	si2c_wrq(QUP_OPERATIONAL, QUP_OPERATIONAL_RESET);
@@ -1611,7 +1624,7 @@ new file mode 100644
 +	    "| rst iolo/hi=0x%x/0x%x cur=0x%x/0x%x drv=%d "
 +	    "| dsi 0x%x/0x%x act=%d "
 +	    "| bb %d/0x%x/0x%x p0=0x%x q1=0x%x qop=0x%x ub=0x%x/%x "
-+	    "| gcc cbcr=0x%x halt=0x%x rcgr=0x%x "
++	    "| gcc cbcr=0x%x halt=0x%x rcgr=0x%x iomode=0x%x "
 +	    "| avdd=0x%x/0x%x | scl=0x%x/0x%x sda=0x%x/0x%x\n"
 +	    " pmic(rc/ver/apid/st)=%d/0x%x/0x%x/0x%x",
 +	    what, (int)extra,
@@ -1632,7 +1645,7 @@ new file mode 100644
 +	    si2c.bb_page, si2c.qop_first, si2c.qop_timeout,
 +	    si2c.bb_ub, si2c.bb_ub_ack,
 +	    si2c_rdg(SAGIT_QUP5_CBCR), si2c_rdg(SAGIT_QUP5_HALT),
-+	    si2c_rdg(SAGIT_QUP5_RCGR + RCG_CMD_REG),
++	    si2c_rdg(SAGIT_QUP5_RCGR + RCG_CMD_REG), si2c_rdq(QUP_IO_MODE),
 +	    si2c.avdd_cfg_after, si2c.avdd_io_after,
 +	    scl_cfg, scl_io, sda_cfg, sda_io,
 +	    (int)si2c.pmic_rc, si2c.pmic_ver, si2c.pmic_apid, si2c.pmic_st);
