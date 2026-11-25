@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,2048 @@
+@@ -0,0 +1,2055 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -222,11 +222,14 @@ new file mode 100644
 +#define QUP_I2C_N_VAL_V2        7              /* low 3 bits of QUP_CONFIG */
 +
 +/* QUP v2 tag bytes: these are what actually start a transfer. */
++/*
++ * QUP v2 tag bytes (i2c-qup.c). Full set for reference:
++ *   0x81 START, 0x82 DATAWR, 0x83 DATAWR_STOP,
++ *   0x85 DATARD, 0x86 DATARD_NACK, 0x87 DATARD_STOP
++ * Single-block transfers only need the *_STOP forms.
++ */
 +#define QUP_TAG_V2_START        0x81
-+#define QUP_TAG_V2_DATAWR       0x82
 +#define QUP_TAG_V2_DATAWR_STOP  0x83
-+#define QUP_TAG_V2_DATARD       0x85
-+#define QUP_TAG_V2_DATARD_NACK  0x86
 +#define QUP_TAG_V2_DATARD_STOP  0x87
 +
 +/*
@@ -822,24 +825,23 @@ new file mode 100644
 +	si2c.txn = 11;
 +
 +	/*
-+	 * Write phase: START, addr<<1, DATAWR, then the two RMI4 address bytes
-+	 * (little endian).
++	 * Write phase tags. i2c-qup.c's qup_i2c_set_tags() emits, per block:
 +	 *
-+	 * Counts follow i2c-qup.c's qup_i2c_conf_v2(): QUP_MX_OUTPUT_CNT is the
-+	 * register the engine actually reads as "how many bytes to push out",
-+	 * and QUP_MX_WRITE_CNT is only the secondary count used when a read
-+	 * phase follows. Every version before v110 had these swapped (wlen went
-+	 * to WRITE_CNT while OUTPUT_CNT was zeroed), so QUP believed it had
-+	 * nothing to send: no START ever reached the bus, MAX_OUTPUT_DONE never
-+	 * fired, and the transaction died at step 12 -- while a hand bit-bang of
-+	 * the same pins read the chip fine.
++	 *     [START] [addr] [DATAWR_STOP] [data_len] <data_len raw bytes>
++	 *
++	 * The length byte is REQUIRED. Without it QUP takes the first payload
++	 * byte as the count: for RMI4 address 0x0000 that byte is 0x00, so the
++	 * engine concludes it has nothing to send, never drives the transfer and
++	 * parks with OUT_SVC_FLAG (bit 8) set -- exactly the qop=0x100 seen at
++	 * 50 kHz, and the reason no clock ever came out of the pad.
 +	 */
-+	uint8_t wtags[5];
++	uint8_t wtags[8];
 +	uint32_t wlen = 0;
 +
 +	wtags[wlen++] = QUP_TAG_V2_START;
 +	wtags[wlen++] = (uint8_t)(addr << 1);
-+	wtags[wlen++] = QUP_TAG_V2_DATAWR;
++	wtags[wlen++] = QUP_TAG_V2_DATAWR_STOP;   /* single block, STOP after */
++	wtags[wlen++] = 2;                        /* two register bytes follow */
 +	wtags[wlen++] = (uint8_t)(reg & 0xff);
 +	wtags[wlen++] = (uint8_t)(reg >> 8);
 +
@@ -896,14 +898,13 @@ new file mode 100644
 +	};
 +	/*
 +	 * Second sub-transfer: this one reads, so NO_INPUT is clear and the RX
-+	 * counts are armed. As in qup_i2c_conf_v2(), the number of bytes to
-+	 * receive must be written to BOTH QUP_MX_READ_CNT and QUP_MX_INPUT_CNT;
-+	 * leaving READ_CNT at zero (as every version before v110 did) means the
-+	 * engine clocks out nothing on the read side either.
++	 * counts are armed. i2c-qup.c sets total_rx_len = rx_tag_len(2) +
++	 * data_len: the engine clocks in two extra tag bytes ahead of the
++	 * payload, which the driver then throws away.
 +	 */
 +	si2c_wrq(QUP_MX_OUTPUT_CNT, 0);
-+	si2c_wrq(QUP_MX_INPUT_CNT, len | QUP_I2C_MX_CONFIG_DURING_RUN);
-+	si2c_wrq(QUP_MX_READ_CNT, len | QUP_I2C_MX_CONFIG_DURING_RUN);
++	si2c_wrq(QUP_MX_INPUT_CNT, (len + 2) | QUP_I2C_MX_CONFIG_DURING_RUN);
++	si2c_wrq(QUP_MX_READ_CNT, (len + 2) | QUP_I2C_MX_CONFIG_DURING_RUN);
 +	si2c_wrq(QUP_MX_WRITE_CNT, 4 | QUP_I2C_MX_CONFIG_DURING_RUN);
 +	si2c_wrq(QUP_CONFIG, QUP_I2C_MINI_CORE | QUP_I2C_N_VAL_V2);
 +
@@ -933,6 +934,12 @@ new file mode 100644
 +		return EIO;
 +	}
 +
++	/*
++	 * The RX FIFO starts with two tag bytes (see total_rx_len above); drop
++	 * them before the payload proper.
++	 */
++	(void)si2c_rdq(QUP_IN_FIFO_BASE);
++	(void)si2c_rdq(QUP_IN_FIFO_BASE);
 +	for (uint32_t i = 0; i < len; i++) {
 +		out[i] = (uint8_t)si2c_rdq(QUP_IN_FIFO_BASE);
 +	}
