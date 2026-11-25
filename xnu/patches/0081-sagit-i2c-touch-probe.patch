@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,2004 @@
+@@ -0,0 +1,2010 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -161,12 +161,18 @@ new file mode 100644
 +#define QUP_IN_FIFO_BASE        0x218
 +#define QUP_I2C_CLK_CTL         0x400          /* SCL divider: hs_div<<8 | fs_div */
 +/*
-+ * 400 kHz on a 19.2 MHz source (XO straight through, no PLL):
-+ *     hs_div = 3
-+ *     fs_div = ((19200000 / 400000) / 2) - 3 = (48 / 2) - 3 = 21
-+ *     clk_ctl = (3 << 8) | 21 = 0x315
++ * Bus clock divider. The QUP divider is (hs_div << 8) | fs_div, clocked from
++ * the 19.2 MHz XO:
++ *
++ *   400 kHz: hs_div 3, fs_div 21  ->  0x315  (used until v112)
++ *   100 kHz: hs_div 3, fs_div 96  ->  0x360  <-- current
++ *
++ * Why the slower rate: QUP_OPERATIONAL bit 3 (QUP_I2C_NACK_FLAG) came back set
++ * at 400 kHz, while a GPIO bit-bang of the same address at ~60 kHz was ACKed.
++ * The part has just come out of reset and does not answer at full speed, so
++ * first contact has to be slow. Raise this again once probing works.
 + */
-+#define SAGIT_QUP_CLK_CTL_400K  0x315u
++#define SAGIT_QUP_CLK_CTL_100K  0x360u
 +#define QUP_I2C_STATUS          0x404
 +#define QUP_I2C_MASTER_GEN      0x408
 +
@@ -802,7 +808,7 @@ new file mode 100644
 +	if (si2c_change_state(QUP_STATE_RUN) != 0) {
 +		return ENXIO;
 +	}
-+	si2c_wrq(QUP_I2C_CLK_CTL, SAGIT_QUP_CLK_CTL_400K);
++	si2c_wrq(QUP_I2C_CLK_CTL, SAGIT_QUP_CLK_CTL_100K);
 +	si2c.clk_ctl_readback = si2c_rdq(QUP_I2C_CLK_CTL);
 +
 +	/* Pause the block so the counters and FIFO can be programmed. */
@@ -1575,7 +1581,7 @@ new file mode 100644
 +	    si2c.phys_base, si2c.phys_size,
 +	    si2c_rdq(QUP_STATE), si2c_rdq(QUP_ERROR_FLAGS), si2c_rdq(QUP_I2C_STATUS),
 +	    (int)si2c.txn,
-+	    SAGIT_QUP_CLK_CTL_400K, si2c.clk_ctl_readback,
++	    SAGIT_QUP_CLK_CTL_100K, si2c.clk_ctl_readback,
 +	    si2c.rst_io_low, si2c.rst_io_high, rst_cfg, rst_io,
 +	    (int)si2c.rst_driven_high,
 +	    si2c.dsi_cfg_before, si2c.dsi_io_before, (int)si2c.dsi_action,
