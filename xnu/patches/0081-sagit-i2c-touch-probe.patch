@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,2186 @@
+@@ -0,0 +1,2222 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -267,6 +267,7 @@ new file mode 100644
 +	uint32_t bb_id;                 /* first byte read by bit-bang, 0xffff=none */
 +	uint32_t bb_ack;                /* bit0..7 = ack seen at each step */
 +	uint32_t bb_page;               /* page0[0..3] packed big-endian */
++	uint32_t bb_pdt_fn;             /* fn_number of page0/0xe9 PDT entry via bit-bang */
 +	uint32_t bb_ub;                 /* first byte read at the 0x2c bootloader addr */
 +	uint32_t bb_ub_ack;             /* ack bits for the 0x2c attempt */
 +	uint32_t ub_rc;                 /* QUP read of 0x2c, 8 bytes */
@@ -1639,7 +1640,7 @@ new file mode 100644
 +	    "| rst iolo/hi=0x%x/0x%x cur=0x%x/0x%x drv=%d "
 +	    "| dsi 0x%x/0x%x act=%d "
 +	    "| bb %d/0x%x/0x%x p0=0x%x q1=0x%x qop=0x%x ub=0x%x/%x "
-+	    "| labibb %d/0x%x/0x%x "
++	    "| bpdt fn=0x%x | labibb %d/0x%x/0x%x "
 +	    "| gcc cbcr=0x%x halt=0x%x rcgr=0x%x iomode=0x%x "
 +	    "| avdd=0x%x/0x%x | scl=0x%x/0x%x sda=0x%x/0x%x\n"
 +	    " pmic(rc/ver/apid/st)=%d/0x%x/0x%x/0x%x",
@@ -1660,6 +1661,7 @@ new file mode 100644
 +	    (int)si2c.bb_rc, si2c.bb_id, si2c.bb_ack,
 +	    si2c.bb_page, si2c.qop_first, si2c.qop_timeout,
 +	    si2c.bb_ub, si2c.bb_ub_ack,
++	    si2c.bb_pdt_fn,
 +	    (int)si2c.labibb_rc, si2c.lab_status, si2c.ibb_status,
 +	    si2c_rdg(SAGIT_QUP5_CBCR), si2c_rdg(SAGIT_QUP5_HALT),
 +	    si2c_rdg(SAGIT_QUP5_RCGR + RCG_CMD_REG), si2c_rdq(QUP_IO_MODE),
@@ -2057,9 +2059,23 @@ new file mode 100644
 +		 * (OUT_NOT_EMPTY). Without a reset those stale bytes are what
 +		 * the next transfer sends first, so the retry has to start
 +		 * from a clean block.
++		 *
++		 * v126 did BARE QUP_SW_RESET here and it made things worse:
++		 * SW_RESET clears the whole block, including QUP_IO_MODE's
++		 * REPACK_EN (iomode fell 0xc0a5 -> 0xa5) and the I2C master
++		 * enable. The retry then ran on a half-configured engine and
++		 * hung again (txn=12, st=0x1c=RESET). A full re-init restores
++		 * every register the first pass had programmed.
++		 *
++		 * v128: re-run the whole bring-up, not just the reset bit.
++		 * si2c_qup_init() already does SW_RESET + REPACK_EN + MASTER_GEN.
 +		 */
-+		si2c_wrq(QUP_SW_RESET, 1);
-+		(void)si2c_poll(QUP_SW_RESET, 1u, 0u, SAGIT_I2C_SPIN);
++		rc = si2c_qup_init();
++		if (rc != 0) {
++			si2c_report("qup re-init failed on retry",
++			    si2c_rdq(QUP_CONFIG), si2c_rdq(QUP_STATE),
++			    si2c_rdq(QUP_IO_MODE), (uint32_t)rc);
++		}
 +		rc = si2c_read_rmi4(SAGIT_TOUCH_ADDR, 0x0000, idbuf,
 +		    sizeof(idbuf));
 +	}
@@ -2146,6 +2162,26 @@ new file mode 100644
 +		}
 +		si2c.bb_rc = (uint32_t)brc;
 +		if (brc == 0) {
++			/*
++			 * v128: bit-bang is the ONLY path that talks to this part
++			 * (QUP parks before START even after the reset fix). Ask
++			 * the decisive question over the working wire: read the
++			 * first RMI4 PDT entry at page 0 / 0xe9 via bit-bang. The
++			 * QUP path reads the same 6 consecutive bytes and takes
++			 * pdt[5] as fn_number -- mirror that exactly. bit-bang
++			 * carries a 1-byte register address, so this covers page 0
++			 * only; that is enough to answer "is the chip alive".
++			 */
++			{
++				uint8_t bpdt[6];
++
++				for (uint32_t k = 0; k < 6; k++) {
++					(void)si2c_bb_read(SAGIT_TOUCH_ADDR,
++					    (uint8_t)(0xe9u + k), &bpdt[k]);
++				}
++				si2c.bb_pdt_fn = bpdt[5];
++			}
++
 +			/*
 +			 * 0xDD is the page-descriptor-present byte in RMI4: a live
 +			 * part answers with a non-zero value there even if page 0
