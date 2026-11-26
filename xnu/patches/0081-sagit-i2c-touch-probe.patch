@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,2094 @@
+@@ -0,0 +1,2106 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -2012,13 +2012,25 @@ new file mode 100644
 +	 */
 +	rc = si2c_read_rmi4(SAGIT_TOUCH_ADDR, 0x0000, idbuf, sizeof(idbuf));
 +	if (rc == 0) {
-+		panic("SAGIT I2C OK: touch@0x%02x page0 = %02x %02x %02x %02x "
-+		    "%02x %02x (qop=0x%x) scl io=0x%x sda io=0x%x -- I2C link is "
-+		    "up, device in NORMAL mode",
-+		    SAGIT_TOUCH_ADDR, idbuf[0], idbuf[1], idbuf[2], idbuf[3],
-+		    idbuf[4], idbuf[5], si2c_rdq(QUP_OPERATIONAL),
-+		    si2c_tlmm_rd(SAGIT_PIN_SCL, TLMM_GPIO_IN_OUT),
-+		    si2c_tlmm_rd(SAGIT_PIN_SDA, TLMM_GPIO_IN_OUT));
++		/*
++		 * page0 (0x00-0x05) is only the "function presence" bitmap. The
++		 * real Page Descriptor Table lives from 0xE9 downwards, six
++		 * bytes per function, and 0xE8 is the page-select register.
++		 * Read all three so a zero page0 can be told apart from a part
++		 * that has no functions at all.
++		 */
++		uint8_t psel = 0;
++		uint8_t pdt[6];
++		int rp = si2c_read_rmi4(SAGIT_TOUCH_ADDR, 0x00e8, &psel, 1);
++		int rd = si2c_read_rmi4(SAGIT_TOUCH_ADDR, 0x00e9, pdt,
++		    sizeof(pdt));
++
++		panic("SAGIT I2C OK: touch@0x20 page0=%02x %02x %02x %02x "
++		    "%02x %02x | page_sel=%02x(rc%d) pdt=%02x %02x %02x "
++		    "%02x %02x %02x(rc%d) | qop=0x%x | I2C link is up, NORMAL",
++		    idbuf[0], idbuf[1], idbuf[2], idbuf[3], idbuf[4],
++		    idbuf[5], psel, rp, pdt[0], pdt[1], pdt[2], pdt[3],
++		    pdt[4], pdt[5], rd, si2c_rdq(QUP_OPERATIONAL));
 +	}
 +
 +	/* Not at 0x20: the part may be sitting in ROM bootloader at 0x2c. */
