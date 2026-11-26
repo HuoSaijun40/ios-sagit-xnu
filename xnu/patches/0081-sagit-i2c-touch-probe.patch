@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,2222 @@
+@@ -0,0 +1,2356 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -192,6 +192,10 @@ new file mode 100644
 +#define QUP_OP_MAX_OUTPUT_DONE  (1u << 10)
 +#define QUP_OP_MAX_INPUT_DONE   (1u << 11)
 +#define QUP_OPERATIONAL_RESET   0x000ff0u
++/* Error masks from i2c-qup.c: qup_i2c_interrupt() writes these back to clear. */
++#define QUP_STATUS_ERROR_FLAGS  0x07cu
++#define I2C_STATUS_ERROR_MASK   0x38000fcu
++#define QUP_I2C_NACK_FLAG       (1u << 3)
 +
 +/* QUP_IO_MODE packing */
 +#define QUP_IO_OUTPUT_BLK_MODE  (1u << 10)
@@ -214,7 +218,11 @@ new file mode 100644
 +
 +/* I2C mini core: QUP_CONFIG layout */
 +#define QUP_CLOCK_AUTO_GATE     (1u << 13)
-+#define QUP_NO_INPUT            (1u << 7)
++/*
++ * v130: QUP_NO_INPUT (bit 7) does not exist in i2c-qup.c. The upstream
++ * QUP_CONFIG only carries MINI_CORE (bits 9:8) and N_VAL (bits 2:0);
++ * setting an undefined bit could latch into reserved logic. Removed.
++ */
 +#define QUP_I2C_MINI_CORE       (2u << 8)
 +#define QUP_I2C_N_VAL           15
 +#define QUP_I2C_MAST_GEN        (1u << 4)          /* QUP_STATE bit: master */
@@ -651,19 +659,55 @@ new file mode 100644
 +static int
 +si2c_change_state(uint32_t state)
 +{
-+	uint32_t st;
-+
 +	if (!si2c_poll_state_valid(SAGIT_I2C_SPIN)) {
 +		return EBUSY;
 +	}
-+	st = si2c_rdq(QUP_STATE);
-+	st &= ~QUP_STATE_MASK;
-+	st |= state;
-+	si2c_wrq(QUP_STATE, st);
++	/*
++	 * v130: upstream qup_i2c_change_state() does a BARE writel(state):
++	 *     writel(state, qup->base + QUP_STATE);
++	 * The old read-modify-write carried every read-only/sticky bit back
++	 * into QUP_STATE, notably QUP_I2C_FLUSH (BIT 6), which a bare write
++	 * leaves alone. MAST_GEN (BIT 4) is NOT in the state write path -- it
++	 * comes from the separate QUP_I2C_MASTER_GEN register, so a bare
++	 * state write cannot clear it. Writing only the low two state bits
++	 * matches the driver the hardware was designed for.
++	 */
++	si2c_wrq(QUP_STATE, state & QUP_STATE_MASK);
 +	if (!si2c_poll_state(state, SAGIT_I2C_SPIN)) {
 +		return ENXIO;
 +	}
 +	return 0;
++}
++
++/*
++ * v130: check and CLEAR QUP error flags the way qup_i2c_interrupt() does.
++ * Errors are write-one-to-clear; leaving them set poisons every later
++ * transfer. On any error upstream also resets QUP_STATE to RESET.
++ * Returns 0 when clean, EIO for a QUP/mini-core error, ENXIO for a NACK.
++ */
++static int
++si2c_check_qup_errors(void)
++{
++	uint32_t qerr = si2c_rdq(QUP_ERROR_FLAGS) & QUP_STATUS_ERROR_FLAGS;
++	uint32_t berr = si2c_rdq(QUP_I2C_STATUS) & I2C_STATUS_ERROR_MASK;
++	int rc = 0;
++
++	if (qerr != 0) {
++		si2c_wrq(QUP_ERROR_FLAGS, qerr);
++	}
++	if (berr != 0) {
++		si2c_wrq(QUP_I2C_STATUS, berr);
++	}
++	if (berr & QUP_I2C_NACK_FLAG) {
++		si2c.nack_seen = 1;
++		rc = ENXIO;
++	} else if (qerr != 0 || berr != 0) {
++		rc = EIO;
++	}
++	if (rc != 0) {
++		si2c_wrq(QUP_STATE, QUP_STATE_RESET);
++	}
++	return rc;
 +}
 +
 +/*
@@ -825,6 +869,43 @@ new file mode 100644
 +		return EINVAL;
 +	}
 +
++	/*
++	 * v130: mirror qup_i2c_xfer_v2() -- EVERY transfer starts from a clean
++	 * block. The old code only initialized once at probe time; after the
++	 * first read (or any parked transfer) the state machine and FIFOs were
++	 * left dirty, so the second transfer wedged at txn=12. This is the
++	 * single biggest omission found in the QUP audit: upstream does
++	 *     writel(1, QUP_SW_RESET);
++	 *     qup_i2c_poll_state(qup, QUP_RESET_STATE);
++	 *     writel(I2C_MINI_CORE | I2C_N_VAL_V2, QUP_CONFIG);
++	 *     writel(QUP_V2_TAGS_EN, QUP_I2C_MASTER_GEN);
++	 *     qup_i2c_poll_state_i2c_master(qup);
++	 * at the top of i2c_transfer, before every message.
++	 */
++	si2c_wrq(QUP_SW_RESET, 1);
++	if (!si2c_poll(QUP_SW_RESET, 1u, 0u, SAGIT_I2C_SPIN)) {
++		return EBUSY;
++	}
++	if (si2c_change_state(QUP_STATE_RESET) != 0) {
++		return ENXIO;
++	}
++	si2c_wrq(QUP_CONFIG, QUP_I2C_MINI_CORE | QUP_I2C_N_VAL_V2);
++	si2c_wrq(QUP_I2C_MASTER_GEN_REG, QUP_V2_TAGS_EN);
++	if (!si2c_poll_state_master(SAGIT_I2C_SPIN)) {
++		return ENXIO;
++	}
++	/*
++	 * SW_RESET also zeroed QUP_IO_MODE; restore REPACK_EN with a
++	 * read-modify-write (the hardware-reported FIFO sizes must survive).
++	 * i2c-qup.c does this in qup_i2c_set_read_mode_v2()/write_mode_v2().
++	 */
++	{
++		uint32_t iom = si2c_rdq(QUP_IO_MODE);
++
++		iom |= QUP_REPACK_EN;
++		si2c_wrq(QUP_IO_MODE, iom);
++	}
++
 +	si2c.txn = 10;
 +
 +
@@ -862,8 +943,7 @@ new file mode 100644
 +	si2c_wrq(QUP_MX_READ_CNT, 0);
 +	si2c_wrq(QUP_MX_OUTPUT_CNT, 0);
 +	si2c_wrq(QUP_MX_WRITE_CNT, wlen);
-+	si2c_wrq(QUP_CONFIG,
-+	    QUP_I2C_MINI_CORE | QUP_I2C_N_VAL_V2 | QUP_NO_INPUT);
++	si2c_wrq(QUP_CONFIG, QUP_I2C_MINI_CORE | QUP_I2C_N_VAL_V2);
 +
 +	/*
 +	 * Clock latch, in the order qup_i2c_conf_xfer_v2() uses: after the
@@ -905,6 +985,20 @@ new file mode 100644
 +		op = si2c_rdq(QUP_OPERATIONAL);
 +		if (si2c.qop_first == 0xffffffffu) {
 +			si2c.qop_first = op;
++		}
++		/*
++		 * v130: check the real error registers (and CLEAR them) on
++		 * every poll. The old code watched only QUP_OPERATIONAL bit3
++		 * and never wrote ERROR_FLAGS/I2C_STATUS back, so a single
++		 * error stayed latched for every later transfer.
++		 */
++		{
++			int errc = si2c_check_qup_errors();
++
++			if (errc != 0) {
++				si2c.qop_timeout = op;
++				return errc;
++			}
 +		}
 +		/*
 +		 * NACK first: on a NACK the engine stops and never raises
@@ -959,6 +1053,19 @@ new file mode 100644
 +
 +	for (spins = 0; spins < SAGIT_I2C_SPIN; spins++) {
 +		op = si2c_rdq(QUP_OPERATIONAL);
++		/*
++		 * v130: clear errors as they appear, not just at the end.
++		 * A NACK or QUP error in the read phase stops the engine and
++		 * MAX_INPUT_DONE never arrives; checking only on timeout made
++		 * every failure look like ETIMEDOUT.
++		 */
++		{
++			int errc = si2c_check_qup_errors();
++
++			if (errc != 0) {
++				return errc;
++			}
++		}
 +		if (op & QUP_OP_MAX_INPUT_DONE) {
 +			break;
 +		}
@@ -969,19 +1076,33 @@ new file mode 100644
 +		return ETIMEDOUT;
 +	}
 +
-+	/* A NACK shows up here rather than as a timeout. */
-+	if (si2c_rdq(QUP_ERROR_FLAGS) || (si2c_rdq(QUP_I2C_STATUS) & 0x38000fc)) {
-+		return EIO;
-+	}
-+
 +	/*
-+	 * The RX FIFO starts with two tag bytes (see total_rx_len above); drop
-+	 * them before the payload proper.
++	 * v130: REPACK_EN packs FOUR bytes into every 32-bit FIFO word. The
++	 * old code read two whole words and discarded them thinking they were
++	 * two tag BYTES, then read `len` words taking one byte each. For a
++	 * 6-byte read that consumed 8 words when only 2 exist -- it threw away
++	 * all the data and read garbage. That is why v121-v124 reported a
++	 * "successful" transfer with an all-zero PDT: the wire worked, our
++	 * FIFO decode did not.
++	 *
++	 * Mirror qup_i2c_read_fifo_v2(): total = payload + 2 tag bytes, read
++	 * word by word, skip the first 2 bytes, write the rest into out[].
 +	 */
-+	(void)si2c_rdq(QUP_IN_FIFO_BASE);
-+	(void)si2c_rdq(QUP_IN_FIFO_BASE);
-+	for (uint32_t i = 0; i < len; i++) {
-+		out[i] = (uint8_t)si2c_rdq(QUP_IN_FIFO_BASE);
++	{
++		uint32_t total = len + 2;       /* 2 tag bytes lead the payload */
++		uint32_t pos = 0;
++
++		while (pos < total) {
++			uint32_t val = si2c_rdq(QUP_IN_FIFO_BASE);
++
++			for (uint32_t idx = 0; idx < 4 && pos < total;
++			    idx++, val >>= 8, pos++) {
++				if (pos < 2) {
++					continue;       /* tag bytes */
++				}
++				out[pos - 2] = (uint8_t)(val & 0xff);
++			}
++		}
 +	}
 +	si2c.txn = 16;
 +
@@ -2067,17 +2188,30 @@ new file mode 100644
 +		 * hung again (txn=12, st=0x1c=RESET). A full re-init restores
 +		 * every register the first pass had programmed.
 +		 *
-+		 * v128: re-run the whole bring-up, not just the reset bit.
-+		 * si2c_qup_init() already does SW_RESET + REPACK_EN + MASTER_GEN.
++		 * v128 re-ran si2c_qup_init() directly, but that function's
++		 * FIRST step is change_state(RESET), which polls VALID. A
++		 * parked transfer leaves the state machine wedged with VALID
++		 * clear (v128 panic: txn=4, qstate=0x19, iomode=0x0), so the
++		 * SW_RESET two steps later was never reached. Unwedge FIRST
++		 * with a bare reset, then re-run the full init to restore
++		 * REPACK_EN + MASTER_GEN that the bare reset clears.
++		 *
++		 * v129 order: bare SW_RESET (unwedge) -> full qup_init
++		 * (restore config) -> retry read.
 +		 */
++		si2c_wrq(QUP_SW_RESET, 1);
++		(void)si2c_poll(QUP_SW_RESET, 1u, 0u, SAGIT_I2C_SPIN);
 +		rc = si2c_qup_init();
-+		if (rc != 0) {
-+			si2c_report("qup re-init failed on retry",
-+			    si2c_rdq(QUP_CONFIG), si2c_rdq(QUP_STATE),
-+			    si2c_rdq(QUP_IO_MODE), (uint32_t)rc);
++		/*
++		 * A re-init failure must not abort the probe: bit-bang is a
++		 * proven working path and is the whole reason we are here.
++		 * Leave rc != 0 so control falls through to the bit-bang PDT
++		 * scan instead of panicking on a half-configured engine.
++		 */
++		if (rc == 0) {
++			rc = si2c_read_rmi4(SAGIT_TOUCH_ADDR, 0x0000, idbuf,
++			    sizeof(idbuf));
 +		}
-+		rc = si2c_read_rmi4(SAGIT_TOUCH_ADDR, 0x0000, idbuf,
-+		    sizeof(idbuf));
 +	}
 +	if (rc == 0) {
 +		/*
