@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,2164 @@
+@@ -0,0 +1,2186 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -1968,12 +1968,14 @@ new file mode 100644
 +	    si2c_tlmm_rd(SAGIT_PIN_TOUCH_IRQ, TLMM_GPIO_CFG),
 +	    si2c_tlmm_rd(SAGIT_PIN_TOUCH_IRQ, TLMM_GPIO_IN_OUT));
 +	/*
-+	 * 200 ms startup, the vendor's synaptics,reset-delay-ms from live.dtb.
-+	 * This used to be 1000 ms borrowed from the msm8998 Yoshino boards,
-+	 * but those boards use a different panel -- the vendor value for THIS
-+	 * panel is 200 ms, and 1000 ms only cost boot time.
++	 * 600 ms startup. The vendor value is 200 ms, but that is measured on a
++	 * part that has already been brought up once. From cold, and now that
++	 * the reset polarity is finally right (so the part actually reboots
++	 * instead of sitting held in reset), it needs materially longer: during
++	 * boot it drives both SDA and SCL low, and a QUP transfer attempted in
++	 * that window simply parks with OUT_NOT_EMPTY and never emits START.
 +	 */
-+	si2c_wait_ms(200);              /* reset release -> part booted */
++	si2c_wait_ms(600);              /* reset release -> part booted */
 +	/* Stage 8 is the freeze point of v44 and v45: the very first GCC
 +	 * read happens on the next line, so mark it before going in. */
 +	si2c_stage(8);
@@ -2041,6 +2043,26 @@ new file mode 100644
 +	 * what rmi4_i2c reads at probe time.
 +	 */
 +	rc = si2c_read_rmi4(SAGIT_TOUCH_ADDR, 0x0000, idbuf, sizeof(idbuf));
++	/*
++	 * The part holds the bus low while it boots. If the first attempt lands
++	 * in that window QUP parks and reports nothing; one patient retry is
++	 * usually enough and costs far less than a boot cycle.
++	 */
++	if (rc != 0) {
++		printf("SAGIT I2C: first read rc=%d, retrying after 300ms\n",
++		    rc);
++		si2c_wait_ms(300);
++		/*
++		 * The parked transfer left its bytes sitting in the TX FIFO
++		 * (OUT_NOT_EMPTY). Without a reset those stale bytes are what
++		 * the next transfer sends first, so the retry has to start
++		 * from a clean block.
++		 */
++		si2c_wrq(QUP_SW_RESET, 1);
++		(void)si2c_poll(QUP_SW_RESET, 1u, 0u, SAGIT_I2C_SPIN);
++		rc = si2c_read_rmi4(SAGIT_TOUCH_ADDR, 0x0000, idbuf,
++		    sizeof(idbuf));
++	}
 +	if (rc == 0) {
 +		/*
 +		 * synaptics_dsx_core.c scans the Page Descriptor Table over
