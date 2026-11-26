@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,2141 @@
+@@ -0,0 +1,2164 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -269,6 +269,8 @@ new file mode 100644
 +	uint32_t bb_page;               /* page0[0..3] packed big-endian */
 +	uint32_t bb_ub;                 /* first byte read at the 0x2c bootloader addr */
 +	uint32_t bb_ub_ack;             /* ack bits for the 0x2c attempt */
++	uint32_t ub_rc;                 /* QUP read of 0x2c, 8 bytes */
++	uint8_t ub_buf[8];              /* what the ROM bootloader answered */
 +	uint32_t qop_timeout;           /* QUP_OPERATIONAL when the write phase timed out */
 +	uint32_t qop_first;             /* QUP_OPERATIONAL on the first poll */
 +	uint32_t nack_seen;             /* set when QUP reported an address NACK */
@@ -1389,8 +1391,24 @@ new file mode 100644
 +	cfg |= (TLMM_DRV_16 << TLMM_CTL_DRV_BIT);
 +	cfg |= (1u << TLMM_CTL_OE_BIT);
 +
-+	/* 1. assert: drive low, then enable the driver. */
-+	si2c_tlmm_io_wr(SAGIT_PIN_RESET, 0);
++	/*
++	 * POLARITY. The DT says reset-on-state = 1, and the vendor driver uses
++	 * it literally (synaptics_rmi4_reset_device):
++	 *
++	 *     gpio_set_value(reset_gpio,  reset_on_state);   // 1 -> assert
++	 *     msleep(reset_active_ms);                       // 5 ms
++	 *     gpio_set_value(reset_gpio, !reset_on_state);   // 0 -> release
++	 *     msleep(reset_delay_ms);                        // 200 ms
++	 *
++	 * So RESET IS ACTIVE HIGH and the line must REST LOW. Every version up
++	 * to v124 drove it the other way round -- low for 20 ms, then high and
++	 * left there -- which holds the part in reset forever. Its I2C slave is
++	 * hardware, so it kept ACKing; the core never booted, which is why the
++	 * RMI4 page descriptor table came back empty no matter how many times
++	 * the QUP setup was fixed.
++	 */
++	/* 1. assert: drive HIGH, then enable the driver. */
++	si2c_tlmm_io_wr(SAGIT_PIN_RESET, 1);
 +	si2c_tlmm_wr(SAGIT_PIN_RESET, TLMM_GPIO_CFG, cfg);
 +	si2c.rst_cfg_low = si2c_tlmm_rd(SAGIT_PIN_RESET, TLMM_GPIO_CFG);
 +	/*
@@ -1399,16 +1417,10 @@ new file mode 100644
 +	 * useless: it reads back identical whether or not the line moved.
 +	 */
 +	si2c.rst_io_low = si2c_tlmm_rd(SAGIT_PIN_RESET, TLMM_GPIO_IN_OUT);
-+	/*
-+	 * The vendor DT asks for reset-active-ms = 5, but mainline rmi4 defaults
-+	 * to 20 ms and a longer low pulse is strictly safer: the part latches
-+	 * its reset only while the line is actually low, and 5 ms of *spin*
-+	 * (si2c_wait_ms is a calibrated busy-wait, not a timer) can land short.
-+	 */
-+	si2c_wait_ms(20);                       /* reset-active-ms (>=5) */
++	si2c_wait_ms(20);                       /* reset-active-ms (DT: 5) */
 +
-+	/* 2. deassert: drive high and LEAVE IT DRIVEN. */
-+	si2c_tlmm_io_wr(SAGIT_PIN_RESET, 1);
++	/* 2. deassert: drive LOW and LEAVE IT LOW (part out of reset). */
++	si2c_tlmm_io_wr(SAGIT_PIN_RESET, 0);
 +	si2c.rst_cfg_after = si2c_tlmm_rd(SAGIT_PIN_RESET, TLMM_GPIO_CFG);
 +	io = si2c_tlmm_rd(SAGIT_PIN_RESET, TLMM_GPIO_IN_OUT);
 +	si2c.rst_io_high = io;
@@ -2058,14 +2070,25 @@ new file mode 100644
 +			}
 +		}
 +
++		/*
++		 * Decisive question: is the ROM bootloader at 0x2c alive at all?
++		 * Any non-zero byte there means the part still has a bootloader
++		 * and firmware could be pushed; all zeros means the part never
++		 * got out of reset internally and nothing can be done over I2C.
++		 */
++		si2c.ub_rc = (uint32_t)si2c_read_rmi4(SAGIT_TOUCH_UB_ADDR,
++		    0x0000, si2c.ub_buf, sizeof(si2c.ub_buf));
++
 +		panic("SAGIT I2C OK: page0=%02x %02x %02x %02x %02x %02x "
-+		    "| pdt pg=%d fn=0x%02x e=%02x %02x %02x %02x %02x %02x "
-+		    "| labibb %d/0x%x/0x%x | qop=0x%x",
++		    "| pdt pg=%d fn=0x%02x "
++		    "| ub %d/%02x %02x %02x %02x %02x %02x %02x %02x "
++		    "| labibb %d/0x%x/0x%x",
 +		    idbuf[0], idbuf[1], idbuf[2], idbuf[3], idbuf[4],
-+		    idbuf[5], (int)found_pg, fn, pdt[0], pdt[1], pdt[2],
-+		    pdt[3], pdt[4], pdt[5], (int)si2c.labibb_rc,
-+		    si2c.lab_status, si2c.ibb_status,
-+		    si2c_rdq(QUP_OPERATIONAL));
++		    idbuf[5], (int)found_pg, fn, (int)si2c.ub_rc,
++		    si2c.ub_buf[0], si2c.ub_buf[1], si2c.ub_buf[2],
++		    si2c.ub_buf[3], si2c.ub_buf[4], si2c.ub_buf[5],
++		    si2c.ub_buf[6], si2c.ub_buf[7], (int)si2c.labibb_rc,
++		    si2c.lab_status, si2c.ibb_status);
 +	}
 +
 +	/* Not at 0x20: the part may be sitting in ROM bootloader at 0x2c. */
