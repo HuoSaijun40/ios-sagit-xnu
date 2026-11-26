@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,2106 @@
+@@ -0,0 +1,2121 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -2013,24 +2013,39 @@ new file mode 100644
 +	rc = si2c_read_rmi4(SAGIT_TOUCH_ADDR, 0x0000, idbuf, sizeof(idbuf));
 +	if (rc == 0) {
 +		/*
-+		 * page0 (0x00-0x05) is only the "function presence" bitmap. The
-+		 * real Page Descriptor Table lives from 0xE9 downwards, six
-+		 * bytes per function, and 0xE8 is the page-select register.
-+		 * Read all three so a zero page0 can be told apart from a part
-+		 * that has no functions at all.
++		 * synaptics_dsx_core.c scans the Page Descriptor Table over
++		 * PAGES_TO_SERVICE (10) pages, not just page 0:
++		 *     for (page = 0; page < 10; page++)
++		 *         for (addr = 0xE9; addr > 0xD0; addr -= 6)
++		 *             read 6-byte entry at (page << 8) | addr
++		 * A part with an empty page-0 PDT may still carry its
++		 * functions on page 1 or above, so read the first entry of
++		 * every page and report where the first fn_number appears.
 +		 */
-+		uint8_t psel = 0;
 +		uint8_t pdt[6];
-+		int rp = si2c_read_rmi4(SAGIT_TOUCH_ADDR, 0x00e8, &psel, 1);
-+		int rd = si2c_read_rmi4(SAGIT_TOUCH_ADDR, 0x00e9, pdt,
-+		    sizeof(pdt));
++		uint32_t pg;
++		uint32_t found_pg = 0xffu;
++		uint8_t fn = 0;
 +
-+		panic("SAGIT I2C OK: touch@0x20 page0=%02x %02x %02x %02x "
-+		    "%02x %02x | page_sel=%02x(rc%d) pdt=%02x %02x %02x "
-+		    "%02x %02x %02x(rc%d) | qop=0x%x | I2C link is up, NORMAL",
++		for (pg = 0; pg < 10; pg++) {
++			if (si2c_read_rmi4(SAGIT_TOUCH_ADDR,
++			    (uint16_t)((pg << 8) | 0x00e9), pdt,
++			    sizeof(pdt)) != 0) {
++				continue;
++			}
++			if (pdt[5] != 0) {      /* fn_number is the last byte */
++				found_pg = pg;
++				fn = pdt[5];
++				break;
++			}
++		}
++
++		panic("SAGIT I2C OK: page0=%02x %02x %02x %02x %02x %02x "
++		    "| pdt pg=%d fn=0x%02x e=%02x %02x %02x %02x %02x %02x "
++		    "| qop=0x%x",
 +		    idbuf[0], idbuf[1], idbuf[2], idbuf[3], idbuf[4],
-+		    idbuf[5], psel, rp, pdt[0], pdt[1], pdt[2], pdt[3],
-+		    pdt[4], pdt[5], rd, si2c_rdq(QUP_OPERATIONAL));
++		    idbuf[5], (int)found_pg, fn, pdt[0], pdt[1], pdt[2],
++		    pdt[3], pdt[4], pdt[5], si2c_rdq(QUP_OPERATIONAL));
 +	}
 +
 +	/* Not at 0x20: the part may be sitting in ROM bootloader at 0x2c. */
