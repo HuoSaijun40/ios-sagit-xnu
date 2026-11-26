@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,2121 @@
+@@ -0,0 +1,2139 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -276,6 +276,9 @@ new file mode 100644
 +	uint32_t dsi_io_before;         /* gpio8 io, as found */
 +	uint32_t dsi_action;            /* 0 = already released, 1 = drove high */
 +	uint32_t pmic_rc;               /* sagit_pmic_ldo6_on() result */
++	uint32_t labibb_rc;             /* sagit_pmic_labibb_on() result */
++	uint32_t lab_status;            /* LAB STATUS1 after enable */
++	uint32_t ibb_status;            /* IBB STATUS1 after enable */
 +	uint32_t pmic_ver;              /* SPMI arbiter version word */
 +	uint32_t pmic_apid;             /* resolved APID, 0xffffffff if none */
 +	uint32_t pmic_st;               /* STATUS after the ENABLE write */
@@ -1624,6 +1627,7 @@ new file mode 100644
 +	    "| rst iolo/hi=0x%x/0x%x cur=0x%x/0x%x drv=%d "
 +	    "| dsi 0x%x/0x%x act=%d "
 +	    "| bb %d/0x%x/0x%x p0=0x%x q1=0x%x qop=0x%x ub=0x%x/%x "
++	    "| labibb %d/0x%x/0x%x "
 +	    "| gcc cbcr=0x%x halt=0x%x rcgr=0x%x iomode=0x%x "
 +	    "| avdd=0x%x/0x%x | scl=0x%x/0x%x sda=0x%x/0x%x\n"
 +	    " pmic(rc/ver/apid/st)=%d/0x%x/0x%x/0x%x",
@@ -1644,6 +1648,7 @@ new file mode 100644
 +	    (int)si2c.bb_rc, si2c.bb_id, si2c.bb_ack,
 +	    si2c.bb_page, si2c.qop_first, si2c.qop_timeout,
 +	    si2c.bb_ub, si2c.bb_ub_ack,
++	    (int)si2c.labibb_rc, si2c.lab_status, si2c.ibb_status,
 +	    si2c_rdg(SAGIT_QUP5_CBCR), si2c_rdg(SAGIT_QUP5_HALT),
 +	    si2c_rdg(SAGIT_QUP5_RCGR + RCG_CMD_REG), si2c_rdq(QUP_IO_MODE),
 +	    si2c.avdd_cfg_after, si2c.avdd_io_after,
@@ -1893,6 +1898,19 @@ new file mode 100644
 +			si2c.pmic_rc = 0xffff0000u;     /* skipped on purpose */
 +		}
 +	}
++
++	/*
++	 * LAB/IBB: the incell panel's +/-5.5V rails. Unconditional -- on Android
++	 * the display driver raises these before touch probes, and with no
++	 * display driver here they would otherwise stay off forever. The touch
++	 * part then acks I2C but never initialises (empty RMI4 PDT).
++	 */
++	{
++		si2c.labibb_rc = (uint32_t)sagit_pmic_labibb_on(
++		    &si2c.lab_status, &si2c.ibb_status);
++		printf("SAGIT I2C: labibb rc=%d lab=0x%x ibb=0x%x\n",
++		    (int)si2c.labibb_rc, si2c.lab_status, si2c.ibb_status);
++	}
 +	si2c_stage(5);
 +	printf("SAGIT I2C 5/9 avdd after: cfg=0x%x io=0x%x\n",
 +	    si2c_tlmm_rd(SAGIT_PIN_TS_AVDD, TLMM_GPIO_CFG),
@@ -2132,7 +2150,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_pmic.c
 --- /dev/null
 +++ b/bsd/dev/sagit_pmic.c
-@@ -0,0 +1,468 @@
+@@ -0,0 +1,579 @@
 +/*
 + * SAGIT: minimal SPMI write to bring up the touch controller's power rail.
 + *
@@ -2498,6 +2516,27 @@ new file mode 100644
 +
 +/* ------------------------------------------------------------- entry point */
 +
++/*
++ * Map the arbiter core and the ownership table once. Every entry point below
++ * goes through here so the two windows are never mapped twice.
++ */
++static int
++pmic_ensure_mapped(void)
++{
++	if (pmic.mapped != 0) {
++		return 0;
++	}
++	pmic.core = (volatile uint32_t *)ml_io_map(PMIC_ARB_CORE_BASE,
++	    PMIC_ARB_CORE_SIZE);
++	if (pmic.core == NULL) {
++		return ENOMEM;
++	}
++	pmic.cnfg = (volatile uint32_t *)ml_io_map(PMIC_ARB_CNFG_BASE,
++	    PMIC_ARB_CNFG_SIZE);
++	pmic.mapped = 1;
++	return 0;
++}
++
 +int
 +sagit_pmic_ldo6_on(struct sagit_pmic_report *rep)
 +{
@@ -2508,16 +2547,9 @@ new file mode 100644
 +	int rc;
 +	int v;
 +
-+	if (pmic.mapped == 0) {
-+		pmic.core = (volatile uint32_t *)ml_io_map(PMIC_ARB_CORE_BASE,
-+		    PMIC_ARB_CORE_SIZE);
-+		if (pmic.core == NULL) {
-+			printf("SAGIT PMIC: ml_io_map(core) failed\n");
-+			return ENOMEM;
-+		}
-+		pmic.cnfg = (volatile uint32_t *)ml_io_map(PMIC_ARB_CNFG_BASE,
-+		    PMIC_ARB_CNFG_SIZE);
-+		pmic.mapped = 1;
++	if (pmic_ensure_mapped() != 0) {
++		printf("SAGIT PMIC: ml_io_map(core) failed\n");
++		return ENOMEM;
 +	}
 +
 +	if (rep != NULL) {
@@ -2601,13 +2633,110 @@ new file mode 100644
 +}
 +
 +#endif /* SAGIT */
++
++/* ---------------------------------------------------------------- LAB/IBB */
++
++/*
++ * LAB/IBB on PMI8998 (USID 3): the +5.5 V / -5.5 V rails an incell panel's
++ * source/gate drivers need. On Android the display driver raises these before
++ * the touch driver probes; with no display driver here they are never powered,
++ * and an incell part then answers I2C (VDD/VDDIO are up) while refusing to
++ * initialise -- which is exactly what an empty RMI4 PDT looks like.
++ *
++ * SPMI PPID = (usid << 8) | (addr >> 8):
++ *   LAB 0xDE00 -> PPID 0x3DE, register 0x46
++ *   IBB 0xDC00 -> PPID 0x3DC, register 0x46
++ *
++ * Registers, from drivers/regulator/qcom-labibb-regulator.c:
++ *   0x04 PERPH_TYPE  0x24 for LAB, 0x20 for IBB
++ *   0x08 STATUS1     BIT(7) = VREG_OK
++ *   0x46 ENABLE_CTL  BIT(7) = enable
++ *
++ * Voltage is deliberately not written: the DT sets
++ * qcom,qpnp-lab-use-default-voltage, so the OTP values (5.5 V) apply. Writing
++ * a voltage we cannot verify risks the panel.
++ */
++int
++sagit_pmic_labibb_on(uint32_t *lab_status, uint32_t *ibb_status)
++{
++	static const struct {
++		uint32_t ppid;
++		int type;
++		const char *name;
++	} rails[2] = {
++		{ 0x3deu, 0x24, "lab" },
++		{ 0x3dcu, 0x20, "ibb" },
++	};
++	int rc = 0;
++
++	if (pmic_ensure_mapped() != 0) {
++		return ENOMEM;
++	}
++
++	for (uint32_t i = 0; i < 2; i++) {
++		int apid = pmic_find_apid(rails[i].ppid, NULL);
++		int type;
++		int st;
++
++		if (apid < 0) {
++			printf("SAGIT PMIC: %s ppid=0x%x no apid\n",
++			    rails[i].name, rails[i].ppid);
++			rc = ENOENT;
++			continue;
++		}
++
++		type = pmic_read_byte((uint32_t)apid, 0x04u);
++		printf("SAGIT PMIC: %s apid=%d type=0x%x want=0x%x\n",
++		    rails[i].name, apid, type, rails[i].type);
++		if (type != rails[i].type) {
++			rc = EIO;
++			continue;
++		}
++
++		st = pmic_read_byte((uint32_t)apid, 0x08u);
++		if (st < 0) {
++			rc = EIO;
++			continue;
++		}
++		printf("SAGIT PMIC: %s status1=0x%x\n", rails[i].name, st);
++
++		if ((st & 0x80) == 0) {
++			uint32_t wst = 0;
++			int wrc = pmic_write_byte((uint32_t)apid, 0x46u,
++			    0x80u, &wst);
++
++			printf("SAGIT PMIC: %s enable rc=%d st=0x%x\n",
++			    rails[i].name, wrc, wst);
++			if (wrc != 0) {
++				rc = wrc;
++				continue;
++			}
++			pmic_settle(4000);      /* POWER_DELAY is 8 ms */
++			st = pmic_read_byte((uint32_t)apid, 0x08u);
++			printf("SAGIT PMIC: %s status1 after=0x%x\n",
++			    rails[i].name, st);
++		}
++
++		if (i == 0 && lab_status != NULL) {
++			*lab_status = (st < 0) ? 0xffffffffu : (uint32_t)st;
++		}
++		if (i == 1 && ibb_status != NULL) {
++			*ibb_status = (st < 0) ? 0xffffffffu : (uint32_t)st;
++		}
++		if (st < 0 || (st & 0x80) == 0) {
++			rc = EIO;
++		}
++	}
++
++	return rc;
++}
 diff --git a/bsd/dev/sagit_pmic.h b/bsd/dev/sagit_pmic.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sagit_pmic.h
 --- /dev/null
 +++ b/bsd/dev/sagit_pmic.h
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,49 @@
 +/*
 + * SAGIT PMIC: the result of the SPMI write that brings up the touch rail.
 + *
@@ -2648,6 +2777,13 @@ new file mode 100644
 +};
 +
 +int sagit_pmic_ldo6_on(struct sagit_pmic_report *rep);
++
++/*
++ * Raise LAB/IBB on PMI8998 -- the +5.5 V / -5.5 V rails an incell panel needs
++ * and that the (absent) display driver would normally provide.
++ * Returns 0 only when both rails report VREG_OK.
++ */
++int sagit_pmic_labibb_on(uint32_t *lab_status, uint32_t *ibb_status);
 +
 +#endif /* _BSD_DEV_SAGIT_PMIC_H_ */
 diff --git a/bsd/dev/sagit_smem.c b/bsd/dev/sagit_smem.c
