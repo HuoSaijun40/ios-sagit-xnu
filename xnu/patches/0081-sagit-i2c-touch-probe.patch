@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,2356 @@
+@@ -0,0 +1,2476 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -275,7 +275,8 @@ new file mode 100644
 +	uint32_t bb_id;                 /* first byte read by bit-bang, 0xffff=none */
 +	uint32_t bb_ack;                /* bit0..7 = ack seen at each step */
 +	uint32_t bb_page;               /* page0[0..3] packed big-endian */
-+	uint32_t bb_pdt_fn;             /* fn_number of page0/0xe9 PDT entry via bit-bang */
++	uint32_t bb_pdt_fn;             /* first non-zero fn_number from RMI4 PDT via bit-bang */
++	uint32_t bb_pdt_pg;             /* page where bb_pdt_fn was found (0xff = none) */
 +	uint32_t bb_ub;                 /* first byte read at the 0x2c bootloader addr */
 +	uint32_t bb_ub_ack;             /* ack bits for the 0x2c attempt */
 +	uint32_t ub_rc;                 /* QUP read of 0x2c, 8 bytes */
@@ -1598,6 +1599,100 @@ new file mode 100644
 +	return (int)(si2c_tlmm_rd(pin, TLMM_GPIO_IN_OUT) & 1u);
 +}
 +
++/*
++ * v131: RMI4 uses a page register, NOT a 16-bit address. The vendor driver
++ * (synaptics_rmi4_i2c_set_page) writes {0xFF, page} in a SEPARATE I2C
++ * transaction before every read whose address crosses a page. Every version
++ * of this probe so far wrote the page as the high byte of a 16-bit register
++ * address (0xE9 -> (page<<8)|0xE9), which the chip never interprets as a page
++ * select -- so all PDT reads hit whatever page happened to be latched (0),
++ * and came back all zeros even though the slave ACKed everything.
++ *
++ * Minimal open-drain byte write: START, addr+W, reg, data, STOP.
++ */
++static int
++si2c_bb_write_byte(uint8_t addr, uint8_t reg, uint8_t val)
++{
++	const uint32_t scl = SAGIT_PIN_SCL;
++	const uint32_t sda = SAGIT_PIN_SDA;
++	uint8_t acks = 0;
++	uint8_t b;
++	uint32_t i;
++
++	bb_release(sda);
++	bb_release(scl);
++	si2c_settle(2);
++
++	bb_low(sda);                    /* START */
++	si2c_settle(2);
++	bb_low(scl);
++	si2c_settle(2);
++
++	b = (uint8_t)(addr << 1);       /* address + WRITE */
++	for (i = 0; i < 8; i++) {
++		if (b & 0x80) bb_release(sda); else bb_low(sda);
++		si2c_settle(2);
++		bb_release(scl);
++		si2c_settle(2);
++		bb_low(scl);
++		si2c_settle(2);
++		b = (uint8_t)(b << 1);
++	}
++	bb_release(sda);
++	si2c_settle(2);
++	bb_release(scl);
++	si2c_settle(2);
++	if (!bb_level(sda)) acks |= 1u;
++	bb_low(scl);
++	si2c_settle(2);
++
++	b = reg;                        /* register = 0xFF (page select) */
++	for (i = 0; i < 8; i++) {
++		if (b & 0x80) bb_release(sda); else bb_low(sda);
++		si2c_settle(2);
++		bb_release(scl);
++		si2c_settle(2);
++		bb_low(scl);
++		si2c_settle(2);
++		b = (uint8_t)(b << 1);
++	}
++	bb_release(sda);
++	si2c_settle(2);
++	bb_release(scl);
++	si2c_settle(2);
++	if (!bb_level(sda)) acks |= 2u;
++	bb_low(scl);
++	si2c_settle(2);
++
++	b = val;                        /* data = page number */
++	for (i = 0; i < 8; i++) {
++		if (b & 0x80) bb_release(sda); else bb_low(sda);
++		si2c_settle(2);
++		bb_release(scl);
++		si2c_settle(2);
++		bb_low(scl);
++		si2c_settle(2);
++		b = (uint8_t)(b << 1);
++	}
++	bb_release(sda);
++	si2c_settle(2);
++	bb_release(scl);
++	si2c_settle(2);
++	if (!bb_level(sda)) acks |= 4u;
++	bb_low(scl);
++	si2c_settle(2);
++
++	/* STOP */
++	bb_low(sda);
++	si2c_settle(2);
++	bb_release(scl);
++	si2c_settle(2);
++	bb_release(sda);
++	si2c_settle(2);
++
++	return (acks == 7u) ? 0 : EIO;
++}
++
 +static int
 +si2c_bb_read(uint8_t addr, uint8_t reg, uint8_t *out)
 +{
@@ -1761,7 +1856,7 @@ new file mode 100644
 +	    "| rst iolo/hi=0x%x/0x%x cur=0x%x/0x%x drv=%d "
 +	    "| dsi 0x%x/0x%x act=%d "
 +	    "| bb %d/0x%x/0x%x p0=0x%x q1=0x%x qop=0x%x ub=0x%x/%x "
-+	    "| bpdt fn=0x%x | labibb %d/0x%x/0x%x "
++	    "| bpdt pg/fn=0x%x/0x%x | labibb %d/0x%x/0x%x "
 +	    "| gcc cbcr=0x%x halt=0x%x rcgr=0x%x iomode=0x%x "
 +	    "| avdd=0x%x/0x%x | scl=0x%x/0x%x sda=0x%x/0x%x\n"
 +	    " pmic(rc/ver/apid/st)=%d/0x%x/0x%x/0x%x",
@@ -1782,7 +1877,7 @@ new file mode 100644
 +	    (int)si2c.bb_rc, si2c.bb_id, si2c.bb_ack,
 +	    si2c.bb_page, si2c.qop_first, si2c.qop_timeout,
 +	    si2c.bb_ub, si2c.bb_ub_ack,
-+	    si2c.bb_pdt_fn,
++	    si2c.bb_pdt_pg, si2c.bb_pdt_fn,
 +	    (int)si2c.labibb_rc, si2c.lab_status, si2c.ibb_status,
 +	    si2c_rdg(SAGIT_QUP5_CBCR), si2c_rdg(SAGIT_QUP5_HALT),
 +	    si2c_rdg(SAGIT_QUP5_RCGR + RCG_CMD_REG), si2c_rdq(QUP_IO_MODE),
@@ -1801,6 +1896,7 @@ new file mode 100644
 +	int rc;
 +
 +	si2c.txn = 0;
++	si2c.bb_pdt_pg = 0xffu;         /* 0xff = no PDT entry found anywhere */
 +
 +	/*
 +	 * Feasibility gate for the RPM path. v89 showed PM8998's LDO6 has no
@@ -2307,13 +2403,37 @@ new file mode 100644
 +			 * only; that is enough to answer "is the chip alive".
 +			 */
 +			{
-+				uint8_t bpdt[6];
++				uint32_t pg;
 +
-+				for (uint32_t k = 0; k < 6; k++) {
-+					(void)si2c_bb_read(SAGIT_TOUCH_ADDR,
-+					    (uint8_t)(0xe9u + k), &bpdt[k]);
++				for (pg = 0; pg < 10; pg++) {
++					uint32_t ent;
++					uint8_t found = 0;
++
++					/* RMI4 page select: write 0xFF = page (v131). */
++					(void)si2c_bb_write_byte(SAGIT_TOUCH_ADDR,
++					    0xffu, (uint8_t)pg);
++
++					for (ent = 0xe9u; ent > 0xd0u; ent -= 6u) {
++						uint8_t bpdt[6];
++						uint32_t k;
++
++						for (k = 0; k < 6; k++) {
++							(void)si2c_bb_read(
++							    SAGIT_TOUCH_ADDR,
++							    (uint8_t)(ent + k),
++							    &bpdt[k]);
++						}
++						if (bpdt[5] != 0) {
++							found = bpdt[5];
++							break;
++						}
++					}
++					if (found != 0) {
++						si2c.bb_pdt_fn = found;
++						si2c.bb_pdt_pg = pg;
++						break;
++					}
 +				}
-+				si2c.bb_pdt_fn = bpdt[5];
 +			}
 +
 +			/*
