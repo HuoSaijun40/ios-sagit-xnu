@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,2587 @@
+@@ -0,0 +1,2605 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -930,8 +930,19 @@ new file mode 100644
 +	wtags[wlen++] = (uint8_t)(addr << 1);
 +	wtags[wlen++] = QUP_TAG_V2_DATAWR_STOP;   /* single block, STOP after */
 +	wtags[wlen++] = 2;                        /* two register bytes follow */
-+	wtags[wlen++] = (uint8_t)(reg & 0xff);
-+	wtags[wlen++] = (uint8_t)(reg >> 8);
++	/*
++	 * v137: the RMI4 16-bit register address is BIG-ENDIAN. Linux
++	 * drivers/input/rmi4/rmi_i2c.c transmits it as
++	 *     txbuf[0] = addr >> 8;
++	 *     txbuf[1] = addr & 0xff;
++	 * We had it little-endian, so every non-zero address was decoded as
++	 * the wrong page: 0x00E9 became page 0xE9 / offset 0x00, an empty
++	 * page. That is why page0 (address 0x0000, endian-independent) read
++	 * back cleanly while the whole PDT came back zero, on every version
++	 * since v121. Swap the two bytes.
++	 */
++	wtags[wlen++] = (uint8_t)(reg >> 8);      /* high byte = page  */
++	wtags[wlen++] = (uint8_t)(reg & 0xff);    /* low  byte = offset */
 +
 +	/*
 +	 * First sub-transfer: config_run is 0, no RX.
@@ -2446,13 +2457,20 @@ new file mode 100644
 +		panic("SAGIT I2C OK: page0=%02x %02x %02x %02x %02x %02x "
 +		    "| pdt pg=%d fn=0x%02x "
 +		    "| ub %d/%02x %02x %02x %02x %02x %02x %02x %02x "
-+		    "| labibb %d/0x%x/0x%x",
++		    "| labibb %d/0x%x/0x%x "
++		    "| labdbg apid/ty/st=0x%x/0x%x/0x%x "
++		    "ibb=0x%x/0x%x/0x%x wrc=0x%x/0x%x after=0x%x/0x%x",
 +		    idbuf[0], idbuf[1], idbuf[2], idbuf[3], idbuf[4],
 +		    idbuf[5], (int)found_pg, fn, (int)si2c.ub_rc,
 +		    si2c.ub_buf[0], si2c.ub_buf[1], si2c.ub_buf[2],
 +		    si2c.ub_buf[3], si2c.ub_buf[4], si2c.ub_buf[5],
 +		    si2c.ub_buf[6], si2c.ub_buf[7], (int)si2c.labibb_rc,
-+		    si2c.lab_status, si2c.ibb_status);
++		    si2c.lab_status, si2c.ibb_status,
++		    sagit_labibb_dbg[0], sagit_labibb_dbg[1],
++		    sagit_labibb_dbg[2], sagit_labibb_dbg[3],
++		    sagit_labibb_dbg[4], sagit_labibb_dbg[5],
++		    sagit_labibb_dbg[6], sagit_labibb_dbg[7],
++		    sagit_labibb_dbg[8], sagit_labibb_dbg[9]);
 +	}
 +
 +	/* Not at 0x20: the part may be sitting in ROM bootloader at 0x2c. */
@@ -2598,7 +2616,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_pmic.c
 --- /dev/null
 +++ b/bsd/dev/sagit_pmic.c
-@@ -0,0 +1,579 @@
+@@ -0,0 +1,593 @@
 +/*
 + * SAGIT: minimal SPMI write to bring up the touch controller's power rail.
 + *
@@ -3104,6 +3122,8 @@ new file mode 100644
 + * qcom,qpnp-lab-use-default-voltage, so the OTP values (5.5 V) apply. Writing
 + * a voltage we cannot verify risks the panel.
 + */
++uint32_t sagit_labibb_dbg[10];
++
 +int
 +sagit_pmic_labibb_on(uint32_t *lab_status, uint32_t *ibb_status)
 +{
@@ -3117,6 +3137,10 @@ new file mode 100644
 +	};
 +	int rc = 0;
 +
++	/* 0xdead = "that rail was never reached", 0xffffffff = no apid. */
++	for (int k = 0; k < 10; k++) {
++		sagit_labibb_dbg[k] = 0xdeadu;
++	}
 +	if (pmic_ensure_mapped() != 0) {
 +		return ENOMEM;
 +	}
@@ -3129,13 +3153,17 @@ new file mode 100644
 +		if (apid < 0) {
 +			printf("SAGIT PMIC: %s ppid=0x%x no apid\n",
 +			    rails[i].name, rails[i].ppid);
++			sagit_labibb_dbg[i * 3u] = 0xffffffffu;
 +			rc = ENOENT;
 +			continue;
 +		}
++		sagit_labibb_dbg[i * 3u] = (uint32_t)apid;
 +
 +		type = pmic_read_byte((uint32_t)apid, 0x04u);
 +		printf("SAGIT PMIC: %s apid=%d type=0x%x want=0x%x\n",
 +		    rails[i].name, apid, type, rails[i].type);
++		sagit_labibb_dbg[i * 3u + 1u] =
++		    (type < 0) ? 0xffffffffu : (uint32_t)type;
 +		if (type != rails[i].type) {
 +			rc = EIO;
 +			continue;
@@ -3146,6 +3174,7 @@ new file mode 100644
 +			rc = EIO;
 +			continue;
 +		}
++		sagit_labibb_dbg[i * 3u + 2u] = (uint32_t)st;
 +		printf("SAGIT PMIC: %s status1=0x%x\n", rails[i].name, st);
 +
 +		if ((st & 0x80) == 0) {
@@ -3155,6 +3184,7 @@ new file mode 100644
 +
 +			printf("SAGIT PMIC: %s enable rc=%d st=0x%x\n",
 +			    rails[i].name, wrc, wst);
++			sagit_labibb_dbg[6u + i] = (uint32_t)wrc;
 +			if (wrc != 0) {
 +				rc = wrc;
 +				continue;
@@ -3164,6 +3194,8 @@ new file mode 100644
 +			printf("SAGIT PMIC: %s status1 after=0x%x\n",
 +			    rails[i].name, st);
 +		}
++		sagit_labibb_dbg[8u + i] =
++		    (st < 0) ? 0xffffffffu : (uint32_t)st;
 +
 +		if (i == 0 && lab_status != NULL) {
 +			*lab_status = (st < 0) ? 0xffffffffu : (uint32_t)st;
@@ -3184,7 +3216,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_pmic.h
 --- /dev/null
 +++ b/bsd/dev/sagit_pmic.h
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,58 @@
 +/*
 + * SAGIT PMIC: the result of the SPMI write that brings up the touch rail.
 + *
@@ -3232,6 +3264,15 @@ new file mode 100644
 + * Returns 0 only when both rails report VREG_OK.
 + */
 +int sagit_pmic_labibb_on(uint32_t *lab_status, uint32_t *ibb_status);
++/*
++ * v137 diagnostics: the LAB/IBB probe reported rc=0 with both STATUS1 words
++ * zero, which the code's own logic says is impossible (it sets EIO whenever
++ * bit7 is clear). Expose the per-rail intermediates so one panic settles it:
++ *   [0]=lab apid  [1]=lab type  [2]=lab status before
++ *   [3]=ibb apid  [4]=ibb type  [5]=ibb status before
++ *   [6]=lab write rc  [7]=ibb write rc  [8]=lab status after  [9]=ibb after
++ */
++extern uint32_t sagit_labibb_dbg[10];
 +
 +#endif /* _BSD_DEV_SAGIT_PMIC_H_ */
 diff --git a/bsd/dev/sagit_smem.c b/bsd/dev/sagit_smem.c
