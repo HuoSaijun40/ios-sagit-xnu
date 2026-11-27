@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,2656 @@
+@@ -0,0 +1,2690 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -280,6 +280,11 @@ new file mode 100644
 +	uint32_t bb_pdt_pg;             /* page where bb_pdt_fn was found (0xff = none) */
 +	uint32_t bb_idle;               /* SCL/SDA levels before bit-bang: bit1=SCL bit0=SDA */
 +	uint32_t bb_bogus_ack;          /* ACK bits from a read of a non-existent addr 0x7f */
++	/* v140: RMI4 PDT results, everything a touch driver needs to start. */
++	uint32_t fn_n;                  /* number of PDT entries found */
++	uint8_t fn_list[8];             /* fn_number of each entry, in PDT order */
++	uint32_t f01_q, f01_c, f01_d;   /* F01 query/control/data base addresses */
++	uint32_t f11_q, f11_c, f11_d;   /* F11 query/control/data base addresses */
 +	uint32_t bb_ub;                 /* first byte read at the 0x2c bootloader addr */
 +	uint32_t bb_ub_ack;             /* ack bits for the 0x2c attempt */
 +	uint32_t ub_rc;                 /* QUP read of 0x2c, 8 bytes */
@@ -2465,26 +2470,60 @@ new file mode 100644
 +		uint8_t fn = 0;
 +
 +		/*
-+		 * v139: scan the PDT the way the vendor does -- five entries per
-+		 * page, walking DOWN from 0xE9 (0xE9, 0xE3, 0xDD, 0xD7, 0xD1),
-+		 * not just the first one. A part whose 0xE9 entry is blank can
-+		 * still carry F01/F11 at 0xE3 or below.
++		 * v140: the whole PDT finally reads correctly (v139 page-select
++		 * protocol). v139 stopped at the FIRST non-zero entry, which on
++		 * this part is F34 at 0xE9 -- so F01 and F11 were never seen.
++		 * Walk every entry of every page and collect what a driver needs:
++		 * F01 (device control) and F11 (2D touch) query/control bases.
 +		 */
-+		for (pg = 0; pg < 10 && fn == 0; pg++) {
-+			uint32_t ent;
++		{
++			uint8_t fn_list[8];
++			uint32_t fn_n = 0;
++			uint8_t f01_q = 0, f01_c = 0, f01_d = 0;
++			uint8_t f11_q = 0, f11_c = 0, f11_d = 0;
 +
-+			for (ent = 0x00e9u; ent > 0x00d0u; ent -= 6u) {
-+				if (si2c_read_rmi4(SAGIT_TOUCH_ADDR,
-+				    (uint16_t)((pg << 8) | ent), pdt,
-+				    sizeof(pdt)) != 0) {
-+					continue;
-+				}
-+				if (pdt[5] != 0) {  /* fn_number is last byte */
-+					found_pg = pg;
-+					fn = pdt[5];
-+					break;
++			for (pg = 0; pg < 10; pg++) {
++				uint32_t ent;
++
++				for (ent = 0x00e9u; ent > 0x00d0u; ent -= 6u) {
++					if (si2c_read_rmi4(SAGIT_TOUCH_ADDR,
++					    (uint16_t)((pg << 8) | ent), pdt,
++					    sizeof(pdt)) != 0) {
++						continue;
++					}
++					if (pdt[5] == 0) {
++						continue;   /* empty entry */
++					}
++					if (fn_n < 8) {
++						fn_list[fn_n++] = pdt[5];
++					}
++					if (fn == 0) {
++						/* keep the first one for the dump */
++						found_pg = pg;
++						fn = pdt[5];
++					}
++					if (pdt[5] == 0x01) {
++						f01_q = pdt[0];
++						f01_c = pdt[2];
++						f01_d = pdt[3];
++					}
++					if (pdt[5] == 0x11) {
++						f11_q = pdt[0];
++						f11_c = pdt[2];
++						f11_d = pdt[3];
++					}
 +				}
 +			}
++			si2c.fn_n = fn_n;
++			for (uint32_t i = 0; i < fn_n && i < 8; i++) {
++				si2c.fn_list[i] = fn_list[i];
++			}
++			si2c.f01_q = f01_q;
++			si2c.f01_c = f01_c;
++			si2c.f01_d = f01_d;
++			si2c.f11_q = f11_q;
++			si2c.f11_c = f11_c;
++			si2c.f11_d = f11_d;
 +		}
 +
 +		/*
@@ -2497,31 +2536,26 @@ new file mode 100644
 +		    0x0000, si2c.ub_buf, sizeof(si2c.ub_buf));
 +
 +		/*
-+		 * v139: dump all six PDT bytes, not just fn_number. v138 showed
-+		 * "pdt pg=5 fn=0xE9" -- and 0xE9 is exactly the offset we asked
-+		 * for, which looks like the slave echoing the register pointer
-+		 * instead of returning data. Only the full entry distinguishes
-+		 * "echo" (E9 00 00 00 00 E9 or similar) from a real descriptor.
++		 * v140: the link and the PDT are both proven now, so report what
++		 * a driver consumes instead of more link diagnostics:
++		 *   fns   = every fn_number found, in PDT order
++		 *   f01/f11 = query/control/data base addresses of F01 and F11
++		 * With these I can issue the real F01 device-control and F11 2D
++		 * touch reads without another discovery round.
 +		 */
 +		panic("SAGIT I2C OK: page0=%02x %02x %02x %02x %02x %02x "
-+		    "| pdt pg=%d fn=0x%02x entry=%02x %02x %02x %02x %02x %02x "
-+		    "| ub %d/%02x %02x %02x %02x %02x %02x %02x %02x "
-+		    "| labibb %d/0x%x/0x%x "
-+		    "| labdbg apid/ty/st=0x%x/0x%x/0x%x "
-+		    "ibb=0x%x/0x%x/0x%x wrc=0x%x/0x%x after=0x%x/0x%x",
++		    "| fns=%d: %02x %02x %02x %02x %02x %02x %02x %02x "
++		    "| f01 qcd=0x%x/0x%x/0x%x | f11 qcd=0x%x/0x%x/0x%x "
++		    "| ub %d | lab 0x%x/0x%x",
 +		    idbuf[0], idbuf[1], idbuf[2], idbuf[3], idbuf[4],
-+		    idbuf[5], (int)found_pg, fn,
-+		    pdt[0], pdt[1], pdt[2], pdt[3], pdt[4], pdt[5],
++		    idbuf[5], (int)si2c.fn_n,
++		    si2c.fn_list[0], si2c.fn_list[1], si2c.fn_list[2],
++		    si2c.fn_list[3], si2c.fn_list[4], si2c.fn_list[5],
++		    si2c.fn_list[6], si2c.fn_list[7],
++		    si2c.f01_q, si2c.f01_c, si2c.f01_d,
++		    si2c.f11_q, si2c.f11_c, si2c.f11_d,
 +		    (int)si2c.ub_rc,
-+		    si2c.ub_buf[0], si2c.ub_buf[1], si2c.ub_buf[2],
-+		    si2c.ub_buf[3], si2c.ub_buf[4], si2c.ub_buf[5],
-+		    si2c.ub_buf[6], si2c.ub_buf[7], (int)si2c.labibb_rc,
-+		    si2c.lab_status, si2c.ibb_status,
-+		    sagit_labibb_dbg[0], sagit_labibb_dbg[1],
-+		    sagit_labibb_dbg[2], sagit_labibb_dbg[3],
-+		    sagit_labibb_dbg[4], sagit_labibb_dbg[5],
-+		    sagit_labibb_dbg[6], sagit_labibb_dbg[7],
-+		    sagit_labibb_dbg[8], sagit_labibb_dbg[9]);
++		    si2c.lab_status, si2c.ibb_status);
 +	}
 +
 +	/* Not at 0x20: the part may be sitting in ROM bootloader at 0x2c. */
