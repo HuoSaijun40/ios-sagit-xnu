@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,2517 @@
+@@ -0,0 +1,2533 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -278,6 +278,7 @@ new file mode 100644
 +	uint32_t bb_pdt_fn;             /* first non-zero fn_number from RMI4 PDT via bit-bang */
 +	uint32_t bb_pdt_pg;             /* page where bb_pdt_fn was found (0xff = none) */
 +	uint32_t bb_idle;               /* SCL/SDA levels before bit-bang: bit1=SCL bit0=SDA */
++	uint32_t bb_bogus_ack;          /* ACK bits from a read of a non-existent addr 0x7f */
 +	uint32_t bb_ub;                 /* first byte read at the 0x2c bootloader addr */
 +	uint32_t bb_ub_ack;             /* ack bits for the 0x2c attempt */
 +	uint32_t ub_rc;                 /* QUP read of 0x2c, 8 bytes */
@@ -1896,7 +1897,8 @@ new file mode 100644
 +	    "| rst iolo/hi=0x%x/0x%x cur=0x%x/0x%x drv=%d "
 +	    "| dsi 0x%x/0x%x act=%d "
 +	    "| bb %d/0x%x/0x%x p0=0x%x q1=0x%x qop=0x%x ub=0x%x/%x "
-+	    "| bpdt pg/fn=0x%x/0x%x idle=0x%x | labibb %d/0x%x/0x%x "
++	    "| bpdt pg/fn=0x%x/0x%x idle=0x%x bogus=0x%x "
++	    "| labibb %d/0x%x/0x%x "
 +	    "| gcc cbcr=0x%x halt=0x%x rcgr=0x%x iomode=0x%x "
 +	    "| avdd=0x%x/0x%x | scl=0x%x/0x%x sda=0x%x/0x%x\n"
 +	    " pmic(rc/ver/apid/st)=%d/0x%x/0x%x/0x%x",
@@ -1917,7 +1919,7 @@ new file mode 100644
 +	    (int)si2c.bb_rc, si2c.bb_id, si2c.bb_ack,
 +	    si2c.bb_page, si2c.qop_first, si2c.qop_timeout,
 +	    si2c.bb_ub, si2c.bb_ub_ack,
-+	    si2c.bb_pdt_pg, si2c.bb_pdt_fn, si2c.bb_idle,
++	    si2c.bb_pdt_pg, si2c.bb_pdt_fn, si2c.bb_idle, si2c.bb_bogus_ack,
 +	    (int)si2c.labibb_rc, si2c.lab_status, si2c.ibb_status,
 +	    si2c_rdg(SAGIT_QUP5_CBCR), si2c_rdg(SAGIT_QUP5_HALT),
 +	    si2c_rdg(SAGIT_QUP5_RCGR + RCG_CMD_REG), si2c_rdq(QUP_IO_MODE),
@@ -2418,6 +2420,20 @@ new file mode 100644
 +	 */
 +	si2c_stage(12);
 +	si2c_bb_bus_check();            /* v132: verify bus is actually free */
++	/*
++	 * v133 DECISIVE SELF-TEST: read a slave address nobody can occupy
++	 * (0x7f is reserved). A healthy open-drain probe must see NACK and
++	 * return acks=0. If this also returns 7, our "ACK=7" on 0x20 was
++	 * never a real slave acknowledgement -- it is SDA sampled before the
++	 * pull-up rose, and every data byte is likewise sampled too early.
++	 * That would explain ACK=7 with all-zero data in one shot.
++	 */
++	{
++		uint8_t bogus = 0;
++
++		(void)si2c_bb_read(0x7fu, 0x00u, &bogus);
++		si2c.bb_bogus_ack = si2c.bb_ack;
++	}
 +	{
 +		uint8_t page[6];
 +		uint8_t dd = 0;
