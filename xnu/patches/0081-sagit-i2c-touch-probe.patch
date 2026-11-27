@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,2903 @@
+@@ -0,0 +1,2939 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -291,6 +291,7 @@ new file mode 100644
 +	uint32_t f01_ctrl_before, f01_ctrl_after;
 +	uint32_t f01_intr_after;
 +	uint32_t f12_ctrl_after;
++	uint32_t wr_rc1, wr_rc2, wr_rc3; /* v143: write() return codes */
 +	uint32_t f01_status;
 +	uint32_t touch_hits;            /* polls that saw a non-zero int status */
 +	uint32_t f12_d0, f12_d1;        /* first F12 data word seen */
@@ -1178,13 +1179,17 @@ new file mode 100644
 + *   block 1  START addr+W DATAWR_STOP 2 0xFF page      (page select)
 + *   block 2  START addr+W DATAWR_STOP n offset d0..    (register write)
 + */
++/*
++ * One write-only QUP transaction:
++ *   START, addr+W, DATAWR_STOP, len, <len bytes>
++ * Self-contained (reset -> run -> program -> pause -> fill -> run -> wait) so
++ * callers can chain as many as they need without reasoning about block state.
++ */
 +static int
-+si2c_write_addr(uint8_t addr, uint16_t reg, const uint8_t *val, uint32_t len)
++si2c_qup_write_one(uint8_t addr, const uint8_t *buf, uint32_t len)
 +{
-+	uint8_t wt[40];
++	uint8_t wt[24];
 +	uint32_t wlen = 0;
-+	uint8_t page = (uint8_t)(reg >> 8);
-+	uint8_t offset = (uint8_t)(reg & 0xff);
 +	uint32_t op;
 +	uint32_t spins;
 +
@@ -1192,7 +1197,6 @@ new file mode 100644
 +		return EINVAL;
 +	}
 +
-+	/* Same per-transfer bring-up as the read path (qup_i2c_xfer_v2). */
 +	si2c_wrq(QUP_SW_RESET, 1);
 +	if (!si2c_poll(QUP_SW_RESET, 1u, 0u, SAGIT_I2C_SPIN)) {
 +		return EBUSY;
@@ -1215,17 +1219,9 @@ new file mode 100644
 +	wt[wlen++] = QUP_TAG_V2_START;
 +	wt[wlen++] = (uint8_t)(addr << 1);
 +	wt[wlen++] = QUP_TAG_V2_DATAWR_STOP;
-+	wt[wlen++] = 2;
-+	wt[wlen++] = 0xff;
-+	wt[wlen++] = page;
-+
-+	wt[wlen++] = QUP_TAG_V2_START;
-+	wt[wlen++] = (uint8_t)(addr << 1);
-+	wt[wlen++] = QUP_TAG_V2_DATAWR_STOP;
-+	wt[wlen++] = (uint8_t)(len + 1u);
-+	wt[wlen++] = offset;
++	wt[wlen++] = (uint8_t)len;
 +	for (uint32_t i = 0; i < len; i++) {
-+		wt[wlen++] = val[i];
++		wt[wlen++] = buf[i];
 +	}
 +
 +	si2c_wrq(QUP_MX_INPUT_CNT, 0);
@@ -1243,7 +1239,6 @@ new file mode 100644
 +	}
 +
 +	si2c_wrq(QUP_OPERATIONAL, QUP_OPERATIONAL_RESET);
-+
 +	if (si2c_write_tags(wt, wlen) != 0) {
 +		return ETIMEDOUT;
 +	}
@@ -1266,8 +1261,45 @@ new file mode 100644
 +	if (spins == SAGIT_I2C_XFER_SPIN) {
 +		return ETIMEDOUT;
 +	}
++	(void)si2c_change_state(QUP_STATE_RESET);
 +
 +	return 0;
++}
++
++/*
++ * v143: split the write into TWO transactions instead of packing both blocks
++ * into one FIFO burst. The v142 single-shot version queued 12 tag bytes
++ * (block1 6 + block2 5+1), the OUT FIFO is 2 words deep on this SoC, and the
++ * write silently did nothing -- F01 interrupt-enable read back 0 right after
++ * writing 1. Two small transactions avoid the FIFO limit entirely and make
++ * each step independently diagnosable.
++ */
++static int
++si2c_write_addr(uint8_t addr, uint16_t reg, const uint8_t *val, uint32_t len)
++{
++	uint8_t page = (uint8_t)(reg >> 8);
++	uint8_t offset = (uint8_t)(reg & 0xff);
++	uint8_t b[17];
++	int rc;
++
++	if (len == 0 || len > 16) {
++		return EINVAL;
++	}
++
++	/* transaction 1: page select {0xFF, page} */
++	b[0] = 0xff;
++	b[1] = page;
++	rc = si2c_qup_write_one(addr, b, 2);
++	if (rc != 0) {
++		return rc;
++	}
++
++	/* transaction 2: {offset, data...} */
++	b[0] = offset;
++	for (uint32_t i = 0; i < len; i++) {
++		b[1 + i] = val[i];
++	}
++	return si2c_qup_write_one(addr, b, len + 1);
 +}
 +
 +/*
@@ -2684,7 +2716,8 @@ new file mode 100644
 +			    (uint16_t)si2c.f01_c, &c, 1) == 0) {
 +				si2c.f01_ctrl_before = c;
 +				c &= (uint8_t)~0x07u;   /* normal operation */
-+				(void)si2c_write_rmi4(SAGIT_TOUCH_ADDR,
++				si2c.wr_rc1 = (uint32_t)si2c_write_rmi4(
++				    SAGIT_TOUCH_ADDR,
 +				    (uint16_t)si2c.f01_c, &c, 1);
 +				if (si2c_read_rmi4(SAGIT_TOUCH_ADDR,
 +				    (uint16_t)si2c.f01_c, &c, 1) == 0) {
@@ -2694,7 +2727,8 @@ new file mode 100644
 +			if (si2c_read_rmi4(SAGIT_TOUCH_ADDR,
 +			    (uint16_t)(si2c.f01_c + 1), &c, 1) == 0) {
 +				c |= 0x01u;             /* 0D interrupt */
-+				(void)si2c_write_rmi4(SAGIT_TOUCH_ADDR,
++				si2c.wr_rc2 = (uint32_t)si2c_write_rmi4(
++				    SAGIT_TOUCH_ADDR,
 +				    (uint16_t)(si2c.f01_c + 1), &c, 1);
 +				if (si2c_read_rmi4(SAGIT_TOUCH_ADDR,
 +				    (uint16_t)(si2c.f01_c + 1), &c, 1) == 0) {
@@ -2703,7 +2737,8 @@ new file mode 100644
 +			}
 +			if (si2c.f12_c != 0) {
 +				c = 0x00u;              /* continuous mode */
-+				(void)si2c_write_rmi4(SAGIT_TOUCH_ADDR,
++				si2c.wr_rc3 = (uint32_t)si2c_write_rmi4(
++				    SAGIT_TOUCH_ADDR,
 +				    (uint16_t)si2c.f12_c, &c, 1);
 +				if (si2c_read_rmi4(SAGIT_TOUCH_ADDR,
 +				    (uint16_t)si2c.f12_c, &c, 1) == 0) {
@@ -2758,7 +2793,7 @@ new file mode 100644
 +		panic("SAGIT I2C OK: f01 qcd=0x%x/0x%x/0x%x f12 qcd=0x%x/0x%x/0x%x "
 +		    "| f01q= %02x %02x %02x %02x %02x %02x %02x %02x "
 +		    "| ctrl %x->%x intr=%x f12c=%x st=%x "
-+		    "| hits=%d d0/d1=0x%x/0x%x | lab 0x%x/0x%x",
++		    "| wrc %d/%d/%d | hits=%d d0/d1=0x%x/0x%x | lab 0x%x/0x%x",
 +		    si2c.f01_q, si2c.f01_c, si2c.f01_d,
 +		    si2c.f12_q, si2c.f12_c, si2c.f12_d,
 +		    si2c.f01_query[0], si2c.f01_query[1], si2c.f01_query[2],
@@ -2767,6 +2802,7 @@ new file mode 100644
 +		    si2c.f01_ctrl_before, si2c.f01_ctrl_after,
 +		    si2c.f01_intr_after, si2c.f12_ctrl_after,
 +		    si2c.f01_status,
++		    (int)si2c.wr_rc1, (int)si2c.wr_rc2, (int)si2c.wr_rc3,
 +		    (int)si2c.touch_hits, si2c.f12_d0, si2c.f12_d1,
 +		    si2c.lab_status, si2c.ibb_status);
 +	}
