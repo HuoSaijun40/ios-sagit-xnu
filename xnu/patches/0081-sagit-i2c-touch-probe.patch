@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,2569 @@
+@@ -0,0 +1,2587 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -1517,42 +1517,60 @@ new file mode 100644
 +	cfg |= (1u << TLMM_CTL_OE_BIT);
 +
 +	/*
-+	 * POLARITY. The DT says reset-on-state = 1, and the vendor driver uses
-+	 * it literally (synaptics_rmi4_reset_device):
++	 * POLARITY -- v136 CORRECTION, PROVEN AGAINST THE VENDOR SOURCE.
 +	 *
-+	 *     gpio_set_value(reset_gpio,  reset_on_state);   // 1 -> assert
-+	 *     msleep(reset_active_ms);                       // 5 ms
-+	 *     gpio_set_value(reset_gpio, !reset_on_state);   // 0 -> release
-+	 *     msleep(reset_delay_ms);                        // 200 ms
++	 * We parsed the property straight out of this phone's live.dtb:
 +	 *
-+	 * So RESET IS ACTIVE HIGH and the line must REST LOW. Every version up
-+	 * to v124 drove it the other way round -- low for 20 ms, then high and
-+	 * left there -- which holds the part in reset forever. Its I2C slave is
-+	 * hardware, so it kept ACKing; the core never booted, which is why the
-+	 * RMI4 page descriptor table came back empty no matter how many times
-+	 * the QUP setup was fixed.
++	 *     synaptics,reset-on-state = 0x0        (NOT 1)
++	 *     synaptics,reset-active-ms = 0x5
++	 *     synaptics,reset-delay-ms  = 0xc8 (200)
++	 *
++	 * and read how Xiaomi's driver actually uses it
++	 * (synaptics_dsx_force/synaptics_dsx_core.c:4121):
++	 *
++	 *     gpio_set_value(bdata->reset_gpio, bdata->reset_on_state);   // 0
++	 *     msleep(bdata->reset_active_ms);                            // 5 ms
++	 *     gpio_set_value(bdata->reset_gpio, !bdata->reset_on_state);  // 1
++	 *     msleep(bdata->reset_delay_ms);                             // 200 ms
++	 *
++	 * reset_on_state = 0 therefore means: ASSERT BY DRIVING LOW, release by
++	 * driving HIGH and leaving it HIGH.
++	 *
++	 * v125..v135 had it exactly backwards (high 20 ms -> low forever), i.e.
++	 * the part was held in reset the whole time. That also explains the one
++	 * piece of evidence that never fit: v121-v124, which drove low-then-high,
++	 * got real QUP completions (qop=0xf40). They were the CORRECT polarity
++	 * and only looked wrong because the FIFO decode was broken then (fixed
++	 * in v130).
 +	 */
-+	/* 1. assert: drive HIGH, then enable the driver. */
++	/*
++	 * Latch the DEASSERTED (high) level BEFORE enabling the driver, exactly
++	 * like the vendor's synaptics_rmi4_gpio_setup(..., 1, !reset_on_state):
++	 * the pad must never glitch into reset as the driver is turned on.
++	 */
 +	si2c_tlmm_io_wr(SAGIT_PIN_RESET, 1);
 +	si2c_tlmm_wr(SAGIT_PIN_RESET, TLMM_GPIO_CFG, cfg);
++	si2c_wait_ms(1);
++
++	/* 1. assert: drive LOW for reset-active-ms. */
++	si2c_tlmm_io_wr(SAGIT_PIN_RESET, 0);
 +	si2c.rst_cfg_low = si2c_tlmm_rd(SAGIT_PIN_RESET, TLMM_GPIO_CFG);
 +	/*
 +	 * The live level is in GPIO_IN_OUT bit 0 (in_bit), NOT in GPIO_CFG --
-+	 * CFG bits 0-1 are the pull selector on msm8998. Recording CFG here was
-+	 * useless: it reads back identical whether or not the line moved.
++	 * CFG bits 0-1 are the pull selector on msm8998.
 +	 */
 +	si2c.rst_io_low = si2c_tlmm_rd(SAGIT_PIN_RESET, TLMM_GPIO_IN_OUT);
-+	si2c_wait_ms(20);                       /* reset-active-ms (DT: 5) */
++	si2c_wait_ms(5);                        /* reset-active-ms (DT: 5) */
 +
-+	/* 2. deassert: drive LOW and LEAVE IT LOW (part out of reset). */
-+	si2c_tlmm_io_wr(SAGIT_PIN_RESET, 0);
++	/* 2. deassert: drive HIGH and LEAVE IT HIGH (part out of reset). */
++	si2c_tlmm_io_wr(SAGIT_PIN_RESET, 1);
 +	si2c.rst_cfg_after = si2c_tlmm_rd(SAGIT_PIN_RESET, TLMM_GPIO_CFG);
 +	io = si2c_tlmm_rd(SAGIT_PIN_RESET, TLMM_GPIO_IN_OUT);
 +	si2c.rst_io_high = io;
 +	/*
 +	 * in_bit (0) is the live pad level; out_bit (1) would only read back what
-+	 * we just wrote. If the pad reads 0 while we drive high, the chip is
-+	 * fighting the line -- record that rather than guess.
++	 * we just wrote. rst_driven_high now means "the released line reads
++	 * high", which is the healthy state.
 +	 */
 +	si2c.rst_driven_high = io & 1u;
 +}
