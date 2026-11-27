@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,2605 @@
+@@ -0,0 +1,2656 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -238,6 +238,7 @@ new file mode 100644
 + * Single-block transfers only need the *_STOP forms.
 + */
 +#define QUP_TAG_V2_START        0x81
++#define QUP_TAG_V2_DATAWR       0x82    /* v138: write WITHOUT stop */
 +#define QUP_TAG_V2_DATAWR_STOP  0x83
 +#define QUP_TAG_V2_DATARD_STOP  0x87
 +
@@ -925,24 +926,30 @@ new file mode 100644
 +	 */
 +	uint8_t wtags[8];
 +	uint32_t wlen = 0;
++	uint8_t page = (uint8_t)(reg >> 8);
++	uint8_t offset = (uint8_t)(reg & 0xff);
 +
++	/*
++	 * v138: TALK TO THE PART THE WAY THE VENDOR DRIVER DOES.
++	 *
++	 * synaptics_dsx_i2c.c never sends a 16-bit register address. It does
++	 *     synaptics_rmi4_i2c_set_page(): write {0xFF, page}   (2 bytes)
++	 *     then msg[0] = {offset} (1 byte, no stop) + msg[1] read
++	 * i.e. a page-select register plus a repeated-START register read.
++	 *
++	 * v137 guessed the address was a 16-bit big-endian value; the part
++	 * answered with garbage (PDT "found" fn=0x09 on page 5, and 0x09 is
++	 * not even a valid RMI4 function). Page select is the documented
++	 * protocol, so use it.
++	 *
++	 * Write phase = page select: START, addr+W, DATAWR_STOP, 2, 0xFF, page.
++	 */
 +	wtags[wlen++] = QUP_TAG_V2_START;
 +	wtags[wlen++] = (uint8_t)(addr << 1);
 +	wtags[wlen++] = QUP_TAG_V2_DATAWR_STOP;   /* single block, STOP after */
-+	wtags[wlen++] = 2;                        /* two register bytes follow */
-+	/*
-+	 * v137: the RMI4 16-bit register address is BIG-ENDIAN. Linux
-+	 * drivers/input/rmi4/rmi_i2c.c transmits it as
-+	 *     txbuf[0] = addr >> 8;
-+	 *     txbuf[1] = addr & 0xff;
-+	 * We had it little-endian, so every non-zero address was decoded as
-+	 * the wrong page: 0x00E9 became page 0xE9 / offset 0x00, an empty
-+	 * page. That is why page0 (address 0x0000, endian-independent) read
-+	 * back cleanly while the whole PDT came back zero, on every version
-+	 * since v121. Swap the two bytes.
-+	 */
-+	wtags[wlen++] = (uint8_t)(reg >> 8);      /* high byte = page  */
-+	wtags[wlen++] = (uint8_t)(reg & 0xff);    /* low  byte = offset */
++	wtags[wlen++] = 2;                        /* two bytes follow */
++	wtags[wlen++] = 0xff;                     /* page-select register */
++	wtags[wlen++] = page;
 +
 +	/*
 +	 * First sub-transfer: config_run is 0, no RX.
@@ -1040,24 +1047,28 @@ new file mode 100644
 +		return ETIMEDOUT;
 +	}
 +
-+	uint8_t rtags[4] = {
++	/*
++	 * v138: the read is ONE I2C transaction with a repeated START:
++	 *   START, addr+W, DATAWR(no stop), 1, offset,
++	 *   START, addr+R, DATARD_STOP, len
++	 * This is exactly what the vendor's i2c_transfer(msgs, 2) puts on the
++	 * wire. 9 tag bytes out; QUP_MX_READ_CNT still counts the 2 tag bytes
++	 * that the engine echoes back plus the payload.
++	 */
++	uint8_t rtags[9] = {
++		QUP_TAG_V2_START, (uint8_t)(addr << 1),
++		QUP_TAG_V2_DATAWR, 1, offset,
 +		QUP_TAG_V2_START, (uint8_t)((addr << 1) | 1),
 +		QUP_TAG_V2_DATARD_STOP, (uint8_t)(len == 256 ? 0 : len),
 +	};
-+	/*
-+	 * Second sub-transfer: this one reads, so NO_INPUT is clear. Same
-+	 * mode rule again -- FIFO mode puts the RX byte count in QUP_MX_READ_CNT
-+	 * (INPUT_CNT stays zero) and the TX tag count in QUP_MX_WRITE_CNT.
-+	 * total_rx_len = 2 tag bytes + payload, as in i2c-qup.c.
-+	 */
 +	si2c_wrq(QUP_MX_OUTPUT_CNT, 0);
 +	si2c_wrq(QUP_MX_INPUT_CNT, 0);
 +	si2c_wrq(QUP_MX_READ_CNT, (len + 2) | QUP_I2C_MX_CONFIG_DURING_RUN);
-+	si2c_wrq(QUP_MX_WRITE_CNT, 4 | QUP_I2C_MX_CONFIG_DURING_RUN);
++	si2c_wrq(QUP_MX_WRITE_CNT, 9 | QUP_I2C_MX_CONFIG_DURING_RUN);
 +	si2c_wrq(QUP_CONFIG, QUP_I2C_MINI_CORE | QUP_I2C_N_VAL_V2);
 +
 +	si2c_wrq(QUP_OPERATIONAL, QUP_OPERATIONAL_RESET);
-+	if (si2c_write_tags(rtags, 4) != 0) {
++	if (si2c_write_tags(rtags, 9) != 0) {
 +		return ETIMEDOUT;
 +	}
 +	if (si2c_change_state(QUP_STATE_RUN) != 0) {
@@ -1107,7 +1118,28 @@ new file mode 100644
 +		uint32_t pos = 0;
 +
 +		while (pos < total) {
-+			uint32_t val = si2c_rdq(QUP_IN_FIFO_BASE);
++			uint32_t val;
++
++			/*
++			 * v139: wait until the FIFO actually holds this word --
++			 * qup_i2c_read_fifo_v2() calls
++			 *     qup_i2c_wait_ready(qup, QUP_IN_NOT_EMPTY, SET_BIT, ...)
++			 * before every readl(QUP_IN_FIFO_BASE). Without it the
++			 * second word of a 6-byte read can be sampled before the
++			 * engine has moved it into the FIFO, which shifts the whole
++			 * payload and is another way to get plausible-looking but
++			 * wrong bytes.
++			 */
++			for (spins = 0; spins < SAGIT_I2C_SPIN; spins++) {
++				if (si2c_rdq(QUP_OPERATIONAL) &
++				    QUP_OP_IN_NOT_EMPTY) {
++					break;
++				}
++			}
++			if (spins == SAGIT_I2C_SPIN) {
++				return ETIMEDOUT;
++			}
++			val = si2c_rdq(QUP_IN_FIFO_BASE);
 +
 +			for (uint32_t idx = 0; idx < 4 && pos < total;
 +			    idx++, val >>= 8, pos++) {
@@ -2432,16 +2464,26 @@ new file mode 100644
 +		uint32_t found_pg = 0xffu;
 +		uint8_t fn = 0;
 +
-+		for (pg = 0; pg < 10; pg++) {
-+			if (si2c_read_rmi4(SAGIT_TOUCH_ADDR,
-+			    (uint16_t)((pg << 8) | 0x00e9), pdt,
-+			    sizeof(pdt)) != 0) {
-+				continue;
-+			}
-+			if (pdt[5] != 0) {      /* fn_number is the last byte */
-+				found_pg = pg;
-+				fn = pdt[5];
-+				break;
++		/*
++		 * v139: scan the PDT the way the vendor does -- five entries per
++		 * page, walking DOWN from 0xE9 (0xE9, 0xE3, 0xDD, 0xD7, 0xD1),
++		 * not just the first one. A part whose 0xE9 entry is blank can
++		 * still carry F01/F11 at 0xE3 or below.
++		 */
++		for (pg = 0; pg < 10 && fn == 0; pg++) {
++			uint32_t ent;
++
++			for (ent = 0x00e9u; ent > 0x00d0u; ent -= 6u) {
++				if (si2c_read_rmi4(SAGIT_TOUCH_ADDR,
++				    (uint16_t)((pg << 8) | ent), pdt,
++				    sizeof(pdt)) != 0) {
++					continue;
++				}
++				if (pdt[5] != 0) {  /* fn_number is last byte */
++					found_pg = pg;
++					fn = pdt[5];
++					break;
++				}
 +			}
 +		}
 +
@@ -2454,14 +2496,23 @@ new file mode 100644
 +		si2c.ub_rc = (uint32_t)si2c_read_rmi4(SAGIT_TOUCH_UB_ADDR,
 +		    0x0000, si2c.ub_buf, sizeof(si2c.ub_buf));
 +
++		/*
++		 * v139: dump all six PDT bytes, not just fn_number. v138 showed
++		 * "pdt pg=5 fn=0xE9" -- and 0xE9 is exactly the offset we asked
++		 * for, which looks like the slave echoing the register pointer
++		 * instead of returning data. Only the full entry distinguishes
++		 * "echo" (E9 00 00 00 00 E9 or similar) from a real descriptor.
++		 */
 +		panic("SAGIT I2C OK: page0=%02x %02x %02x %02x %02x %02x "
-+		    "| pdt pg=%d fn=0x%02x "
++		    "| pdt pg=%d fn=0x%02x entry=%02x %02x %02x %02x %02x %02x "
 +		    "| ub %d/%02x %02x %02x %02x %02x %02x %02x %02x "
 +		    "| labibb %d/0x%x/0x%x "
 +		    "| labdbg apid/ty/st=0x%x/0x%x/0x%x "
 +		    "ibb=0x%x/0x%x/0x%x wrc=0x%x/0x%x after=0x%x/0x%x",
 +		    idbuf[0], idbuf[1], idbuf[2], idbuf[3], idbuf[4],
-+		    idbuf[5], (int)found_pg, fn, (int)si2c.ub_rc,
++		    idbuf[5], (int)found_pg, fn,
++		    pdt[0], pdt[1], pdt[2], pdt[3], pdt[4], pdt[5],
++		    (int)si2c.ub_rc,
 +		    si2c.ub_buf[0], si2c.ub_buf[1], si2c.ub_buf[2],
 +		    si2c.ub_buf[3], si2c.ub_buf[4], si2c.ub_buf[5],
 +		    si2c.ub_buf[6], si2c.ub_buf[7], (int)si2c.labibb_rc,
