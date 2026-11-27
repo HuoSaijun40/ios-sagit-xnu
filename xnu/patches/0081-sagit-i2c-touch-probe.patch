@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,2543 @@
+@@ -0,0 +1,2569 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -1585,8 +1585,17 @@ new file mode 100644
 +static void
 +bb_release(uint32_t pin)
 +{
++	/*
++	 * v135: set the output latch HIGH before releasing to input. The old
++	 * code left the latch at whatever bb_low() last wrote (0); if the OE
++	 * bit write is delayed or races, the pad keeps driving LOW and SDA
++	 * never rises -- every ACK sample reads 0 (false ACK) and every data
++	 * bit reads 0. Latch-high is the safe open-drain idle state.
++	 */
++	si2c_tlmm_io_wr(pin, 1);
 +	bb_pin_mode(pin, 0);
 +}
++
 +
 +static void
 +bb_low(uint32_t pin)
@@ -1599,6 +1608,23 @@ new file mode 100644
 +bb_level(uint32_t pin)
 +{
 +	return (int)(si2c_tlmm_rd(pin, TLMM_GPIO_IN_OUT) & 1u);
++}
++
++/*
++ * v135: sample SDA with an active pre-charge. Drive the line HIGH in push-
++ * pull for one settle to overcome board capacitance / weak internal pull-up,
++ * then go high-Z and let the slave (or pull-up) settle before sampling. This
++ * removes the ambiguity that made a non-existent address (0x7f) return ACK.
++ */
++static int
++bb_sample_sda(void)
++{
++	si2c_tlmm_io_wr(SAGIT_PIN_SDA, 1);
++	bb_pin_mode(SAGIT_PIN_SDA, 1);   /* push-pull HIGH, charge the line */
++	si2c_settle(2);
++	bb_release(SAGIT_PIN_SDA);      /* high-Z, latch stays high */
++	si2c_settle(4);
++	return bb_level(SAGIT_PIN_SDA);
 +}
 +
 +/*
@@ -1693,7 +1719,7 @@ new file mode 100644
 +	si2c_settle(8);
 +	bb_release(scl);
 +	si2c_settle(8);
-+	if (!bb_level(sda)) acks |= 1u;
++	if (!bb_sample_sda()) acks |= 1u;
 +	bb_low(scl);
 +	si2c_settle(2);
 +
@@ -1711,7 +1737,7 @@ new file mode 100644
 +	si2c_settle(8);
 +	bb_release(scl);
 +	si2c_settle(8);
-+	if (!bb_level(sda)) acks |= 2u;
++	if (!bb_sample_sda()) acks |= 2u;
 +	bb_low(scl);
 +	si2c_settle(2);
 +
@@ -1729,7 +1755,7 @@ new file mode 100644
 +	si2c_settle(8);
 +	bb_release(scl);
 +	si2c_settle(8);
-+	if (!bb_level(sda)) acks |= 4u;
++	if (!bb_sample_sda()) acks |= 4u;
 +	bb_low(scl);
 +	si2c_settle(2);
 +
@@ -1779,7 +1805,7 @@ new file mode 100644
 +	si2c_settle(8);
 +	bb_release(scl);
 +	si2c_settle(8);
-+	nack = bb_level(sda);
++	nack = bb_sample_sda();
 +	if (!nack) acks |= 1u;
 +	bb_low(scl);
 +	si2c_settle(2);
@@ -1801,7 +1827,7 @@ new file mode 100644
 +	si2c_settle(8);
 +	bb_release(scl);
 +	si2c_settle(8);
-+	if (!bb_level(sda)) acks |= 2u;
++	if (!bb_sample_sda()) acks |= 2u;
 +	bb_low(scl);
 +	si2c_settle(2);
 +
@@ -1829,7 +1855,7 @@ new file mode 100644
 +	si2c_settle(8);
 +	bb_release(scl);
 +	si2c_settle(8);
-+	if (!bb_level(sda)) acks |= 4u;
++	if (!bb_sample_sda()) acks |= 4u;
 +	bb_low(scl);
 +	si2c_settle(2);
 +
@@ -1841,7 +1867,7 @@ new file mode 100644
 +		si2c_settle(8);
 +		bb_release(scl);
 +		si2c_settle(8);
-+		b = (uint8_t)((b << 1) | (bb_level(sda) ? 1u : 0u));
++		b = (uint8_t)((b << 1) | (bb_sample_sda() ? 1u : 0u));
 +		bb_low(scl);
 +		si2c_settle(8);
 +	}
