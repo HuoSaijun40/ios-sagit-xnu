@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,2939 @@
+@@ -0,0 +1,2998 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -292,6 +292,9 @@ new file mode 100644
 +	uint32_t f01_intr_after;
 +	uint32_t f12_ctrl_after;
 +	uint32_t wr_rc1, wr_rc2, wr_rc3; /* v143: write() return codes */
++	uint32_t wr_pg_rc;              /* v144: page-select transaction rc */
++	uint32_t wr_st;                 /* v144: I2C_STATUS seen when a write failed */
++	uint32_t wr_op;                 /* v144: QUP_OPERATIONAL at that moment */
 +	uint32_t f01_status;
 +	uint32_t touch_hits;            /* polls that saw a non-zero int status */
 +	uint32_t f12_d0, f12_d1;        /* first F12 data word seen */
@@ -868,6 +871,40 @@ new file mode 100644
 +}
 +
 +/*
++ * Wait about `us` microseconds without delay(): spin on `yield`, the same trick
++ * the UFS driver uses. Each iteration is a handful of cycles, so 2000 yields is
++ * a convenient unit ("one tick"); on Kryo at 1.9 GHz that is on the order of a
++ * few microseconds. Precision does not matter here -- only that it waits long
++ * enough for the rail to settle.
++ */
++static void
++si2c_settle(uint32_t ticks)
++{
++	for (uint32_t t = 0; t < ticks; t++) {
++		for (volatile uint32_t i = 0; i < 2000; i++) {
++			__asm__ volatile("yield" ::: "memory");
++		}
++	}
++}
++
++/*
++ * Millisecond-granularity wait.
++ *
++ * The Synaptics part needs tens of milliseconds to come out of reset (the
++ * mainline Mi 6 DT says syna,reset-delay-ms = 20 and syna,startup-delay-ms =
++ * 20). si2c_settle() is a few microseconds per tick, so 20 ms is ~10000
++ * ticks; measured generously at ~2 us per tick, 12000 ticks covers it with
++ * margin and still finishes well inside the watchdog budget.
++ */
++#define SAGIT_TICKS_PER_MS      600u
++
++static void
++si2c_wait_ms(uint32_t ms)
++{
++	si2c_settle(ms * SAGIT_TICKS_PER_MS);
++}
++
++/*
 + * One I2C register read using the v2 tag protocol.
 + *
 + * A "read register" is two transactions on the wire, and each one is described
@@ -1252,6 +1289,11 @@ new file mode 100644
 +		op = si2c_rdq(QUP_OPERATIONAL);
 +		errc = si2c_check_qup_errors();
 +		if (errc != 0) {
++			/* v144: keep the first failure's raw registers. */
++			if (si2c.wr_st == 0xffffffffu) {
++				si2c.wr_st = si2c_rdq(QUP_I2C_STATUS);
++				si2c.wr_op = op;
++			}
 +			return errc;
 +		}
 +		if (op & QUP_OP_MAX_OUTPUT_DONE) {
@@ -1259,6 +1301,10 @@ new file mode 100644
 +		}
 +	}
 +	if (spins == SAGIT_I2C_XFER_SPIN) {
++		if (si2c.wr_st == 0xffffffffu) {
++			si2c.wr_st = si2c_rdq(QUP_I2C_STATUS);
++			si2c.wr_op = op;
++		}
 +		return ETIMEDOUT;
 +	}
 +	(void)si2c_change_state(QUP_STATE_RESET);
@@ -1290,9 +1336,18 @@ new file mode 100644
 +	b[0] = 0xff;
 +	b[1] = page;
 +	rc = si2c_qup_write_one(addr, b, 2);
++	if (si2c.wr_pg_rc == 0xffffffffu) {
++		si2c.wr_pg_rc = (uint32_t)rc;   /* first write only */
++	}
 +	if (rc != 0) {
 +		return rc;
 +	}
++
++	/*
++	 * The part needs a moment to latch the page before the data block
++	 * arrives; without the gap the second transaction intermittently NACKs.
++	 */
++	si2c_wait_ms(2);
 +
 +	/* transaction 2: {offset, data...} */
 +	b[0] = offset;
@@ -1301,6 +1356,7 @@ new file mode 100644
 +	}
 +	return si2c_qup_write_one(addr, b, len + 1);
 +}
++
 +
 +/*
 + * RMI4 register read: two address bytes, little endian.
@@ -1319,6 +1375,38 @@ new file mode 100644
 +si2c_write_rmi4(uint8_t addr, uint16_t reg, const uint8_t *val, uint32_t len)
 +{
 +	return si2c_write_addr(addr, reg, val, len);
++}
++
++/*
++ * v144: write one byte, then READ IT BACK and retry until it sticks.
++ *
++ * v143 proved the write path is not simply broken: of three identical
++ * single-byte writes, 0x0C and 0x12 returned EIO while 0x0D returned 0 --
++ * and even that "successful" write read back 0. That pattern is a part
++ * which is still waking up: it ACKs/NACKs erratically and drops writes.
++ * So verify instead of trusting the completion bit, and retry a few times.
++ */
++static int
++si2c_write_verify(uint8_t addr, uint16_t reg, uint8_t val, uint32_t *out_rc)
++{
++	int rc = EIO;
++
++	for (int t = 0; t < 4; t++) {
++		uint8_t rb = 0;
++
++		rc = si2c_write_rmi4(addr, reg, &val, 1);
++		si2c_wait_ms(15);
++		if (si2c_read_rmi4(addr, reg, &rb, 1) == 0 && rb == val) {
++			if (out_rc != NULL) {
++				*out_rc = 0;
++			}
++			return 0;
++		}
++	}
++	if (out_rc != NULL) {
++		*out_rc = (uint32_t)rc;
++	}
++	return (rc != 0) ? rc : EIO;
 +}
 +
 +/*
@@ -1547,40 +1635,6 @@ new file mode 100644
 +	io = si2c_tlmm_rd(SAGIT_PIN_TS_AVDD, TLMM_GPIO_IN_OUT);
 +	si2c.avdd_io_after = io;
 +	si2c.avdd_cfg_after = si2c_tlmm_rd(SAGIT_PIN_TS_AVDD, TLMM_GPIO_CFG);
-+}
-+
-+/*
-+ * Wait about `us` microseconds without delay(): spin on `yield`, the same trick
-+ * the UFS driver uses. Each iteration is a handful of cycles, so 2000 yields is
-+ * a convenient unit ("one tick"); on Kryo at 1.9 GHz that is on the order of a
-+ * few microseconds. Precision does not matter here -- only that it waits long
-+ * enough for the rail to settle.
-+ */
-+static void
-+si2c_settle(uint32_t ticks)
-+{
-+	for (uint32_t t = 0; t < ticks; t++) {
-+		for (volatile uint32_t i = 0; i < 2000; i++) {
-+			__asm__ volatile("yield" ::: "memory");
-+		}
-+	}
-+}
-+
-+/*
-+ * Millisecond-granularity wait.
-+ *
-+ * The Synaptics part needs tens of milliseconds to come out of reset (the
-+ * mainline Mi 6 DT says syna,reset-delay-ms = 20 and syna,startup-delay-ms =
-+ * 20). si2c_settle() is a few microseconds per tick, so 20 ms is ~10000
-+ * ticks; measured generously at ~2 us per tick, 12000 ticks covers it with
-+ * margin and still finishes well inside the watchdog budget.
-+ */
-+#define SAGIT_TICKS_PER_MS      600u
-+
-+static void
-+si2c_wait_ms(uint32_t ms)
-+{
-+	si2c_settle(ms * SAGIT_TICKS_PER_MS);
 +}
 +
 +/*
@@ -2189,6 +2243,8 @@ new file mode 100644
 +
 +	si2c.txn = 0;
 +	si2c.bb_pdt_pg = 0xffu;         /* 0xff = no PDT entry found anywhere */
++	si2c.wr_pg_rc = 0xffffffffu;    /* v144: 0xffffffff = "never recorded" */
++	si2c.wr_st = 0xffffffffu;
 +
 +	/*
 +	 * Feasibility gate for the RPM path. v89 showed PM8998's LDO6 has no
@@ -2712,13 +2768,15 @@ new file mode 100644
 +			uint8_t st[3];
 +			uint8_t d[8];
 +
++			/* Let the part settle before the first control write. */
++			si2c_wait_ms(20);
++
 +			if (si2c_read_rmi4(SAGIT_TOUCH_ADDR,
 +			    (uint16_t)si2c.f01_c, &c, 1) == 0) {
 +				si2c.f01_ctrl_before = c;
 +				c &= (uint8_t)~0x07u;   /* normal operation */
-+				si2c.wr_rc1 = (uint32_t)si2c_write_rmi4(
-+				    SAGIT_TOUCH_ADDR,
-+				    (uint16_t)si2c.f01_c, &c, 1);
++				(void)si2c_write_verify(SAGIT_TOUCH_ADDR,
++				    (uint16_t)si2c.f01_c, c, &si2c.wr_rc1);
 +				if (si2c_read_rmi4(SAGIT_TOUCH_ADDR,
 +				    (uint16_t)si2c.f01_c, &c, 1) == 0) {
 +					si2c.f01_ctrl_after = c;
@@ -2727,9 +2785,9 @@ new file mode 100644
 +			if (si2c_read_rmi4(SAGIT_TOUCH_ADDR,
 +			    (uint16_t)(si2c.f01_c + 1), &c, 1) == 0) {
 +				c |= 0x01u;             /* 0D interrupt */
-+				si2c.wr_rc2 = (uint32_t)si2c_write_rmi4(
-+				    SAGIT_TOUCH_ADDR,
-+				    (uint16_t)(si2c.f01_c + 1), &c, 1);
++				(void)si2c_write_verify(SAGIT_TOUCH_ADDR,
++				    (uint16_t)(si2c.f01_c + 1), c,
++				    &si2c.wr_rc2);
 +				if (si2c_read_rmi4(SAGIT_TOUCH_ADDR,
 +				    (uint16_t)(si2c.f01_c + 1), &c, 1) == 0) {
 +					si2c.f01_intr_after = c;
@@ -2737,9 +2795,8 @@ new file mode 100644
 +			}
 +			if (si2c.f12_c != 0) {
 +				c = 0x00u;              /* continuous mode */
-+				si2c.wr_rc3 = (uint32_t)si2c_write_rmi4(
-+				    SAGIT_TOUCH_ADDR,
-+				    (uint16_t)si2c.f12_c, &c, 1);
++				(void)si2c_write_verify(SAGIT_TOUCH_ADDR,
++				    (uint16_t)si2c.f12_c, c, &si2c.wr_rc3);
 +				if (si2c_read_rmi4(SAGIT_TOUCH_ADDR,
 +				    (uint16_t)si2c.f12_c, &c, 1) == 0) {
 +					si2c.f12_ctrl_after = c;
@@ -2793,7 +2850,8 @@ new file mode 100644
 +		panic("SAGIT I2C OK: f01 qcd=0x%x/0x%x/0x%x f12 qcd=0x%x/0x%x/0x%x "
 +		    "| f01q= %02x %02x %02x %02x %02x %02x %02x %02x "
 +		    "| ctrl %x->%x intr=%x f12c=%x st=%x "
-+		    "| wrc %d/%d/%d | hits=%d d0/d1=0x%x/0x%x | lab 0x%x/0x%x",
++		    "| wrc %d/%d/%d pg=%d st=0x%x op=0x%x "
++		    "| hits=%d d0/d1=0x%x/0x%x | lab 0x%x/0x%x",
 +		    si2c.f01_q, si2c.f01_c, si2c.f01_d,
 +		    si2c.f12_q, si2c.f12_c, si2c.f12_d,
 +		    si2c.f01_query[0], si2c.f01_query[1], si2c.f01_query[2],
@@ -2803,6 +2861,7 @@ new file mode 100644
 +		    si2c.f01_intr_after, si2c.f12_ctrl_after,
 +		    si2c.f01_status,
 +		    (int)si2c.wr_rc1, (int)si2c.wr_rc2, (int)si2c.wr_rc3,
++		    (int)si2c.wr_pg_rc, si2c.wr_st, si2c.wr_op,
 +		    (int)si2c.touch_hits, si2c.f12_d0, si2c.f12_d1,
 +		    si2c.lab_status, si2c.ibb_status);
 +	}
