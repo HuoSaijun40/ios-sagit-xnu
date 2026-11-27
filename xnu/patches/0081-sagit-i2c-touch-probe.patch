@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,2714 @@
+@@ -0,0 +1,2903 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -287,6 +287,13 @@ new file mode 100644
 +	uint32_t f11_q, f11_c, f11_d;   /* F11 query/control/data base addresses */
 +	uint32_t f12_q, f12_c, f12_d;   /* v141: F12 (2D touch, this part uses F12) */
 +	uint8_t f01_query[8];           /* v141: manufacturer/product/fw id */
++	/* v142: results of actually driving the part. */
++	uint32_t f01_ctrl_before, f01_ctrl_after;
++	uint32_t f01_intr_after;
++	uint32_t f12_ctrl_after;
++	uint32_t f01_status;
++	uint32_t touch_hits;            /* polls that saw a non-zero int status */
++	uint32_t f12_d0, f12_d1;        /* first F12 data word seen */
 +	uint32_t bb_ub;                 /* first byte read at the 0x2c bootloader addr */
 +	uint32_t bb_ub_ack;             /* ack bits for the 0x2c attempt */
 +	uint32_t ub_rc;                 /* QUP read of 0x2c, 8 bytes */
@@ -1163,6 +1170,107 @@ new file mode 100644
 +}
 +
 +/*
++ * v142: RMI4 register WRITE. The probe has been read-only until now; taking
++ * F01 out of sleep and enabling touch reporting needs writes.
++ *
++ * One transaction carries two blocks, which is exactly what the vendor's
++ * synaptics_rmi4_i2c_write() puts on the wire:
++ *   block 1  START addr+W DATAWR_STOP 2 0xFF page      (page select)
++ *   block 2  START addr+W DATAWR_STOP n offset d0..    (register write)
++ */
++static int
++si2c_write_addr(uint8_t addr, uint16_t reg, const uint8_t *val, uint32_t len)
++{
++	uint8_t wt[40];
++	uint32_t wlen = 0;
++	uint8_t page = (uint8_t)(reg >> 8);
++	uint8_t offset = (uint8_t)(reg & 0xff);
++	uint32_t op;
++	uint32_t spins;
++
++	if (len == 0 || len > 16) {
++		return EINVAL;
++	}
++
++	/* Same per-transfer bring-up as the read path (qup_i2c_xfer_v2). */
++	si2c_wrq(QUP_SW_RESET, 1);
++	if (!si2c_poll(QUP_SW_RESET, 1u, 0u, SAGIT_I2C_SPIN)) {
++		return EBUSY;
++	}
++	if (si2c_change_state(QUP_STATE_RESET) != 0) {
++		return ENXIO;
++	}
++	si2c_wrq(QUP_CONFIG, QUP_I2C_MINI_CORE | QUP_I2C_N_VAL_V2);
++	si2c_wrq(QUP_I2C_MASTER_GEN_REG, QUP_V2_TAGS_EN);
++	if (!si2c_poll_state_master(SAGIT_I2C_SPIN)) {
++		return ENXIO;
++	}
++	{
++		uint32_t iom = si2c_rdq(QUP_IO_MODE);
++
++		iom |= QUP_REPACK_EN;
++		si2c_wrq(QUP_IO_MODE, iom);
++	}
++
++	wt[wlen++] = QUP_TAG_V2_START;
++	wt[wlen++] = (uint8_t)(addr << 1);
++	wt[wlen++] = QUP_TAG_V2_DATAWR_STOP;
++	wt[wlen++] = 2;
++	wt[wlen++] = 0xff;
++	wt[wlen++] = page;
++
++	wt[wlen++] = QUP_TAG_V2_START;
++	wt[wlen++] = (uint8_t)(addr << 1);
++	wt[wlen++] = QUP_TAG_V2_DATAWR_STOP;
++	wt[wlen++] = (uint8_t)(len + 1u);
++	wt[wlen++] = offset;
++	for (uint32_t i = 0; i < len; i++) {
++		wt[wlen++] = val[i];
++	}
++
++	si2c_wrq(QUP_MX_INPUT_CNT, 0);
++	si2c_wrq(QUP_MX_READ_CNT, 0);
++	si2c_wrq(QUP_MX_OUTPUT_CNT, 0);
++	si2c_wrq(QUP_MX_WRITE_CNT, wlen);
++	si2c_wrq(QUP_CONFIG, QUP_I2C_MINI_CORE | QUP_I2C_N_VAL_V2);
++
++	if (si2c_change_state(QUP_STATE_RUN) != 0) {
++		return ENXIO;
++	}
++	si2c_wrq(QUP_I2C_CLK_CTL, SAGIT_QUP_CLK_CTL_50K);
++	if (si2c_change_state(QUP_STATE_PAUSE) != 0) {
++		return ETIMEDOUT;
++	}
++
++	si2c_wrq(QUP_OPERATIONAL, QUP_OPERATIONAL_RESET);
++
++	if (si2c_write_tags(wt, wlen) != 0) {
++		return ETIMEDOUT;
++	}
++	if (si2c_change_state(QUP_STATE_RUN) != 0) {
++		return ENXIO;
++	}
++
++	for (spins = 0; spins < SAGIT_I2C_XFER_SPIN; spins++) {
++		int errc;
++
++		op = si2c_rdq(QUP_OPERATIONAL);
++		errc = si2c_check_qup_errors();
++		if (errc != 0) {
++			return errc;
++		}
++		if (op & QUP_OP_MAX_OUTPUT_DONE) {
++			break;
++		}
++	}
++	if (spins == SAGIT_I2C_XFER_SPIN) {
++		return ETIMEDOUT;
++	}
++
++	return 0;
++}
++
++/*
 + * RMI4 register read: two address bytes, little endian.
 + *
 + * The Synaptics protocol is not plain register I/O -- every transfer carries a
@@ -1173,6 +1281,12 @@ new file mode 100644
 +si2c_read_rmi4(uint8_t addr, uint16_t reg, uint8_t *out, uint32_t len)
 +{
 +	return si2c_read_addr(addr, reg, out, len);
++}
++
++static int
++si2c_write_rmi4(uint8_t addr, uint16_t reg, const uint8_t *val, uint32_t len)
++{
++	return si2c_write_addr(addr, reg, val, len);
 +}
 +
 +/*
@@ -2549,6 +2663,82 @@ new file mode 100644
 +		}
 +
 +		/*
++		 * v142: ACTUALLY DRIVE THE PANEL.
++		 *
++		 * The link and the PDT are proven, so do what a touch driver
++		 * does first: take F01 out of sleep, enable the 0D interrupt,
++		 * put F12 in continuous reporting, then poll for events.
++		 * Every write is read back so a single panic proves whether the
++		 * write path itself works, independent of any finger.
++		 *
++		 * F01 control bits (synaptics_dsx_core.c:117):
++		 *   bit0 SENSOR_SLEEP, bit2 NO_SLEEP, bit7 CONFIGURED
++		 * So "run" = control & ~0x07.
++		 */
++		if (si2c.f01_c != 0 && si2c.f01_d != 0) {
++			uint8_t c = 0;
++			uint8_t st[3];
++			uint8_t d[8];
++
++			if (si2c_read_rmi4(SAGIT_TOUCH_ADDR,
++			    (uint16_t)si2c.f01_c, &c, 1) == 0) {
++				si2c.f01_ctrl_before = c;
++				c &= (uint8_t)~0x07u;   /* normal operation */
++				(void)si2c_write_rmi4(SAGIT_TOUCH_ADDR,
++				    (uint16_t)si2c.f01_c, &c, 1);
++				if (si2c_read_rmi4(SAGIT_TOUCH_ADDR,
++				    (uint16_t)si2c.f01_c, &c, 1) == 0) {
++					si2c.f01_ctrl_after = c;
++				}
++			}
++			if (si2c_read_rmi4(SAGIT_TOUCH_ADDR,
++			    (uint16_t)(si2c.f01_c + 1), &c, 1) == 0) {
++				c |= 0x01u;             /* 0D interrupt */
++				(void)si2c_write_rmi4(SAGIT_TOUCH_ADDR,
++				    (uint16_t)(si2c.f01_c + 1), &c, 1);
++				if (si2c_read_rmi4(SAGIT_TOUCH_ADDR,
++				    (uint16_t)(si2c.f01_c + 1), &c, 1) == 0) {
++					si2c.f01_intr_after = c;
++				}
++			}
++			if (si2c.f12_c != 0) {
++				c = 0x00u;              /* continuous mode */
++				(void)si2c_write_rmi4(SAGIT_TOUCH_ADDR,
++				    (uint16_t)si2c.f12_c, &c, 1);
++				if (si2c_read_rmi4(SAGIT_TOUCH_ADDR,
++				    (uint16_t)si2c.f12_c, &c, 1) == 0) {
++					si2c.f12_ctrl_after = c;
++				}
++			}
++
++			/*
++			 * Poll F01 device status + interrupt status 0 for about
++			 * two seconds. touch_hits counts polls where the 0D bit
++			 * was raised, so a finger on the panel during boot shows
++			 * up as a non-zero count even though we cannot yet
++			 * deliver coordinates to userspace.
++			 */
++			for (uint32_t i = 0; i < 100; i++) {
++				if (si2c_read_rmi4(SAGIT_TOUCH_ADDR,
++				    (uint16_t)si2c.f01_d, st, 3) == 0) {
++					si2c.f01_status = st[0];
++					if (st[1] != 0) {
++						si2c.touch_hits++;
++					}
++				}
++				if (si2c.f12_d != 0) {
++					if (si2c_read_rmi4(SAGIT_TOUCH_ADDR,
++					    (uint16_t)si2c.f12_d, d,
++					    sizeof(d)) == 0) {
++						si2c.f12_d0 = d[0];
++						si2c.f12_d1 = d[1];
++					}
++				}
++				si2c_wait_ms(20);
++			}
++		}
++
++		/*
 +		 * Decisive question: is the ROM bootloader at 0x2c alive at all?
 +		 * Any non-zero byte there means the part still has a bootloader
 +		 * and firmware could be pushed; all zeros means the part never
@@ -2565,20 +2755,19 @@ new file mode 100644
 +		 * With these I can issue the real F01 device-control and F11 2D
 +		 * touch reads without another discovery round.
 +		 */
-+		panic("SAGIT I2C OK: fns=%d: %02x %02x %02x %02x %02x %02x "
-+		    "%02x %02x | f01 qcd=0x%x/0x%x/0x%x "
-+		    "| f12 qcd=0x%x/0x%x/0x%x "
++		panic("SAGIT I2C OK: f01 qcd=0x%x/0x%x/0x%x f12 qcd=0x%x/0x%x/0x%x "
 +		    "| f01q= %02x %02x %02x %02x %02x %02x %02x %02x "
-+		    "| lab 0x%x/0x%x",
-+		    (int)si2c.fn_n,
-+		    si2c.fn_list[0], si2c.fn_list[1], si2c.fn_list[2],
-+		    si2c.fn_list[3], si2c.fn_list[4], si2c.fn_list[5],
-+		    si2c.fn_list[6], si2c.fn_list[7],
++		    "| ctrl %x->%x intr=%x f12c=%x st=%x "
++		    "| hits=%d d0/d1=0x%x/0x%x | lab 0x%x/0x%x",
 +		    si2c.f01_q, si2c.f01_c, si2c.f01_d,
 +		    si2c.f12_q, si2c.f12_c, si2c.f12_d,
 +		    si2c.f01_query[0], si2c.f01_query[1], si2c.f01_query[2],
 +		    si2c.f01_query[3], si2c.f01_query[4], si2c.f01_query[5],
 +		    si2c.f01_query[6], si2c.f01_query[7],
++		    si2c.f01_ctrl_before, si2c.f01_ctrl_after,
++		    si2c.f01_intr_after, si2c.f12_ctrl_after,
++		    si2c.f01_status,
++		    (int)si2c.touch_hits, si2c.f12_d0, si2c.f12_d1,
 +		    si2c.lab_status, si2c.ibb_status);
 +	}
 +
