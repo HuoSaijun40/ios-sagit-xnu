@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,2690 @@
+@@ -0,0 +1,2714 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -285,6 +285,8 @@ new file mode 100644
 +	uint8_t fn_list[8];             /* fn_number of each entry, in PDT order */
 +	uint32_t f01_q, f01_c, f01_d;   /* F01 query/control/data base addresses */
 +	uint32_t f11_q, f11_c, f11_d;   /* F11 query/control/data base addresses */
++	uint32_t f12_q, f12_c, f12_d;   /* v141: F12 (2D touch, this part uses F12) */
++	uint8_t f01_query[8];           /* v141: manufacturer/product/fw id */
 +	uint32_t bb_ub;                 /* first byte read at the 0x2c bootloader addr */
 +	uint32_t bb_ub_ack;             /* ack bits for the 0x2c attempt */
 +	uint32_t ub_rc;                 /* QUP read of 0x2c, 8 bytes */
@@ -2481,6 +2483,7 @@ new file mode 100644
 +			uint32_t fn_n = 0;
 +			uint8_t f01_q = 0, f01_c = 0, f01_d = 0;
 +			uint8_t f11_q = 0, f11_c = 0, f11_d = 0;
++			uint8_t f12_q = 0, f12_c = 0, f12_d = 0;
 +
 +			for (pg = 0; pg < 10; pg++) {
 +				uint32_t ent;
@@ -2512,6 +2515,12 @@ new file mode 100644
 +						f11_c = pdt[2];
 +						f11_d = pdt[3];
 +					}
++					/* This panel is F12, not F11 (v141). */
++					if (pdt[5] == 0x12) {
++						f12_q = pdt[0];
++						f12_c = pdt[2];
++						f12_d = pdt[3];
++					}
 +				}
 +			}
 +			si2c.fn_n = fn_n;
@@ -2524,6 +2533,19 @@ new file mode 100644
 +			si2c.f11_q = f11_q;
 +			si2c.f11_c = f11_c;
 +			si2c.f11_d = f11_d;
++			si2c.f12_q = f12_q;
++			si2c.f12_c = f12_c;
++			si2c.f12_d = f12_d;
++
++			/*
++			 * v141: read the F01 query block. Its first bytes are the
++			 * manufacturer id, product id and firmware version -- the
++			 * identity a real driver logs and keys its config off.
++			 */
++			if (f01_q != 0) {
++				(void)si2c_read_rmi4(SAGIT_TOUCH_ADDR, f01_q,
++				    si2c.f01_query, sizeof(si2c.f01_query));
++			}
 +		}
 +
 +		/*
@@ -2543,18 +2565,20 @@ new file mode 100644
 +		 * With these I can issue the real F01 device-control and F11 2D
 +		 * touch reads without another discovery round.
 +		 */
-+		panic("SAGIT I2C OK: page0=%02x %02x %02x %02x %02x %02x "
-+		    "| fns=%d: %02x %02x %02x %02x %02x %02x %02x %02x "
-+		    "| f01 qcd=0x%x/0x%x/0x%x | f11 qcd=0x%x/0x%x/0x%x "
-+		    "| ub %d | lab 0x%x/0x%x",
-+		    idbuf[0], idbuf[1], idbuf[2], idbuf[3], idbuf[4],
-+		    idbuf[5], (int)si2c.fn_n,
++		panic("SAGIT I2C OK: fns=%d: %02x %02x %02x %02x %02x %02x "
++		    "%02x %02x | f01 qcd=0x%x/0x%x/0x%x "
++		    "| f12 qcd=0x%x/0x%x/0x%x "
++		    "| f01q= %02x %02x %02x %02x %02x %02x %02x %02x "
++		    "| lab 0x%x/0x%x",
++		    (int)si2c.fn_n,
 +		    si2c.fn_list[0], si2c.fn_list[1], si2c.fn_list[2],
 +		    si2c.fn_list[3], si2c.fn_list[4], si2c.fn_list[5],
 +		    si2c.fn_list[6], si2c.fn_list[7],
 +		    si2c.f01_q, si2c.f01_c, si2c.f01_d,
-+		    si2c.f11_q, si2c.f11_c, si2c.f11_d,
-+		    (int)si2c.ub_rc,
++		    si2c.f12_q, si2c.f12_c, si2c.f12_d,
++		    si2c.f01_query[0], si2c.f01_query[1], si2c.f01_query[2],
++		    si2c.f01_query[3], si2c.f01_query[4], si2c.f01_query[5],
++		    si2c.f01_query[6], si2c.f01_query[7],
 +		    si2c.lab_status, si2c.ibb_status);
 +	}
 +
