@@ -1,0 +1,55 @@
+diff --git a/bsd/kern/kern_fork.c b/bsd/kern/kern_fork.c
+index 58424cb..4e00e1a 100644
+--- a/bsd/kern/kern_fork.c
++++ b/bsd/kern/kern_fork.c
+@@ -456,6 +456,7 @@ fork_create_child(task_t parent_task,
+ 	bool inherit_memory = !!(clone_flags & CLONEPROC_FLAGS_INHERIT_MEMORY);
+ 	bool in_exec = !!(clone_flags & CLONEPROC_FLAGS_FOR_EXEC);
+ 
++	printf("SAGIT CL D1: fork_create_child entered\n");
+ 	proc_ro = proc_get_ro(child_proc);
+ 	if (proc_ro_task(proc_ro) != NULL) {
+ 		panic("Proc_ro_task for newly created proc %p is not NULL", child_proc);
+@@ -483,12 +484,15 @@ fork_create_child(task_t parent_task,
+ 		    __func__, result);
+ 		goto bad;
+ 	}
++	printf("SAGIT CL D2: task_create_internal ok, task %p\n",
++	    (void *)child_task);
+ 
+ 	/* Set the child proc process to child task */
+ 	proc_set_task(child_proc, child_task);
+ 
+ 	/* Set child task process to child proc */
+ 	set_bsdtask_info(child_task, child_proc);
++	printf("SAGIT CL D3: proc_set_task + set_bsdtask_info done\n");
+ 
+ 	/* Propagate CPU limit timer from parent */
+ 	if (timerisset(&child_proc->p_rlim_cpu)) {
+@@ -520,14 +524,26 @@ fork_create_child(task_t parent_task,
+ 		task_deallocate(child_task);
+ 		child_task = NULL;
+ 	}
++	printf("SAGIT CL D4: main_thread_create_waiting -> %d, thread %p\n",
++	    result, (void *)child_thread);
+ 
+ 	/*
+ 	 * Tag thread as being the first thread in its task.
+ 	 */
+ 	thread_set_tag(child_thread, THREAD_TAG_MAINTHREAD);
++	printf("SAGIT CL D5: thread_set_tag done\n");
+ 
+ bad:
++#if defined(SAGIT)
++	/*
++	 * Only a "let a peer preempt me" hint, and it runs on both the success
++	 * and the failure path. It is also the only statement here that can park
++	 * the boot thread in the scheduler, so skip it on this port.
++	 */
++	printf("SAGIT CL D6: yield skipped, returning %p\n", (void *)child_thread);
++#else
+ 	thread_yield_internal(1);
++#endif
+ 
+ 	return child_thread;
+ }
