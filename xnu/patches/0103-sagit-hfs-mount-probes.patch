@@ -1,0 +1,158 @@
+diff --git a/bsd/dev/sagit_ufs.c b/bsd/dev/sagit_ufs.c
+index 464daf8..209c55c 100644
+--- a/bsd/dev/sagit_ufs.c
++++ b/bsd/dev/sagit_ufs.c
+@@ -540,13 +540,13 @@ sagit_ufs_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
+ 		*o = su.nblocks * UFS_BLOCK / su.secsize;
+ 		return 0;
+ 	case DKIOCISWRITABLE:
+-		*f = 0;
++		*f = 1;
+ 		return 0;
+ 	case DKIOCGETMAXBLOCKCOUNTREAD:
+ 		*o = BOUNCE_SIZE / su.secsize;
+ 		return 0;
+ 	case DKIOCGETMAXBLOCKCOUNTWRITE:
+-		*o = 0;
++		*o = BOUNCE_SIZE / su.secsize;
+ 		return 0;
+ 	case DKIOCGETMAXSEGMENTCOUNTREAD:
+ 	case DKIOCGETMAXSEGMENTCOUNTWRITE:
+diff --git a/bsd/sagit_hfs/core/hfs_vfsops.c b/bsd/sagit_hfs/core/hfs_vfsops.c
+index 557430b..6951ea7 100644
+--- a/bsd/sagit_hfs/core/hfs_vfsops.c
++++ b/bsd/sagit_hfs/core/hfs_vfsops.c
+@@ -1122,6 +1122,9 @@ hfs_mountfs(struct vnode *devvp, struct mount *mp, struct hfs_mount_args *args,
+ 	cred = p ? vfs_context_ucred(context) : NOCRED;
+ 	mntwrapper = 0;
+ 
++	printf("SAGIT HM 1/8: hfs_mountfs enter, ronly=%d isroot=%d\n",
++	    ronly, isroot);
++
+ 	bp = NULL;
+ 	hfsmp = NULL;
+ 	mdbp = NULL;
+@@ -1268,6 +1271,18 @@ hfs_mountfs(struct vnode *devvp, struct mount *mp, struct hfs_mount_args *args,
+ 	bcopy((char *)buf_dataptr(bp) + HFS_PRI_OFFSET(phys_blksize), mdbp, kMDBSize);
+ 	buf_brelse(bp);
+ 	bp = NULL;
++	{
++		HFSPlusVolumeHeader *sag_vhp = (HFSPlusVolumeHeader *)mdbp;
++
++		printf("SAGIT HM 2/8: volhdr sig=0x%x ver=0x%x blkSize=%u "
++		    "attrs=0x%x jib=%u lastMnt=0x%x\n",
++		    SWAP_BE16(sag_vhp->signature),
++		    SWAP_BE16(sag_vhp->version),
++		    SWAP_BE32(sag_vhp->blockSize),
++		    SWAP_BE32(sag_vhp->attributes),
++		    SWAP_BE32(sag_vhp->journalInfoBlock),
++		    SWAP_BE32(sag_vhp->lastMountedVersion));
++	}
+ 
+ 	hfsmp = hfs_malloc_type(struct hfsmount);
+ 
+@@ -1580,6 +1595,10 @@ hfs_mountfs(struct vnode *devvp, struct mount *mp, struct hfs_mount_args *args,
+ 		// (so we need to go find the .journal file, make sure it's
+ 		// the right size, re-sync up if it was moved, etc).
+ 		//
++		printf("SAGIT HM 3/8: jnl decision lastMnt=0x%x jnlbit=%d "
++		    "disable=%d\n", SWAP_BE32(vhp->lastMountedVersion),
++		    !!(SWAP_BE32(vhp->attributes) & kHFSVolumeJournaledMask),
++		    jnl_disable);
+ 		if (   (SWAP_BE32(vhp->lastMountedVersion) == kHFSJMountVersion)
+ 			&& (SWAP_BE32(vhp->attributes) & kHFSVolumeJournaledMask)
+ 			&& !jnl_disable) {
+@@ -1588,6 +1607,11 @@ hfs_mountfs(struct vnode *devvp, struct mount *mp, struct hfs_mount_args *args,
+ 			// point as journaled.
+ 			//
+ 			if ((retval = hfs_early_journal_init(hfsmp, vhp, args, embeddedOffset, mdb_offset, mdbp, cred)) == 0) {
++				printf("SAGIT HM 3/8: early jnl ok, jnl=%p "
++				    "start=%lld size=%lld\n",
++				    (void *)hfsmp->jnl,
++				    (long long)hfsmp->jnl_start,
++				    (long long)hfsmp->jnl_size);
+ 				if (mp)
+ 					vfs_setflags(mp, (u_int64_t)((unsigned int)MNT_JOURNALED));
+ 			} else {
+@@ -1663,7 +1687,9 @@ hfs_mountfs(struct vnode *devvp, struct mount *mp, struct hfs_mount_args *args,
+ 			goto error_exit;
+ 		}
+ 
++		printf("SAGIT HM 4/8: calling MountHFSPlusVolume\n");
+ 		retval = hfs_MountHFSPlusVolume(hfsmp, vhp, embeddedOffset, disksize, p, args, cred);
++		printf("SAGIT HM 4/8: MountHFSPlusVolume returned %d\n", retval);
+ 		/*
+ 		 * If the backend didn't like our physical blocksize
+ 		 * then retry with physical blocksize of 512.
+diff --git a/bsd/sagit_hfs/core/hfs_vfsutils.c b/bsd/sagit_hfs/core/hfs_vfsutils.c
+index 5734b67..1c87d86 100644
+--- a/bsd/sagit_hfs/core/hfs_vfsutils.c
++++ b/bsd/sagit_hfs/core/hfs_vfsutils.c
+@@ -188,6 +188,10 @@ OSErr hfs_MountHFSPlusVolume(struct hfsmount *hfsmp, HFSPlusVolumeHeader *vhp,
+ 	signature = SWAP_BE16(vhp->signature);
+ 	hfs_version = SWAP_BE16(vhp->version);
+ 
++	printf("SAGIT HM 5/8: MountHFSPlusVolume enter sig=0x%x ver=0x%x "
++	    "ronly=%d jnl=%p\n", signature, hfs_version,
++	    !!(hfsmp->hfs_flags & HFS_READ_ONLY), (void *)hfsmp->jnl);
++
+ 	retval = hfs_ValidateHFSPlusVolumeHeader(hfsmp, vhp);
+ 	if (retval)
+ 		return retval;
+@@ -409,6 +413,7 @@ OSErr hfs_MountHFSPlusVolume(struct hfsmount *hfsmp, HFSPlusVolumeHeader *vhp,
+ 		}
+ 		goto ErrorExit;
+ 	}
++	printf("SAGIT HM 6/8: extents B-tree opened\n");
+ 	/*
+ 	 * Set up Catalog B-tree vnode
+ 	 */ 
+@@ -447,6 +452,7 @@ OSErr hfs_MountHFSPlusVolume(struct hfsmount *hfsmp, HFSPlusVolumeHeader *vhp,
+ 		hfs_unlock(hfsmp->hfs_catalog_cp);
+ 		goto ErrorExit;
+ 	}
++	printf("SAGIT HM 7/8: catalog B-tree opened\n");
+ 	if ((hfsmp->hfs_flags & HFS_X) &&
+ 	    BTGetInformation(VTOF(hfsmp->hfs_catalog_vp), 0, &btinfo) == 0) {
+ 		if (btinfo.keyCompareType == kHFSBinaryCompare) {
+@@ -589,6 +595,7 @@ OSErr hfs_MountHFSPlusVolume(struct hfsmount *hfsmp, HFSPlusVolumeHeader *vhp,
+ 	bcopy(cndesc.cd_nameptr, vcb->vcbVN, min(255, cndesc.cd_namelen));
+ 	volname_length = strlen ((const char*)vcb->vcbVN);
+ 	cat_releasedesc(&cndesc);
++	printf("SAGIT HM 7/8: root folder found, volname=\"%s\"\n", vcb->vcbVN);
+ 	
+ 	/* Send the volume name down to CoreStorage if necessary */	
+ 	retval = utf8_normalizestr(vcb->vcbVN, volname_length, (u_int8_t*)converted_volname, &conv_volname_length, 256, UTF_PRECOMPOSED);
+@@ -635,6 +642,7 @@ OSErr hfs_MountHFSPlusVolume(struct hfsmount *hfsmp, HFSPlusVolumeHeader *vhp,
+ 	 * the disk is not SSD.
+ 	 */
+ 	async_bitmap_scan = true;
++	printf("SAGIT HM 8/8: bitmap scan decision\n");
+ 	if (!ISSET(hfsmp->hfs_flags, HFS_SSD) && hfsmp->hfs_catalog_cp) {
+ 		bool catalog_has_overflow_extents;
+ 		bool journal_transaction_needed;
+@@ -655,6 +663,16 @@ OSErr hfs_MountHFSPlusVolume(struct hfsmount *hfsmp, HFSPlusVolumeHeader *vhp,
+ 			async_bitmap_scan = false;
+ 	}
+ 
++	/*
++	 * SAGIT: the async scan waits with no timeout for a thread that takes
++	 * the bitmap lock before setting SCAN_INFLIGHT. Sleep forever if that
++	 * thread never gets there. Sync scan is Apple's fallback for exactly
++	 * this kind of stall.
++	 */
++	printf("SAGIT HM 8/8: async scan chosen=%d, forcing sync\n",
++	    async_bitmap_scan);
++	async_bitmap_scan = false;
++
+ 	if (async_bitmap_scan) {
+ 		thread_t allocator_scanner;
+ 
+@@ -702,6 +720,7 @@ OSErr hfs_MountHFSPlusVolume(struct hfsmount *hfsmp, HFSPlusVolumeHeader *vhp,
+ 		hfsmp->scan_var |= HFS_ALLOCATOR_SCAN_COMPLETED;
+ 		buf_invalidateblks (hfsmp->hfs_allocation_vp, 0, 0, 0);
+ 	}
++	printf("SAGIT HM 8/8: bitmap scan done\n");
+ 
+ 	/* mark the volume dirty (clear clean unmount bit) */
+ 	vcb->vcbAtrb &=	~kHFSVolumeUnmountedMask;
