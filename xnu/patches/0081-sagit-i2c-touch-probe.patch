@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,2885 @@
+@@ -0,0 +1,2912 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -297,6 +297,9 @@ new file mode 100644
 +	uint32_t f12_d0, f12_d1;        /* first F12 data word seen */
 +	uint8_t f12_data[6];            /* v147: last F12 data block */
 +	uint32_t finger_seen;           /* v147: polls with a finger bit set */
++	/* v148: decoded touch coordinates (F12 finger_data, vendor layout). */
++	uint32_t touch_x, touch_y;
++	uint32_t coord_seen;            /* polls that decoded a real position */
 +	uint32_t bb_ub;                 /* first byte read at the 0x2c bootloader addr */
 +	uint32_t bb_ub_ack;             /* ack bits for the 0x2c attempt */
 +	uint32_t ub_rc;                 /* QUP read of 0x2c, 8 bytes */
@@ -2713,6 +2716,30 @@ new file mode 100644
 +						if (d[0] != 0) {
 +							si2c.finger_seen++;
 +						}
++						/*
++						 * v148: decode finger 0 the way the vendor
++						 * does (synaptics_dsx_core.c:1561):
++						 *   data[0] = object_type_and_status
++						 *   data[1] = x_lsb, data[2] = x_msb
++						 *   data[3] = y_lsb, data[4] = y_msb
++						 *   x = (x_msb << 8) | x_lsb   (same for y)
++						 * bits 0-1 of data[0] are the contact
++						 * state; anything non-zero means present.
++						 */
++						if ((d[0] & 0x03u) != 0) {
++							uint32_t fx =
++							    ((uint32_t)d[2] << 8) |
++							    (uint32_t)d[1];
++							uint32_t fy =
++							    ((uint32_t)d[4] << 8) |
++							    (uint32_t)d[3];
++
++							if (fx != 0 || fy != 0) {
++								si2c.touch_x = fx;
++								si2c.touch_y = fy;
++								si2c.coord_seen++;
++							}
++						}
 +					}
 +				}
 +				si2c_wait_ms(20);
@@ -2743,14 +2770,14 @@ new file mode 100644
 +		 * carry everything needed now that the write path is proven:
 +		 * control/intr read-back, write results, and the touch data.
 +		 */
-+		panic("SAGIT TP: ctrl=%x intr=%x f12c=%x st=%x wrc=%d/%d/%d "
-+		    "fing=%d hits=%d d=%x %x %x %x %x %x",
++		panic("SAGIT TP: c=%x i=%x f=%x w=%d/%d/%d "
++		    "fing=%d hit=%d xy=%d,%d n=%d d0=%x",
 +		    si2c.f01_ctrl_after, si2c.f01_intr_after,
-+		    si2c.f12_ctrl_after, si2c.f01_status,
++		    si2c.f12_ctrl_after,
 +		    (int)si2c.wr_rc1, (int)si2c.wr_rc2, (int)si2c.wr_rc3,
 +		    (int)si2c.finger_seen, (int)si2c.touch_hits,
-+		    si2c.f12_data[0], si2c.f12_data[1], si2c.f12_data[2],
-+		    si2c.f12_data[3], si2c.f12_data[4], si2c.f12_data[5]);
++		    (int)si2c.touch_x, (int)si2c.touch_y,
++		    (int)si2c.coord_seen, si2c.f12_data[0]);
 +	}
 +
 +	/* Not at 0x20: the part may be sitting in ROM bootloader at 0x2c. */
