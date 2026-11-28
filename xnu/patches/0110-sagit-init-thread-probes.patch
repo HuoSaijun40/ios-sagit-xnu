@@ -1,0 +1,59 @@
+diff --git a/bsd/kern/kern_sig.c b/bsd/kern/kern_sig.c
+index ae4a5f3..30907fd 100644
+--- a/bsd/kern/kern_sig.c
++++ b/bsd/kern/kern_sig.c
+@@ -3291,6 +3291,8 @@ bsd_ast(thread_t thread)
+ 	int     signum;
+ 	static int bsd_init_done = 0;
+ 
++	printf("SAGIT WT A1: bsd_ast entered, p %p init_done %d\n",
++	    (void *)p, bsd_init_done);
+ 	if (p == NULL) {
+ 		return;
+ 	}
+@@ -3389,6 +3391,7 @@ bsd_ast(thread_t thread)
+ 	}
+ 	proc_unlock(p);
+ 
++	printf("SAGIT WT A2: bsd_ast tail, init_done %d\n", bsd_init_done);
+ 	if (!bsd_init_done) {
+ 		bsd_init_done = 1;
+ 		bsdinit_task();
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index 67c5f79..5e40d1d 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -788,7 +788,11 @@ task_wait_to_return(void)
+ {
+ 	task_t task = current_task();
+ 
++	printf("SAGIT WT 1: task_wait_to_return entered, task %p\n",
++	    (void *)task);
+ 	is_write_lock(task->itk_space);
++	printf("SAGIT WT 2: itk_space write lock taken, flags 0x%x\n",
++	    task->t_returnwaitflags);
+ 
+ 	if (task->t_returnwaitflags & TRW_LRETURNWAIT) {
+ 		struct turnstile *turnstile = turnstile_prepare_hash((uintptr_t) task_get_return_wait_event(task),
+@@ -813,10 +817,13 @@ task_wait_to_return(void)
+ 		} while (task->t_returnwaitflags & TRW_LRETURNWAIT);
+ 
+ 		turnstile_complete_hash((uintptr_t) task_get_return_wait_event(task), TURNSTILE_ULOCK);
++		printf("SAGIT WT 3: turnstile wait finished, flags 0x%x\n",
++		    task->t_returnwaitflags);
+ 	}
+ 
+ 	is_write_unlock(task->itk_space);
+ 	turnstile_cleanup();
++	printf("SAGIT WT 4: turnstile_cleanup done\n");
+ 
+ 
+ #if CONFIG_MACF
+@@ -831,6 +838,7 @@ task_wait_to_return(void)
+ 	mac_proc_notify_exec_complete(current_proc());
+ #endif
+ 
++	printf("SAGIT WT 5: calling thread_bootstrap_return\n");
+ 	thread_bootstrap_return();
+ }
+ 
