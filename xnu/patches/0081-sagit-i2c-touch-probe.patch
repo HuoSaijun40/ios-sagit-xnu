@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,2876 @@
+@@ -0,0 +1,2885 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -295,6 +295,8 @@ new file mode 100644
 +	uint32_t f01_status;
 +	uint32_t touch_hits;            /* polls that saw a non-zero int status */
 +	uint32_t f12_d0, f12_d1;        /* first F12 data word seen */
++	uint8_t f12_data[6];            /* v147: last F12 data block */
++	uint32_t finger_seen;           /* v147: polls with a finger bit set */
 +	uint32_t bb_ub;                 /* first byte read at the 0x2c bootloader addr */
 +	uint32_t bb_ub_ack;             /* ack bits for the 0x2c attempt */
 +	uint32_t ub_rc;                 /* QUP read of 0x2c, 8 bytes */
@@ -2662,22 +2664,16 @@ new file mode 100644
 +			}
 +			if (si2c.f12_c != 0) {
 +				/*
-+				 * v145: continuous mode is 0x00, and a zero payload
-+				 * is exactly what the engine chokes on. Only write
-+				 * when the part is not already in continuous mode;
-+				 * otherwise a doomed 0x00 write adds nothing.
++				 * v147: READ ONLY. v146 reported F12 control = 0x37,
++				 * whose bit0 is the report-enable bit -- the panel
++				 * was already reporting. Writing 0x00 there (what
++				 * v145/v146 did) turns reporting OFF, which is a
++				 * likely reason touch_hits stayed 0. Record the
++				 * value and leave the part alone.
 +				 */
 +				if (si2c_read_rmi4(SAGIT_TOUCH_ADDR,
 +				    (uint16_t)si2c.f12_c, &c, 1) == 0) {
 +					si2c.f12_ctrl_after = c;
-+					if (c != 0x00u) {
-+						c = 0x00u;
-+						si2c.wr_rc3 = (uint32_t)
-+						    si2c_write_via_bb(
-+						    SAGIT_TOUCH_ADDR,
-+						    (uint16_t)si2c.f12_c, c);
-+						si2c_wait_ms(10);
-+					}
 +				}
 +			}
 +
@@ -2688,7 +2684,7 @@ new file mode 100644
 +			 * up as a non-zero count even though we cannot yet
 +			 * deliver coordinates to userspace.
 +			 */
-+			for (uint32_t i = 0; i < 100; i++) {
++			for (uint32_t i = 0; i < 150; i++) {
 +				if (si2c_read_rmi4(SAGIT_TOUCH_ADDR,
 +				    (uint16_t)si2c.f01_d, st, 3) == 0) {
 +					si2c.f01_status = st[0];
@@ -2702,6 +2698,21 @@ new file mode 100644
 +					    sizeof(d)) == 0) {
 +						si2c.f12_d0 = d[0];
 +						si2c.f12_d1 = d[1];
++						/*
++						 * v147: keep the whole block and
++						 * count finger-status hits. F12
++						 * data[0] is the per-finger
++						 * contact bitmap, so a finger on
++						 * the glass shows up here even
++						 * when the F01 interrupt latch
++						 * has already been read-clear.
++						 */
++						for (uint32_t k = 0; k < 6; k++) {
++							si2c.f12_data[k] = d[k];
++						}
++						if (d[0] != 0) {
++							si2c.finger_seen++;
++						}
 +					}
 +				}
 +				si2c_wait_ms(20);
@@ -2725,23 +2736,21 @@ new file mode 100644
 +		 * With these I can issue the real F01 device-control and F11 2D
 +		 * touch reads without another discovery round.
 +		 */
-+		panic("SAGIT I2C OK: f01 qcd=0x%x/0x%x/0x%x f12 qcd=0x%x/0x%x/0x%x "
-+		    "| f01q= %02x %02x %02x %02x %02x %02x %02x %02x "
-+		    "| ctrl %x->%x intr=%x f12c=%x st=%x "
-+		    "| wrc %d/%d/%d bb="
-+		    "| hits=%d d0/d1=0x%x/0x%x | lab 0x%x/0x%x",
-+		    si2c.f01_q, si2c.f01_c, si2c.f01_d,
-+		    si2c.f12_q, si2c.f12_c, si2c.f12_d,
-+		    si2c.f01_query[0], si2c.f01_query[1], si2c.f01_query[2],
-+		    si2c.f01_query[3], si2c.f01_query[4], si2c.f01_query[5],
-+		    si2c.f01_query[6], si2c.f01_query[7],
-+		    si2c.f01_ctrl_before, si2c.f01_ctrl_after,
-+		    si2c.f01_intr_after, si2c.f12_ctrl_after,
-+		    si2c.f01_status,
++		/*
++		 * v147: keep the panic SHORT. v146 passed 27 varargs and the
++		 * panic path itself took a data abort (far=0x80, "nested panic
++		 * count exceeds limit"), which cost the run. Eleven arguments
++		 * carry everything needed now that the write path is proven:
++		 * control/intr read-back, write results, and the touch data.
++		 */
++		panic("SAGIT TP: ctrl=%x intr=%x f12c=%x st=%x wrc=%d/%d/%d "
++		    "fing=%d hits=%d d=%x %x %x %x %x %x",
++		    si2c.f01_ctrl_after, si2c.f01_intr_after,
++		    si2c.f12_ctrl_after, si2c.f01_status,
 +		    (int)si2c.wr_rc1, (int)si2c.wr_rc2, (int)si2c.wr_rc3,
-+		    (int)si2c.bb_ack,
-+		    (int)si2c.touch_hits, si2c.f12_d0, si2c.f12_d1,
-+		    si2c.lab_status, si2c.ibb_status);
++		    (int)si2c.finger_seen, (int)si2c.touch_hits,
++		    si2c.f12_data[0], si2c.f12_data[1], si2c.f12_data[2],
++		    si2c.f12_data[3], si2c.f12_data[4], si2c.f12_data[5]);
 +	}
 +
 +	/* Not at 0x20: the part may be sitting in ROM bootloader at 0x2c. */
