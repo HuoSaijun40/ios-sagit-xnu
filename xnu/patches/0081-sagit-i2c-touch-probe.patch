@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,2998 @@
+@@ -0,0 +1,3027 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -295,6 +295,7 @@ new file mode 100644
 +	uint32_t wr_pg_rc;              /* v144: page-select transaction rc */
 +	uint32_t wr_st;                 /* v144: I2C_STATUS seen when a write failed */
 +	uint32_t wr_op;                 /* v144: QUP_OPERATIONAL at that moment */
++	uint32_t wr_err;                /* v145: QUP_ERROR_FLAGS at that moment */
 +	uint32_t f01_status;
 +	uint32_t touch_hits;            /* polls that saw a non-zero int status */
 +	uint32_t f12_d0, f12_d1;        /* first F12 data word seen */
@@ -1284,15 +1285,22 @@ new file mode 100644
 +	}
 +
 +	for (spins = 0; spins < SAGIT_I2C_XFER_SPIN; spins++) {
++		uint32_t rawerr;
 +		int errc;
 +
 +		op = si2c_rdq(QUP_OPERATIONAL);
++		/*
++		 * Read ERROR_FLAGS BEFORE si2c_check_qup_errors(): that helper
++		 * writes them back to clear, so afterwards it always reads 0.
++		 */
++		rawerr = si2c_rdq(QUP_ERROR_FLAGS);
 +		errc = si2c_check_qup_errors();
 +		if (errc != 0) {
 +			/* v144: keep the first failure's raw registers. */
 +			if (si2c.wr_st == 0xffffffffu) {
 +				si2c.wr_st = si2c_rdq(QUP_I2C_STATUS);
 +				si2c.wr_op = op;
++				si2c.wr_err = rawerr;
 +			}
 +			return errc;
 +		}
@@ -2245,6 +2253,7 @@ new file mode 100644
 +	si2c.bb_pdt_pg = 0xffu;         /* 0xff = no PDT entry found anywhere */
 +	si2c.wr_pg_rc = 0xffffffffu;    /* v144: 0xffffffff = "never recorded" */
 +	si2c.wr_st = 0xffffffffu;
++	si2c.wr_err = 0xffffffffu;
 +
 +	/*
 +	 * Feasibility gate for the RPM path. v89 showed PM8998's LDO6 has no
@@ -2774,7 +2783,17 @@ new file mode 100644
 +			if (si2c_read_rmi4(SAGIT_TOUCH_ADDR,
 +			    (uint16_t)si2c.f01_c, &c, 1) == 0) {
 +				si2c.f01_ctrl_before = c;
-+				c &= (uint8_t)~0x07u;   /* normal operation */
++				/*
++				 * v145: write NO_SLEEP_ON (0x04) instead of 0x00.
++				 * The v144 trace was perfectly repeatable --
++				 * wrc 5/0/5 every single run -- and the two
++				 * failures were exactly the writes whose payload
++				 * byte was 0x00, while the 0x01 write succeeded.
++				 * A zero payload is what trips the engine, so send
++				 * a non-zero control value. The vendor driver keeps
++				 * the existing NO_SLEEP bit for the same reason.
++				 */
++				c = (uint8_t)((c & (uint8_t)~0x07u) | 0x04u);
 +				(void)si2c_write_verify(SAGIT_TOUCH_ADDR,
 +				    (uint16_t)si2c.f01_c, c, &si2c.wr_rc1);
 +				if (si2c_read_rmi4(SAGIT_TOUCH_ADDR,
@@ -2794,12 +2813,22 @@ new file mode 100644
 +				}
 +			}
 +			if (si2c.f12_c != 0) {
-+				c = 0x00u;              /* continuous mode */
-+				(void)si2c_write_verify(SAGIT_TOUCH_ADDR,
-+				    (uint16_t)si2c.f12_c, c, &si2c.wr_rc3);
++				/*
++				 * v145: continuous mode is 0x00, and a zero payload
++				 * is exactly what the engine chokes on. Only write
++				 * when the part is not already in continuous mode;
++				 * otherwise a doomed 0x00 write adds nothing.
++				 */
 +				if (si2c_read_rmi4(SAGIT_TOUCH_ADDR,
 +				    (uint16_t)si2c.f12_c, &c, 1) == 0) {
 +					si2c.f12_ctrl_after = c;
++					if (c != 0x00u) {
++						c = 0x00u;
++						(void)si2c_write_verify(
++						    SAGIT_TOUCH_ADDR,
++						    (uint16_t)si2c.f12_c, c,
++						    &si2c.wr_rc3);
++					}
 +				}
 +			}
 +
@@ -2850,7 +2879,7 @@ new file mode 100644
 +		panic("SAGIT I2C OK: f01 qcd=0x%x/0x%x/0x%x f12 qcd=0x%x/0x%x/0x%x "
 +		    "| f01q= %02x %02x %02x %02x %02x %02x %02x %02x "
 +		    "| ctrl %x->%x intr=%x f12c=%x st=%x "
-+		    "| wrc %d/%d/%d pg=%d st=0x%x op=0x%x "
++		    "| wrc %d/%d/%d pg=%d st=0x%x op=0x%x err=0x%x "
 +		    "| hits=%d d0/d1=0x%x/0x%x | lab 0x%x/0x%x",
 +		    si2c.f01_q, si2c.f01_c, si2c.f01_d,
 +		    si2c.f12_q, si2c.f12_c, si2c.f12_d,
@@ -2861,7 +2890,7 @@ new file mode 100644
 +		    si2c.f01_intr_after, si2c.f12_ctrl_after,
 +		    si2c.f01_status,
 +		    (int)si2c.wr_rc1, (int)si2c.wr_rc2, (int)si2c.wr_rc3,
-+		    (int)si2c.wr_pg_rc, si2c.wr_st, si2c.wr_op,
++		    (int)si2c.wr_pg_rc, si2c.wr_st, si2c.wr_op, si2c.wr_err,
 +		    (int)si2c.touch_hits, si2c.f12_d0, si2c.f12_d1,
 +		    si2c.lab_status, si2c.ibb_status);
 +	}
