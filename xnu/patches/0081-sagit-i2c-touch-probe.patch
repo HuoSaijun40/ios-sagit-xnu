@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,3137 @@
+@@ -0,0 +1,3163 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -2036,61 +2036,69 @@ new file mode 100644
 + */
 +extern void thread_deallocate(thread_t);
 +
++/*
++ * One sampling round. Shared by the polling thread and by the synchronous
++ * sampler in the probe, so both report through the same counters.
++ */
 +static void
-+sagit_touch_thread(void *arg, wait_result_t wresult)
++sagit_touch_poll_once(void)
 +{
 +	uint8_t st[3];
 +	uint8_t d[8];
 +
++	if (si2c.f01_d != 0 &&
++	    si2c_read_rmi4(SAGIT_TOUCH_ADDR,
++	    (uint16_t)si2c.f01_d, st, 3) == 0) {
++		if (st[1] != 0) {
++			sagit_tp.ints++;
++		}
++	} else {
++		sagit_tp.errors++;
++	}
++
++	if (si2c.f12_d != 0 &&
++	    si2c_read_rmi4(SAGIT_TOUCH_ADDR,
++	    (uint16_t)si2c.f12_d, d, sizeof(d)) == 0) {
++		/*
++		 * Same decode as the probe (vendor layout):
++		 *   d[0]=object_type_and_status  d[1]=x_lsb
++		 *   d[2]=x_msb  d[3]=y_lsb  d[4]=y_msb
++		 * bits 0-1 of d[0] carry the contact state.
++		 */
++		if ((d[0] & 0x03u) != 0) {
++			uint32_t fx = ((uint32_t)d[2] << 8) | d[1];
++			uint32_t fy = ((uint32_t)d[4] << 8) | d[3];
++
++			if (fx != 0 || fy != 0) {
++				sagit_tp.x = fx;
++				sagit_tp.y = fy;
++				sagit_tp.down = 1;
++				sagit_tp.events++;
++				/* finger 0 down / move */
++				sweet_hid_touch(0, 1, (int)fx, (int)fy);
++			}
++		} else {
++			if (sagit_tp.down) {
++				/* release at the last known point */
++				sweet_hid_touch(0, 0,
++				    (int)sagit_tp.x, (int)sagit_tp.y);
++			}
++			sagit_tp.down = 0;
++		}
++	} else {
++		sagit_tp.errors++;
++	}
++}
++
++static void
++sagit_touch_thread(void *arg, wait_result_t wresult)
++{
 +	(void)arg;
 +	(void)wresult;
 +
 +	for (;;) {
 +		sagit_tp.loops++;
-+
-+		if (si2c.f01_d != 0 &&
-+		    si2c_read_rmi4(SAGIT_TOUCH_ADDR,
-+		    (uint16_t)si2c.f01_d, st, 3) == 0) {
-+			if (st[1] != 0) {
-+				sagit_tp.ints++;
-+			}
-+		} else {
-+			sagit_tp.errors++;
-+		}
-+
-+		if (si2c.f12_d != 0 &&
-+		    si2c_read_rmi4(SAGIT_TOUCH_ADDR,
-+		    (uint16_t)si2c.f12_d, d, sizeof(d)) == 0) {
-+			/*
-+			 * Same decode as the probe (vendor layout):
-+			 *   d[0]=object_type_and_status  d[1]=x_lsb
-+			 *   d[2]=x_msb  d[3]=y_lsb  d[4]=y_msb
-+			 * bits 0-1 of d[0] carry the contact state.
-+			 */
-+			if ((d[0] & 0x03u) != 0) {
-+				uint32_t fx = ((uint32_t)d[2] << 8) | d[1];
-+				uint32_t fy = ((uint32_t)d[4] << 8) | d[3];
-+
-+				if (fx != 0 || fy != 0) {
-+					sagit_tp.x = fx;
-+					sagit_tp.y = fy;
-+					sagit_tp.down = 1;
-+					sagit_tp.events++;
-+					/* finger 0 down / move */
-+					sweet_hid_touch(0, 1, (int)fx, (int)fy);
-+				}
-+			} else {
-+				if (sagit_tp.down) {
-+					/* release at the last known point */
-+					sweet_hid_touch(0, 0,
-+					    (int)sagit_tp.x, (int)sagit_tp.y);
-+				}
-+				sagit_tp.down = 0;
-+			}
-+		} else {
-+			sagit_tp.errors++;
-+		}
-+
++		sagit_touch_poll_once();
 +		/* ~8 ms between samples; busy-wait is fine on this port. */
 +		si2c_wait_ms(8);
 +	}
@@ -3002,6 +3010,24 @@ new file mode 100644
 +		 * panic on detail that no longer matters once touch is up.
 +		 */
 +		sagit_touch_service_start();
++
++		/*
++		 * v154: sample synchronously for ~2 s.
++		 *
++		 * The polling thread cannot be relied on this early. bsd_init runs
++		 * on kernel_task and this port boots with cpus=1, so a freshly
++		 * created thread may not be scheduled at all before mountroot
++		 * panics -- v153 reported loops=0 for exactly that reason. Reading
++		 * the part here guarantees the panic carries real numbers, which is
++		 * what answers "is the service actually talking to the chip".
++		 */
++		for (int i = 0; i < 100; i++) {
++			sagit_touch_poll_once();
++			si2c_wait_ms(20);
++		}
++		printf("SAGIT TP: sampled 100 rounds (ev=%d hit=%d err=%d)\n",
++		    (int)sagit_tp.events, (int)sagit_tp.ints,
++		    (int)sagit_tp.errors);
 +		return;
 +	}
 +
