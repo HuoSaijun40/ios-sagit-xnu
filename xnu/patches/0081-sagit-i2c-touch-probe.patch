@@ -5033,6 +5033,39 @@ diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
  		}
  #endif
  		if (0 == err) {
+@@ -1029,15 +1089,32 @@
+ 		printf("cannot mount root, errno = %d\n", err);
+ 	}
+ 
++	{
++		extern void IOLog(const char *, ...);
++		IOLog("SAGIT: mountroot ok, entering IOSecureBSDRoot\n");
++	}
+ 	IOSecureBSDRoot(rootdevice);
++	{
++		extern void IOLog(const char *, ...);
++		IOLog("SAGIT: IOSecureBSDRoot done\n");
++	}
+ 
+ 	mountlist.tqh_first->mnt_flag |= MNT_ROOTFS;
+ 
++	{
++		extern void IOLog(const char *, ...);
++		IOLog("SAGIT: entering VFS_ROOT\n");
++	}
+ 	bsd_init_kprintf("calling VFS_ROOT\n");
+ 	/* Get the vnode for '/'.  Set fdp->fd_fd.fd_cdir to reference it. */
+ 	if (VFS_ROOT(mountlist.tqh_first, &init_rootvnode, vfs_context_kernel())) {
+ 		panic("bsd_init: cannot find root vnode: %s", PE_boot_args());
+ 	}
++	{
++		extern void IOLog(const char *, ...);
++		IOLog("SAGIT: VFS_ROOT ok, root vnode %p\n",
++		    (void *)init_rootvnode);
++	}
+ 	(void)vnode_ref(init_rootvnode);
+ 	(void)vnode_put(init_rootvnode);
+ 
 diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
 --- a/osfmk/arm/arm_init.c
 +++ b/osfmk/arm/arm_init.c
