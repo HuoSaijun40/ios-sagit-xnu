@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,3090 @@
+@@ -0,0 +1,3137 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -2014,6 +2014,7 @@ new file mode 100644
 +	uint32_t events;        /* positions decoded since boot */
 +	uint32_t ints;          /* F01 interrupt-status hits since boot */
 +	uint32_t errors;        /* failed I2C reads */
++	uint32_t loops;         /* v152: polling iterations completed */
 +} sagit_tp;
 +
 +static thread_t sagit_touch_thread_ref;
@@ -2045,6 +2046,8 @@ new file mode 100644
 +	(void)wresult;
 +
 +	for (;;) {
++		sagit_tp.loops++;
++
 +		if (si2c.f01_d != 0 &&
 +		    si2c_read_rmi4(SAGIT_TOUCH_ADDR,
 +		    (uint16_t)si2c.f01_d, st, 3) == 0) {
@@ -2136,6 +2139,50 @@ new file mode 100644
 +	}
 +	thread_deallocate(sagit_touch_thread_ref);
 +	printf("SAGIT TP: service running (sysctl kern.sagit.touch)\n");
++}
++
++/*
++ * v152: hand the runtime counters to bsd_init so the mountroot panic can show
++ * them. That panic is the one screen that stays still long enough to read, and
++ * it arrives AFTER the touch thread has been running, so its numbers answer
++ * the question that matters: is the service actually talking to the part?
++ *
++ *   loops  -- iterations the polling thread has completed (0 = never scheduled)
++ *   ints   -- F01 interrupt-status hits
++ *   events -- decoded positions
++ *   errors -- failed I2C reads
++ */
++/*
++ * Takes void* on purpose: bsd_init declares its own local mirror of this
++ * layout, and two structs with the same name in different translation units
++ * are distinct types, so a typed pointer would be a needless incompatibility.
++ * The field order below is the contract -- keep it in step with bsd_init.c.
++ */
++struct sagit_touch_snap {
++	uint32_t loops;
++	uint32_t down;
++	uint32_t x;
++	uint32_t y;
++	uint32_t events;
++	uint32_t ints;
++	uint32_t errors;
++};
++
++void
++sagit_touch_snapshot(void *outp)
++{
++	struct sagit_touch_snap *out = (struct sagit_touch_snap *)outp;
++
++	if (out == NULL) {
++		return;
++	}
++	out->loops = sagit_tp.loops;
++	out->down = sagit_tp.down;
++	out->x = sagit_tp.x;
++	out->y = sagit_tp.y;
++	out->events = sagit_tp.events;
++	out->ints = sagit_tp.ints;
++	out->errors = sagit_tp.errors;
 +}
 +
 +/*
