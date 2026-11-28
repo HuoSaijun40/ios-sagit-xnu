@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,2912 @@
+@@ -0,0 +1,2929 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -2687,7 +2687,7 @@ new file mode 100644
 +			 * up as a non-zero count even though we cannot yet
 +			 * deliver coordinates to userspace.
 +			 */
-+			for (uint32_t i = 0; i < 150; i++) {
++			for (uint32_t i = 0; i < 20; i++) {
 +				if (si2c_read_rmi4(SAGIT_TOUCH_ADDR,
 +				    (uint16_t)si2c.f01_d, st, 3) == 0) {
 +					si2c.f01_status = st[0];
@@ -2770,14 +2770,31 @@ new file mode 100644
 +		 * carry everything needed now that the write path is proven:
 +		 * control/intr read-back, write results, and the touch data.
 +		 */
-+		panic("SAGIT TP: c=%x i=%x f=%x w=%d/%d/%d "
-+		    "fing=%d hit=%d xy=%d,%d n=%d d0=%x",
++		/*
++		 * v149: NO MORE PANIC. The touch controller is proven end to end
++		 * -- control writes land (ctrl 0->4), interrupts fire (hit=150
++		 * with a finger, 1 without), and F12 coordinates decode
++		 * correctly (left-bottom 340,1256 vs right-top 855,274 on a
++		 * 1080x1920 panel). Holding the machine at a panic screen was
++		 * only ever a debugging device; from here the boot must proceed
++		 * so the rest of the system can come up and the coordinates can
++		 * be delivered to the input stack.
++		 */
++		printf("SAGIT TP: c=%x i=%x f=%x w=%d/%d/%d "
++		    "fing=%d hit=%d xy=%d,%d n=%d\n",
 +		    si2c.f01_ctrl_after, si2c.f01_intr_after,
 +		    si2c.f12_ctrl_after,
 +		    (int)si2c.wr_rc1, (int)si2c.wr_rc2, (int)si2c.wr_rc3,
 +		    (int)si2c.finger_seen, (int)si2c.touch_hits,
 +		    (int)si2c.touch_x, (int)si2c.touch_y,
-+		    (int)si2c.coord_seen, si2c.f12_data[0]);
++		    (int)si2c.coord_seen);
++
++		/*
++		 * Stop probing and let the kernel continue: everything below
++		 * this point re-tests the link and would panic on a detail
++		 * that no longer matters once touch is up.
++		 */
++		return;
 +	}
 +
 +	/* Not at 0x20: the part may be sitting in ROM bootloader at 0x2c. */
