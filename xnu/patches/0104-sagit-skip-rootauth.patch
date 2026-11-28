@@ -1,0 +1,21 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index e79a448..f09f989 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1137,6 +1137,16 @@ bsd_init(void)
+ 		require_rootauth = TRUE;
+ #endif // XNU_TARGET_OS_OSX && defined(__arm64__)
+ 
++#if defined(SAGIT)
++		/*
++		 * SAGIT: no sealed system volume, no trust cache and no rootauth
++		 * handshake -- a plain HFS+ tree on userdata. The ioctl can only
++		 * fail, and the check only exists to enforce Apple's SSV.
++		 */
++		require_rootauth = FALSE;
++		printf("SAGIT: sealed-root authentication skipped\n");
++#endif
++
+ 		if (require_rootauth) {
+ 			/* enforce sealedness */
+ 			int autherr = VNOP_IOCTL(rootvnode, FSIOC_KERNEL_ROOTAUTH, NULL, 0, vfs_context_kernel());
