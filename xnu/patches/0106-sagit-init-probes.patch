@@ -1,0 +1,68 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index f09f989..a25f581 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1157,6 +1157,10 @@ bsd_init(void)
+ 	}
+ 
+ 
++#if defined(SAGIT)
++	printf("SAGIT BI 1/8: rootauth done, netboot=%d\n", netboot);
++#endif
++
+ #if CONFIG_NETBOOT
+ 	if (netboot) {
+ 		int err;
+@@ -1198,13 +1202,18 @@ bsd_init(void)
+ 
+ 	/* set initial time; all other resource data is  already zero'ed */
+ 	microtime_with_abstime(&kernproc->p_start, &kernproc->p_stats->ps_start);
++#if defined(SAGIT)
++	printf("SAGIT BI 2/8: microtime done\n");
++#endif
+ 
+ #if DEVFS
+ 	{
+ 		char mounthere[] = "/dev"; /* !const because of internal casting */
+ 
+ 		bsd_init_kprintf("calling devfs_kernel_mount\n");
++		printf("SAGIT BI 3/8: entering devfs_kernel_mount\n");
+ 		devfs_kernel_mount(mounthere);
++		printf("SAGIT BI 4/8: devfs_kernel_mount returned\n");
+ 	}
+ #endif /* DEVFS */
+ 
+@@ -1275,6 +1284,9 @@ bsd_init(void)
+ 	machine_timeout_bsd_init();
+ #endif /* DEVELOPMENT || DEBUG */
+ 
++#if defined(SAGIT)
++	printf("SAGIT BI 5/8: bsd_init returning\n");
++#endif
+ 	bsd_init_kprintf("done\n");
+ }
+ 
+@@ -1283,6 +1295,7 @@ bsdinit_task(void)
+ {
+ 	proc_t p = current_proc();
+ 
++	printf("SAGIT BI 6/8: bsdinit_task entered\n");
+ 	process_name("init", p);
+ 
+ 	/* Set up exception-to-signal reflection */
+@@ -1293,6 +1306,7 @@ bsdinit_task(void)
+ #endif
+ 
+ 	vm_init_before_launchd();
++	printf("SAGIT BI 7/8: ux_handler + vm_init_before_launchd done\n");
+ 
+ #if CONFIG_XNUPOST
+ 	int result = bsd_list_tests();
+@@ -1304,6 +1318,7 @@ bsdinit_task(void)
+ 
+ 	bsd_init_kprintf("bsd_do_post - done");
+ 
++	printf("SAGIT BI 8/8: calling load_init_program\n");
+ 	load_init_program(p);
+ 	lock_trace = 1;
+ }
