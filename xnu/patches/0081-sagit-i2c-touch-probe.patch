@@ -4917,7 +4917,17 @@ diff --git a/bsd/conf/files b/bsd/conf/files
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -966,7 +966,41 @@
+@@ -954,6 +954,9 @@
+ 	printf("SAGIT: inittodr done\n");
+ #endif
+ 
++	/* v152: counters exported by sagit_i2c.c (void* by design). */
++	extern void sagit_touch_snapshot(void *);
++
+ 	/* Mount the root file system. */
+ 	while (TRUE) {
+ 		int err;
+@@ -966,7 +969,41 @@
  		 */
  		{
  			extern int sagit_ufs_rootdev(dev_t * dev);
@@ -4959,6 +4969,44 @@ diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
  			if (SAGIT_UFS_PROBE == 1) {
  				panic("SAGIT probe 1: about to call sagit_ufs_rootdev");
  			}
+@@ -1003,10 +1040,33 @@
+ 		 * exactly what we need to know about the userdata partition.
+ 		 */
+ 		if (err) {
+-			panic("SAGIT: vfs_mountroot(%s) failed: %d (errno), "
+-			    "rootdev maj %d min %d",
+-			    rootdevice[0] ? rootdevice : "no rootdev", err,
+-			    major(rootdev), minor(rootdev));
++			/*
++			 * v152: the touch service has been running by now, so
++			 * report its counters here. loops>0 proves the polling
++			 * thread got scheduled; a large loops with err=0 proves
++			 * it is really talking to the controller over I2C.
++			 * A local mirror of the layout is enough because the
++			 * driver takes void*.
++			 */
++			struct sagit_touch_snap {
++				uint32_t loops;
++				uint32_t down;
++				uint32_t x;
++				uint32_t y;
++				uint32_t events;
++				uint32_t ints;
++				uint32_t errors;
++			} ts;
++
++			memset(&ts, 0, sizeof(ts));
++			sagit_touch_snapshot(&ts);
++			panic("SAGIT: mountroot(%s) err=%d dev %d/%d | "
++			    "tp loops=%d down=%d xy=%d,%d ev=%d hit=%d err=%d",
++			    rootdevice[0] ? rootdevice : "none", err,
++			    major(rootdev), minor(rootdev),
++			    (int)ts.loops, (int)ts.down,
++			    (int)ts.x, (int)ts.y,
++			    (int)ts.events, (int)ts.ints, (int)ts.errors);
+ 		}
+ #endif
+ 		if (0 == err) {
 diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
 --- a/osfmk/arm/arm_init.c
 +++ b/osfmk/arm/arm_init.c
