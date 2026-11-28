@@ -4,7 +4,7 @@ new file mode 100644
 +++ b/bsd/dev/sagit_i2c.c
 --- /dev/null
 +++ b/bsd/dev/sagit_i2c.c
-@@ -0,0 +1,3027 @@
+@@ -0,0 +1,2876 @@
 +/*
 + * SAGIT: minimal BLSP I2C probe for the Synaptics touch controller.
 + *
@@ -292,10 +292,6 @@ new file mode 100644
 +	uint32_t f01_intr_after;
 +	uint32_t f12_ctrl_after;
 +	uint32_t wr_rc1, wr_rc2, wr_rc3; /* v143: write() return codes */
-+	uint32_t wr_pg_rc;              /* v144: page-select transaction rc */
-+	uint32_t wr_st;                 /* v144: I2C_STATUS seen when a write failed */
-+	uint32_t wr_op;                 /* v144: QUP_OPERATIONAL at that moment */
-+	uint32_t wr_err;                /* v145: QUP_ERROR_FLAGS at that moment */
 +	uint32_t f01_status;
 +	uint32_t touch_hits;            /* polls that saw a non-zero int status */
 +	uint32_t f12_d0, f12_d1;        /* first F12 data word seen */
@@ -1217,205 +1213,7 @@ new file mode 100644
 + *   block 1  START addr+W DATAWR_STOP 2 0xFF page      (page select)
 + *   block 2  START addr+W DATAWR_STOP n offset d0..    (register write)
 + */
-+/*
-+ * One write-only QUP transaction:
-+ *   START, addr+W, DATAWR_STOP, len, <len bytes>
-+ * Self-contained (reset -> run -> program -> pause -> fill -> run -> wait) so
-+ * callers can chain as many as they need without reasoning about block state.
-+ */
-+static int
-+si2c_qup_write_one(uint8_t addr, const uint8_t *buf, uint32_t len)
-+{
-+	uint8_t wt[24];
-+	uint32_t wlen = 0;
-+	uint32_t op;
-+	uint32_t spins;
 +
-+	if (len == 0 || len > 16) {
-+		return EINVAL;
-+	}
-+
-+	si2c_wrq(QUP_SW_RESET, 1);
-+	if (!si2c_poll(QUP_SW_RESET, 1u, 0u, SAGIT_I2C_SPIN)) {
-+		return EBUSY;
-+	}
-+	if (si2c_change_state(QUP_STATE_RESET) != 0) {
-+		return ENXIO;
-+	}
-+	si2c_wrq(QUP_CONFIG, QUP_I2C_MINI_CORE | QUP_I2C_N_VAL_V2);
-+	si2c_wrq(QUP_I2C_MASTER_GEN_REG, QUP_V2_TAGS_EN);
-+	if (!si2c_poll_state_master(SAGIT_I2C_SPIN)) {
-+		return ENXIO;
-+	}
-+	{
-+		uint32_t iom = si2c_rdq(QUP_IO_MODE);
-+
-+		iom |= QUP_REPACK_EN;
-+		si2c_wrq(QUP_IO_MODE, iom);
-+	}
-+
-+	wt[wlen++] = QUP_TAG_V2_START;
-+	wt[wlen++] = (uint8_t)(addr << 1);
-+	wt[wlen++] = QUP_TAG_V2_DATAWR_STOP;
-+	wt[wlen++] = (uint8_t)len;
-+	for (uint32_t i = 0; i < len; i++) {
-+		wt[wlen++] = buf[i];
-+	}
-+
-+	si2c_wrq(QUP_MX_INPUT_CNT, 0);
-+	si2c_wrq(QUP_MX_READ_CNT, 0);
-+	si2c_wrq(QUP_MX_OUTPUT_CNT, 0);
-+	si2c_wrq(QUP_MX_WRITE_CNT, wlen);
-+	si2c_wrq(QUP_CONFIG, QUP_I2C_MINI_CORE | QUP_I2C_N_VAL_V2);
-+
-+	if (si2c_change_state(QUP_STATE_RUN) != 0) {
-+		return ENXIO;
-+	}
-+	si2c_wrq(QUP_I2C_CLK_CTL, SAGIT_QUP_CLK_CTL_50K);
-+	if (si2c_change_state(QUP_STATE_PAUSE) != 0) {
-+		return ETIMEDOUT;
-+	}
-+
-+	si2c_wrq(QUP_OPERATIONAL, QUP_OPERATIONAL_RESET);
-+	if (si2c_write_tags(wt, wlen) != 0) {
-+		return ETIMEDOUT;
-+	}
-+	if (si2c_change_state(QUP_STATE_RUN) != 0) {
-+		return ENXIO;
-+	}
-+
-+	for (spins = 0; spins < SAGIT_I2C_XFER_SPIN; spins++) {
-+		uint32_t rawerr;
-+		int errc;
-+
-+		op = si2c_rdq(QUP_OPERATIONAL);
-+		/*
-+		 * Read ERROR_FLAGS BEFORE si2c_check_qup_errors(): that helper
-+		 * writes them back to clear, so afterwards it always reads 0.
-+		 */
-+		rawerr = si2c_rdq(QUP_ERROR_FLAGS);
-+		errc = si2c_check_qup_errors();
-+		if (errc != 0) {
-+			/* v144: keep the first failure's raw registers. */
-+			if (si2c.wr_st == 0xffffffffu) {
-+				si2c.wr_st = si2c_rdq(QUP_I2C_STATUS);
-+				si2c.wr_op = op;
-+				si2c.wr_err = rawerr;
-+			}
-+			return errc;
-+		}
-+		if (op & QUP_OP_MAX_OUTPUT_DONE) {
-+			break;
-+		}
-+	}
-+	if (spins == SAGIT_I2C_XFER_SPIN) {
-+		if (si2c.wr_st == 0xffffffffu) {
-+			si2c.wr_st = si2c_rdq(QUP_I2C_STATUS);
-+			si2c.wr_op = op;
-+		}
-+		return ETIMEDOUT;
-+	}
-+	(void)si2c_change_state(QUP_STATE_RESET);
-+
-+	return 0;
-+}
-+
-+/*
-+ * v143: split the write into TWO transactions instead of packing both blocks
-+ * into one FIFO burst. The v142 single-shot version queued 12 tag bytes
-+ * (block1 6 + block2 5+1), the OUT FIFO is 2 words deep on this SoC, and the
-+ * write silently did nothing -- F01 interrupt-enable read back 0 right after
-+ * writing 1. Two small transactions avoid the FIFO limit entirely and make
-+ * each step independently diagnosable.
-+ */
-+static int
-+si2c_write_addr(uint8_t addr, uint16_t reg, const uint8_t *val, uint32_t len)
-+{
-+	uint8_t page = (uint8_t)(reg >> 8);
-+	uint8_t offset = (uint8_t)(reg & 0xff);
-+	uint8_t b[17];
-+	int rc;
-+
-+	if (len == 0 || len > 16) {
-+		return EINVAL;
-+	}
-+
-+	/* transaction 1: page select {0xFF, page} */
-+	b[0] = 0xff;
-+	b[1] = page;
-+	rc = si2c_qup_write_one(addr, b, 2);
-+	if (si2c.wr_pg_rc == 0xffffffffu) {
-+		si2c.wr_pg_rc = (uint32_t)rc;   /* first write only */
-+	}
-+	if (rc != 0) {
-+		return rc;
-+	}
-+
-+	/*
-+	 * The part needs a moment to latch the page before the data block
-+	 * arrives; without the gap the second transaction intermittently NACKs.
-+	 */
-+	si2c_wait_ms(2);
-+
-+	/* transaction 2: {offset, data...} */
-+	b[0] = offset;
-+	for (uint32_t i = 0; i < len; i++) {
-+		b[1 + i] = val[i];
-+	}
-+	return si2c_qup_write_one(addr, b, len + 1);
-+}
-+
-+
-+/*
-+ * RMI4 register read: two address bytes, little endian.
-+ *
-+ * The Synaptics protocol is not plain register I/O -- every transfer carries a
-+ * 16-bit address before the data, which is why rmi4_i2c calls it a "0x0000
-+ * page descriptor" read at probe time rather than an ID register.
-+ */
-+static int
-+si2c_read_rmi4(uint8_t addr, uint16_t reg, uint8_t *out, uint32_t len)
-+{
-+	return si2c_read_addr(addr, reg, out, len);
-+}
-+
-+static int
-+si2c_write_rmi4(uint8_t addr, uint16_t reg, const uint8_t *val, uint32_t len)
-+{
-+	return si2c_write_addr(addr, reg, val, len);
-+}
-+
-+/*
-+ * v144: write one byte, then READ IT BACK and retry until it sticks.
-+ *
-+ * v143 proved the write path is not simply broken: of three identical
-+ * single-byte writes, 0x0C and 0x12 returned EIO while 0x0D returned 0 --
-+ * and even that "successful" write read back 0. That pattern is a part
-+ * which is still waking up: it ACKs/NACKs erratically and drops writes.
-+ * So verify instead of trusting the completion bit, and retry a few times.
-+ */
-+static int
-+si2c_write_verify(uint8_t addr, uint16_t reg, uint8_t val, uint32_t *out_rc)
-+{
-+	int rc = EIO;
-+
-+	for (int t = 0; t < 4; t++) {
-+		uint8_t rb = 0;
-+
-+		rc = si2c_write_rmi4(addr, reg, &val, 1);
-+		si2c_wait_ms(15);
-+		if (si2c_read_rmi4(addr, reg, &rb, 1) == 0 && rb == val) {
-+			if (out_rc != NULL) {
-+				*out_rc = 0;
-+			}
-+			return 0;
-+		}
-+	}
-+	if (out_rc != NULL) {
-+		*out_rc = (uint32_t)rc;
-+	}
-+	return (rc != 0) ? rc : EIO;
-+}
 +
 +/*
 + * Entry point, called once from bsd_init() before mounting anything.
@@ -2169,6 +1967,56 @@ new file mode 100644
 +}
 +
 +/*
++ * RMI4 register read: thin wrapper over the QUP read path.
++ *
++ * Reads go through QUP (proven: it produced the whole PDT). Writes do NOT --
++ * see si2c_write_via_bb below.
++ */
++static int
++si2c_read_rmi4(uint8_t addr, uint16_t reg, uint8_t *out, uint32_t len)
++{
++	return si2c_read_addr(addr, reg, out, len);
++}
++
++/*
++ * v146: write a register over bit-bang instead of QUP.
++ *
++ * v145 left no room for doubt: the write VERIFY failed while QUP reported
++ * NO error at all (err=0x0), with QUP_OPERATIONAL still showing
++ * OUT_NOT_EMPTY -- the bytes never left the FIFO, yet the engine claimed
++ * completion. Every QUP write is therefore unreliable on this part, while
++ * the bit-bang reader is proven (it produced the whole PDT, and the 0x7f
++ * self-test showed its ACKs are real). So drive writes on the wire by hand
++ * and keep QUP for reads only.
++ *
++ * Page 0 needs no page-select; anything else writes {0xFF, page} first.
++ */
++static int
++si2c_write_via_bb(uint8_t addr, uint16_t reg, uint8_t val)
++{
++	uint8_t page = (uint8_t)(reg >> 8);
++	uint8_t offset = (uint8_t)(reg & 0xff);
++	int rc;
++
++	/*
++	 * Always re-select the page: the PDT sweep visited pages 0..9, so the
++	 * part's page pointer is wherever that walk stopped. Assuming page 0
++	 * would write into the wrong page silently.
++	 */
++	rc = si2c_bb_write_byte(addr, 0xffu, page);
++	if (rc != 0) {
++		si2c_pins_to_i2c();
++		return rc;
++	}
++
++	rc = si2c_bb_write_byte(addr, offset, val);
++
++	/* Hand the pads back to the QUP block for the next read. */
++	si2c_pins_to_i2c();
++	return rc;
++}
++
++/*
 + * Touch interrupt line (GPIO 125): same pinctrl group, input with a pull-up.
 + * Not used for anything yet (this probe is polled), but configuring it the way
 + * the reference design does avoids leaving it in whatever the bootloader set.
@@ -2251,9 +2099,6 @@ new file mode 100644
 +
 +	si2c.txn = 0;
 +	si2c.bb_pdt_pg = 0xffu;         /* 0xff = no PDT entry found anywhere */
-+	si2c.wr_pg_rc = 0xffffffffu;    /* v144: 0xffffffff = "never recorded" */
-+	si2c.wr_st = 0xffffffffu;
-+	si2c.wr_err = 0xffffffffu;
 +
 +	/*
 +	 * Feasibility gate for the RPM path. v89 showed PM8998's LDO6 has no
@@ -2794,8 +2639,10 @@ new file mode 100644
 +				 * the existing NO_SLEEP bit for the same reason.
 +				 */
 +				c = (uint8_t)((c & (uint8_t)~0x07u) | 0x04u);
-+				(void)si2c_write_verify(SAGIT_TOUCH_ADDR,
-+				    (uint16_t)si2c.f01_c, c, &si2c.wr_rc1);
++				si2c.wr_rc1 = (uint32_t)si2c_write_via_bb(
++				    SAGIT_TOUCH_ADDR,
++				    (uint16_t)si2c.f01_c, c);
++				si2c_wait_ms(10);
 +				if (si2c_read_rmi4(SAGIT_TOUCH_ADDR,
 +				    (uint16_t)si2c.f01_c, &c, 1) == 0) {
 +					si2c.f01_ctrl_after = c;
@@ -2804,9 +2651,10 @@ new file mode 100644
 +			if (si2c_read_rmi4(SAGIT_TOUCH_ADDR,
 +			    (uint16_t)(si2c.f01_c + 1), &c, 1) == 0) {
 +				c |= 0x01u;             /* 0D interrupt */
-+				(void)si2c_write_verify(SAGIT_TOUCH_ADDR,
-+				    (uint16_t)(si2c.f01_c + 1), c,
-+				    &si2c.wr_rc2);
++				si2c.wr_rc2 = (uint32_t)si2c_write_via_bb(
++				    SAGIT_TOUCH_ADDR,
++				    (uint16_t)(si2c.f01_c + 1), c);
++				si2c_wait_ms(10);
 +				if (si2c_read_rmi4(SAGIT_TOUCH_ADDR,
 +				    (uint16_t)(si2c.f01_c + 1), &c, 1) == 0) {
 +					si2c.f01_intr_after = c;
@@ -2824,10 +2672,11 @@ new file mode 100644
 +					si2c.f12_ctrl_after = c;
 +					if (c != 0x00u) {
 +						c = 0x00u;
-+						(void)si2c_write_verify(
++						si2c.wr_rc3 = (uint32_t)
++						    si2c_write_via_bb(
 +						    SAGIT_TOUCH_ADDR,
-+						    (uint16_t)si2c.f12_c, c,
-+						    &si2c.wr_rc3);
++						    (uint16_t)si2c.f12_c, c);
++						si2c_wait_ms(10);
 +					}
 +				}
 +			}
@@ -2879,7 +2728,7 @@ new file mode 100644
 +		panic("SAGIT I2C OK: f01 qcd=0x%x/0x%x/0x%x f12 qcd=0x%x/0x%x/0x%x "
 +		    "| f01q= %02x %02x %02x %02x %02x %02x %02x %02x "
 +		    "| ctrl %x->%x intr=%x f12c=%x st=%x "
-+		    "| wrc %d/%d/%d pg=%d st=0x%x op=0x%x err=0x%x "
++		    "| wrc %d/%d/%d bb="
 +		    "| hits=%d d0/d1=0x%x/0x%x | lab 0x%x/0x%x",
 +		    si2c.f01_q, si2c.f01_c, si2c.f01_d,
 +		    si2c.f12_q, si2c.f12_c, si2c.f12_d,
@@ -2890,7 +2739,7 @@ new file mode 100644
 +		    si2c.f01_intr_after, si2c.f12_ctrl_after,
 +		    si2c.f01_status,
 +		    (int)si2c.wr_rc1, (int)si2c.wr_rc2, (int)si2c.wr_rc3,
-+		    (int)si2c.wr_pg_rc, si2c.wr_st, si2c.wr_op, si2c.wr_err,
++		    (int)si2c.bb_ack,
 +		    (int)si2c.touch_hits, si2c.f12_d0, si2c.f12_d1,
 +		    si2c.lab_status, si2c.ibb_status);
 +	}
