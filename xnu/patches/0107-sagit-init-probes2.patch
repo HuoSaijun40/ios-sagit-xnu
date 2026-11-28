@@ -1,0 +1,54 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index a25f581..dae9e40 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1217,6 +1217,10 @@ bsd_init(void)
+ 	}
+ #endif /* DEVFS */
+ 
++#if defined(SAGIT)
++	printf("SAGIT BI 4a: post-devfs, basesystem block next\n");
++#endif
++
+ #if CONFIG_BASESYSTEMROOT
+ #if CONFIG_IMAGEBOOT
+ 	if (bsdmgroot_bootable()) {
+@@ -1253,15 +1257,28 @@ bsd_init(void)
+ #error CONFIG_BASESYSTEMROOT requires CONFIG_IMAGEBOOT
+ #endif /* CONFIG_IMAGEBOOT */
+ #endif /* CONFIG_BASESYSTEMROOT */
++#if defined(SAGIT)
++	printf("SAGIT BI 4b: basesystem block done\n");
++#endif
+ 
+ 	/* Initialize signal state for process 0. */
+ 	bsd_init_kprintf("calling siginit\n");
+ 	siginit(kernproc);
++#if defined(SAGIT)
++	printf("SAGIT BI 4c: siginit done\n");
++#endif
+ 
+ 	bsd_init_kprintf("calling bsd_utaskbootstrap\n");
+ 	bsd_utaskbootstrap();
++#if defined(SAGIT)
++	printf("SAGIT BI 4d: bsd_utaskbootstrap done, initproc=%p\n",
++	    (void *)initproc);
++#endif
+ 
+ 	pal_kernel_announce();
++#if defined(SAGIT)
++	printf("SAGIT BI 4e: pal_kernel_announce done\n");
++#endif
+ 
+ 	bsd_init_kprintf("calling mountroot_post_hook\n");
+ 
+@@ -1283,6 +1300,9 @@ bsd_init(void)
+ 	 */
+ 	machine_timeout_bsd_init();
+ #endif /* DEVELOPMENT || DEBUG */
++#if defined(SAGIT)
++	printf("SAGIT BI 4f: machine_timeout_bsd_init done\n");
++#endif
+ 
+ #if defined(SAGIT)
+ 	printf("SAGIT BI 5/8: bsd_init returning\n");
