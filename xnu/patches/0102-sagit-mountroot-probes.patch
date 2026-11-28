@@ -1,0 +1,141 @@
+diff --git a/bsd/dev/sagit_ufs.c b/bsd/dev/sagit_ufs.c
+index b64588e..464daf8 100644
+--- a/bsd/dev/sagit_ufs.c
++++ b/bsd/dev/sagit_ufs.c
+@@ -127,6 +127,8 @@ static struct {
+ 	bool ready;
+ } su;
+ 
++static uint32_t sagit_ufs_nio;
++
+ static LCK_GRP_DECLARE(sagit_ufs_grp, "sagit_ufs");
+ static LCK_MTX_DECLARE(sagit_ufs_lock, &sagit_ufs_grp);
+ 
+@@ -388,9 +390,11 @@ ufs_take_over_host(void)
+ }
+ 
+ static int
+-sagit_ufs_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++sagit_ufs_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
+ {
++	printf("SAGIT MK 9/10: ufs open, flags 0x%x\n", flags);
+ 	if (!su.ready) {
++		printf("SAGIT MK 9/10: ufs open: device not ready\n");
+ 		return ENXIO;
+ 	}
+ 	/* Writes are supported now (see strategy), so FWRITE is allowed. */
+@@ -413,6 +417,12 @@ sagit_ufs_strategy(buf_t bp)
+ 	uint64_t part_bytes = su.nblocks * UFS_BLOCK;
+ 
+ 	buf_setresid(bp, count);
++	if (sagit_ufs_nio < 12) {
++		printf("SAGIT MK 10/10: io#%u blk %llu cnt %u flags 0x%x "
++		    "sec %u\n", sagit_ufs_nio, (unsigned long long)buf_blkno(bp),
++		    count, buf_flags(bp), su.secsize);
++	}
++	sagit_ufs_nio++;
+ 	if (!(buf_flags(bp) & B_READ)) {
+ 		/*
+ 		 * Write path: read-modify-write. The bounce buffer moves whole
+@@ -495,6 +505,9 @@ sagit_ufs_strategy(buf_t bp)
+ 
+ done:
+ 	if (error) {
++		printf("SAGIT MK 10/10: io error %d (blk %llu cnt %u "
++		    "flags 0x%x)\n", error,
++		    (unsigned long long)buf_blkno(bp), count, buf_flags(bp));
+ 		buf_seterror(bp, error);
+ 	}
+ 	buf_biodone(bp);
+diff --git a/bsd/vfs/vfs_subr.c b/bsd/vfs/vfs_subr.c
+index ea8fc3a..34c36eb 100644
+--- a/bsd/vfs/vfs_subr.c
++++ b/bsd/vfs/vfs_subr.c
+@@ -1219,6 +1219,9 @@ vfs_mountroot(void)
+ 	mount_t mp;
+ 	vnode_t bdevvp_rootvp;
+ 
++	printf("SAGIT MK 1/10: vfs_mountroot enter, mountroot=%d rootdev=%d\n",
++	    mountroot != NULL, (int)rootdev);
++
+ 	/*
+ 	 * Reset any prior "unmounting everything" state.  This handles the
+ 	 * situation where mount root and then unmountall and re-mountroot
+@@ -1239,10 +1242,12 @@ vfs_mountroot(void)
+ 	}
+ 	if ((error = bdevvp(rootdev, &rootvp))) {
+ 		printf("vfs_mountroot: can't setup bdevvp\n");
++		printf("SAGIT MK 2/10: bdevvp failed, err %d\n", error);
+ 
+ 		KDBG_RELEASE(DBG_MOUNTROOT | DBG_FUNC_END, error, 1);
+ 		return error;
+ 	}
++	printf("SAGIT MK 2/10: bdevvp ok, rootvp %p\n", (void *)rootvp);
+ 	/*
+ 	 * 4951998 - code we call in vfc_mountroot may replace rootvp
+ 	 * so keep a local copy for some house keeping.
+@@ -1255,6 +1260,9 @@ vfs_mountroot(void)
+ 			continue;
+ 		}
+ 
++		printf("SAGIT MK 3/10: trying \"%s\" via %s\n", vfsp->vfc_name,
++		    vfsp->vfc_mountroot ? "vfc_mountroot" : "VFS_MOUNT");
++
+ 		mp = vfs_rootmountalloc_internal(vfsp, "root_device");
+ 		mp->mnt_devvp = rootvp;
+ 
+@@ -1263,6 +1271,8 @@ vfs_mountroot(void)
+ 		} else {
+ 			error = VFS_MOUNT(mp, rootvp, 0, ctx);
+ 		}
++		printf("SAGIT MK 4/10: \"%s\" mount returned %d\n",
++		    vfsp->vfc_name, error);
+ 
+ 		if (!error) {
+ 			if (bdevvp_rootvp != rootvp) {
+@@ -1291,6 +1301,9 @@ vfs_mountroot(void)
+ 			 *   support all the queries necessary... however, reasonable
+ 			 *   defaults will have been set, so no reason to bail or care
+ 			 */
++			printf("SAGIT MK 5/10: \"%s\" mounted, flags 0x%x\n",
++			    vfsp->vfc_name, mp->mnt_flag);
++
+ 			vfs_init_io_attributes(rootvp, mp);
+ 
+ 			if (mp->mnt_ioflags & MNT_IOFLAGS_FUSION_DRIVE) {
+@@ -1323,6 +1336,7 @@ vfs_mountroot(void)
+ 			 * Probe root file system for additional features.
+ 			 */
+ 			(void)VFS_START(mp, 0, ctx);
++			printf("SAGIT MK 6/10: VFS_START done\n");
+ 
+ 			VFSATTR_INIT(&vfsattr);
+ 			VFSATTR_WANTED(&vfsattr, f_capabilities);
+@@ -1355,6 +1369,9 @@ vfs_mountroot(void)
+ 			 * rootvp)... it (or we) will have also taken
+ 			 * a usecount reference which we want to keep
+ 			 */
++			printf("SAGIT MK 7/10: attribute probe done, "
++			    "putting rootvp\n");
++
+ 			vnode_put(rootvp);
+ 
+ #if CONFIG_MACF
+@@ -1383,6 +1400,8 @@ vfs_mountroot(void)
+ 				goto fail;
+ 			}
+ #endif
++			printf("SAGIT MK 8/10: vfs_mountroot success, "
++			    "returning 0\n");
+ 			KDBG_RELEASE(DBG_MOUNTROOT | DBG_FUNC_END, 0, 3);
+ 			return 0;
+ 		}
+@@ -1394,6 +1413,8 @@ fail:
+ 			printf("%s_mountroot failed: %d\n", vfsp->vfc_name, error);
+ 		}
+ 	}
++	printf("SAGIT MK 8/10: no filesystem mounted (last err %d), "
++	    "returning ENODEV\n", error);
+ 	KDBG_RELEASE(DBG_MOUNTROOT | DBG_FUNC_END, error ? error : ENODEV, 4);
+ 	return ENODEV;
+ }
